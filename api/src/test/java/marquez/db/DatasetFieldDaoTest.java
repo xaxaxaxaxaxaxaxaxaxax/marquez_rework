@@ -7,6 +7,13 @@ package marquez.db;
 
 import static marquez.db.OpenLineageDao.DEFAULT_NAMESPACE_OWNER;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.CALLS_REAL_METHODS;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -15,9 +22,11 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 import marquez.api.JdbiUtils;
 import marquez.common.models.DatasetType;
+import marquez.db.DatasetFieldDao.DatasetFieldMapping;
 import marquez.db.DatasetFieldDao.DatasetFieldUpsert;
 import marquez.db.models.DatasetFieldRow;
 import marquez.db.models.DatasetRow;
+import marquez.db.models.DatasetVersionRow;
 import marquez.db.models.NamespaceRow;
 import marquez.db.models.SourceRow;
 import marquez.jdbi.MarquezJdbiExternalPostgresExtension;
@@ -27,6 +36,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 
 @ExtendWith(MarquezJdbiExternalPostgresExtension.class)
 class DatasetFieldDaoTest {
@@ -36,6 +46,7 @@ class DatasetFieldDaoTest {
   private static Jdbi jdbi;
   private static DatasetFieldDao fieldDao;
   private static DatasetDao datasetDao;
+  private static DatasetVersionDao datasetVersionDao;
   private static NamespaceDao namespaceDao;
   private static SourceDao sourceDao;
 
@@ -46,6 +57,7 @@ class DatasetFieldDaoTest {
     DatasetFieldDaoTest.jdbi = jdbi;
     fieldDao = jdbi.onDemand(DatasetFieldDao.class);
     datasetDao = jdbi.onDemand(DatasetDao.class);
+    datasetVersionDao = jdbi.onDemand(DatasetVersionDao.class);
     namespaceDao = jdbi.onDemand(NamespaceDao.class);
     sourceDao = jdbi.onDemand(SourceDao.class);
   }
@@ -91,7 +103,9 @@ class DatasetFieldDaoTest {
             field(alphaDiscardedUuid, LATER, "alpha", "STRING", "new"),
             field(secondNullUuid, LATER, "nullable", null, "second"));
 
-    List<DatasetFieldRow> rows = fieldDao.upsertAll(inputs);
+    List<DatasetFieldRow> rows =
+        jdbi.inTransaction(
+            handle -> handle.attach(DatasetFieldDao.class).upsertAllInTransaction(inputs));
 
     assertThat(rows)
         .extracting(DatasetFieldRow::getUuid)
@@ -160,6 +174,96 @@ class DatasetFieldDaoTest {
     assertThat(countFields()).isZero();
   }
 
+  @Test
+  void updateFieldMappingSkipsEmptyInputAndUsesBoundedParallelArrays() {
+    DatasetFieldDao batchingDao = mock(DatasetFieldDao.class, CALLS_REAL_METHODS);
+
+    batchingDao.updateFieldMappingInTransaction(List.of());
+
+    verify(batchingDao, never()).insertFieldMappingsChunk(any(UUID[].class), any(UUID[].class));
+
+    List<DatasetFieldMapping> mappings = new ArrayList<>();
+    for (int index = 0; index <= DatasetFieldDao.MAX_FIELD_MAPPINGS_PER_INSERT; index++) {
+      mappings.add(new DatasetFieldMapping(new UUID(1L, index), new UUID(2L, index)));
+    }
+
+    batchingDao.updateFieldMappingInTransaction(mappings);
+
+    ArgumentCaptor<UUID[]> versionChunks = ArgumentCaptor.forClass(UUID[].class);
+    ArgumentCaptor<UUID[]> fieldChunks = ArgumentCaptor.forClass(UUID[].class);
+    verify(batchingDao, times(2))
+        .insertFieldMappingsChunk(versionChunks.capture(), fieldChunks.capture());
+    assertThat(zipMappings(versionChunks.getAllValues().get(0), fieldChunks.getAllValues().get(0)))
+        .containsExactlyInAnyOrderElementsOf(
+            mappings.subList(0, DatasetFieldDao.MAX_FIELD_MAPPINGS_PER_INSERT));
+    assertThat(zipMappings(versionChunks.getAllValues().get(1), fieldChunks.getAllValues().get(1)))
+        .containsExactlyInAnyOrderElementsOf(
+            mappings.subList(DatasetFieldDao.MAX_FIELD_MAPPINGS_PER_INSERT, mappings.size()));
+  }
+
+  @Test
+  void updateFieldMappingUsesSetSemantics() {
+    DatasetVersionRow version = newDatasetVersion();
+    DatasetFieldRow first =
+        fieldDao.upsert(
+            UUID.randomUUID(), CREATED_AT, "first-mapping", "STRING", null, dataset.getUuid());
+    DatasetFieldRow second =
+        fieldDao.upsert(
+            UUID.randomUUID(), CREATED_AT, "second-mapping", "STRING", null, dataset.getUuid());
+    DatasetFieldMapping firstMapping = new DatasetFieldMapping(version.getUuid(), first.getUuid());
+    DatasetFieldMapping secondMapping =
+        new DatasetFieldMapping(version.getUuid(), second.getUuid());
+
+    fieldDao.updateFieldMapping(List.of(secondMapping, firstMapping, secondMapping, firstMapping));
+    fieldDao.updateFieldMapping(List.of(firstMapping, secondMapping));
+
+    assertThat(findMappedFieldUuids(version.getUuid()))
+        .containsExactlyInAnyOrder(first.getUuid(), second.getUuid());
+  }
+
+  @Test
+  void updateFieldMappingRollsBackEarlierChunksWhenALaterChunkFails() {
+    DatasetVersionRow version = newDatasetVersion();
+    List<DatasetFieldUpsert> fieldUpserts = new ArrayList<>();
+    for (int index = 0; index < DatasetFieldDao.MAX_FIELD_MAPPINGS_PER_INSERT; index++) {
+      fieldUpserts.add(
+          field(UUID.randomUUID(), CREATED_AT, "rollback-mapping-" + index, "STRING", null));
+    }
+    List<DatasetFieldRow> fields = fieldDao.upsertAll(fieldUpserts);
+    List<DatasetFieldMapping> mappings =
+        fields.stream()
+            .map(field -> new DatasetFieldMapping(version.getUuid(), field.getUuid()))
+            .collect(Collectors.toCollection(ArrayList::new));
+    mappings.add(new DatasetFieldMapping(version.getUuid(), UUID.randomUUID()));
+
+    assertThatThrownBy(() -> fieldDao.updateFieldMapping(mappings))
+        .isInstanceOf(RuntimeException.class);
+
+    assertThat(findMappedFieldUuids(version.getUuid())).isEmpty();
+  }
+
+  @Test
+  void updateFieldMappingInTransactionParticipatesInOuterRollback() {
+    DatasetVersionRow version = newDatasetVersion();
+    DatasetFieldRow field =
+        fieldDao.upsert(
+            UUID.randomUUID(), CREATED_AT, "outer-rollback", "STRING", null, dataset.getUuid());
+
+    assertThatThrownBy(
+            () ->
+                jdbi.useTransaction(
+                    handle -> {
+                      handle
+                          .attach(DatasetFieldDao.class)
+                          .updateFieldMappingInTransaction(
+                              List.of(new DatasetFieldMapping(version.getUuid(), field.getUuid())));
+                      throw new IllegalStateException("rollback");
+                    }))
+        .isInstanceOf(IllegalStateException.class);
+
+    assertThat(findMappedFieldUuids(version.getUuid())).isEmpty();
+  }
+
   private DatasetFieldUpsert field(
       UUID uuid, Instant updatedAt, String name, String type, String description) {
     return new DatasetFieldUpsert(
@@ -174,5 +278,41 @@ class DatasetFieldDaoTest {
                 .bind("uuid", dataset.getUuid())
                 .mapTo(Integer.class)
                 .one());
+  }
+
+  private DatasetVersionRow newDatasetVersion() {
+    return datasetVersionDao.upsert(
+        UUID.randomUUID(),
+        CREATED_AT,
+        dataset.getUuid(),
+        UUID.randomUUID(),
+        null,
+        null,
+        null,
+        dataset.getNamespaceName(),
+        dataset.getName(),
+        null);
+  }
+
+  private List<UUID> findMappedFieldUuids(UUID datasetVersionUuid) {
+    return jdbi.withHandle(
+        handle ->
+            handle
+                .createQuery(
+                    "SELECT dataset_field_uuid FROM dataset_versions_field_mapping "
+                        + "WHERE dataset_version_uuid = :datasetVersionUuid")
+                .bind("datasetVersionUuid", datasetVersionUuid)
+                .mapTo(UUID.class)
+                .list());
+  }
+
+  private static List<DatasetFieldMapping> zipMappings(
+      UUID[] datasetVersionUuids, UUID[] datasetFieldUuids) {
+    assertThat(datasetVersionUuids.length).isEqualTo(datasetFieldUuids.length);
+    List<DatasetFieldMapping> mappings = new ArrayList<>(datasetVersionUuids.length);
+    for (int index = 0; index < datasetVersionUuids.length; index++) {
+      mappings.add(new DatasetFieldMapping(datasetVersionUuids[index], datasetFieldUuids[index]));
+    }
+    return mappings;
   }
 }

@@ -23,8 +23,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -34,6 +36,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.stream.Collectors;
 import marquez.BaseIntegrationTest;
 import marquez.api.models.JobVersion;
 import marquez.common.models.DatasetId;
@@ -60,6 +63,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 
 /** The test suite for {@link JobVersionDao}. */
 @org.junit.jupiter.api.Tag("IntegrationTests")
@@ -104,44 +108,55 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
   }
 
   @Test
-  public void testPluralDatasetUpsertMarksPreviousOnceAndDeduplicates() {
+  public void testCurrentJobVersionIoWriteSortsDeduplicatesAndFlushesInputThenOutput() {
     JobVersionDao batchingDao = mock(JobVersionDao.class, CALLS_REAL_METHODS);
     UUID jobVersionUuid = UUID.randomUUID();
     UUID jobUuid = UUID.randomUUID();
     UUID symlinkTargetJobUuid = UUID.randomUUID();
-    UUID firstDatasetUuid = UUID.randomUUID();
-    UUID secondDatasetUuid = UUID.randomUUID();
-    UUID outputDatasetUuid = UUID.randomUUID();
+    UUID firstInputUuid = new UUID(0L, 1L);
+    UUID secondInputUuid = new UUID(0L, 2L);
+    UUID firstOutputUuid = new UUID(0L, 3L);
+    UUID secondOutputUuid = new UUID(0L, 4L);
+    JobVersionDao.CurrentJobVersionIoWrite write =
+        JobVersionDao.CurrentJobVersionIoWrite.of(
+            jobVersionUuid,
+            jobUuid,
+            symlinkTargetJobUuid,
+            List.of(secondInputUuid, firstInputUuid, secondInputUuid),
+            List.of(secondOutputUuid, firstOutputUuid, secondOutputUuid));
 
-    batchingDao.upsertInputDatasetsFor(
-        jobVersionUuid,
-        List.of(firstDatasetUuid, secondDatasetUuid, firstDatasetUuid),
-        jobUuid,
-        symlinkTargetJobUuid);
+    assertThat(write.inputDatasetUuids()).containsExactly(firstInputUuid, secondInputUuid);
+    assertThat(write.outputDatasetUuids()).containsExactly(firstOutputUuid, secondOutputUuid);
 
-    verify(batchingDao).markInputOrOutputDatasetAsPreviousFor(jobVersionUuid, jobUuid, INPUT);
-    @SuppressWarnings({"rawtypes", "unchecked"})
-    ArgumentCaptor<Iterable<UUID>> datasetUuids = ArgumentCaptor.forClass(Iterable.class);
-    verify(batchingDao)
-        .upsertCurrentInputOrOutputDatasetsFor(
+    batchingDao.flushCurrentJobVersionIoInCurrentTransaction(write);
+
+    ArgumentCaptor<UUID[]> inputUuids = ArgumentCaptor.forClass(UUID[].class);
+    ArgumentCaptor<UUID[]> outputUuids = ArgumentCaptor.forClass(UUID[].class);
+    InOrder writes = inOrder(batchingDao);
+    writes
+        .verify(batchingDao)
+        .markInputOrOutputDatasetAsPreviousFor(jobVersionUuid, jobUuid, INPUT);
+    writes
+        .verify(batchingDao)
+        .upsertCurrentInputOrOutputDatasetsChunk(
             eq(jobVersionUuid),
-            datasetUuids.capture(),
+            inputUuids.capture(),
             eq(jobUuid),
             eq(symlinkTargetJobUuid),
             eq(INPUT));
-    assertThat(datasetUuids.getValue())
-        .containsExactlyInAnyOrder(firstDatasetUuid, secondDatasetUuid);
-
-    batchingDao.upsertOutputDatasetsFor(
-        jobVersionUuid, List.of(outputDatasetUuid), jobUuid, symlinkTargetJobUuid);
-    verify(batchingDao).markInputOrOutputDatasetAsPreviousFor(jobVersionUuid, jobUuid, OUTPUT);
-    verify(batchingDao)
-        .upsertCurrentInputOrOutputDatasetsFor(
+    writes
+        .verify(batchingDao)
+        .markInputOrOutputDatasetAsPreviousFor(jobVersionUuid, jobUuid, OUTPUT);
+    writes
+        .verify(batchingDao)
+        .upsertCurrentInputOrOutputDatasetsChunk(
             eq(jobVersionUuid),
-            eq(ImmutableSet.of(outputDatasetUuid)),
+            outputUuids.capture(),
             eq(jobUuid),
             eq(symlinkTargetJobUuid),
             eq(OUTPUT));
+    assertThat(inputUuids.getValue()).containsExactly(firstInputUuid, secondInputUuid);
+    assertThat(outputUuids.getValue()).containsExactly(firstOutputUuid, secondOutputUuid);
   }
 
   @Test
@@ -158,16 +173,45 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
         .markInputOrOutputDatasetAsPreviousFor(
             any(UUID.class), any(UUID.class), any(JobVersionDao.IoType.class));
     verify(batchingDao, never())
-        .upsertCurrentInputOrOutputDatasetsFor(
+        .upsertCurrentInputOrOutputDatasetsChunk(
             any(UUID.class),
-            any(),
+            any(UUID[].class),
             any(UUID.class),
             any(UUID.class),
             any(JobVersionDao.IoType.class));
   }
 
   @Test
-  public void testPluralDatasetUpsertRollsBackInvalidationWhenBatchFails() {
+  public void testCurrentJobVersionIoWriteChunksSortedArraysAfterOneInvalidation() {
+    JobVersionDao batchingDao = mock(JobVersionDao.class, CALLS_REAL_METHODS);
+    UUID jobVersionUuid = UUID.randomUUID();
+    UUID jobUuid = UUID.randomUUID();
+    List<UUID> descendingDatasetUuids = new ArrayList<>();
+    for (long value = JobVersionDao.JOB_VERSION_IO_BATCH_SIZE + 1L; value > 0; value--) {
+      descendingDatasetUuids.add(new UUID(0L, value));
+    }
+    descendingDatasetUuids.add(new UUID(0L, 1L));
+
+    batchingDao.flushCurrentJobVersionIoInCurrentTransaction(
+        JobVersionDao.CurrentJobVersionIoWrite.of(
+            jobVersionUuid, jobUuid, null, descendingDatasetUuids, List.of()));
+
+    verify(batchingDao).markInputOrOutputDatasetAsPreviousFor(jobVersionUuid, jobUuid, INPUT);
+    ArgumentCaptor<UUID[]> chunks = ArgumentCaptor.forClass(UUID[].class);
+    verify(batchingDao, times(2))
+        .upsertCurrentInputOrOutputDatasetsChunk(
+            eq(jobVersionUuid), chunks.capture(), eq(jobUuid), eq(null), eq(INPUT));
+    assertThat(chunks.getAllValues().get(0))
+        .containsExactlyElementsOf(
+            java.util.stream.LongStream.rangeClosed(1, JobVersionDao.JOB_VERSION_IO_BATCH_SIZE)
+                .mapToObj(value -> new UUID(0L, value))
+                .collect(Collectors.toList()));
+    assertThat(chunks.getAllValues().get(1))
+        .containsExactly(new UUID(0L, JobVersionDao.JOB_VERSION_IO_BATCH_SIZE + 1L));
+  }
+
+  @Test
+  public void testPluralDatasetUpsertRollsBackInvalidationWhenArrayInsertFails() {
     final JobMeta jobMeta =
         new JobMeta(
             newJobType(),
@@ -221,6 +265,76 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
 
     assertThat(countMappings(oldVersion.getUuid(), INPUT, true)).isEqualTo(1);
     assertThat(countMappings(newVersion.getUuid(), INPUT, true)).isZero();
+  }
+
+  @Test
+  public void testSetBasedReactivationPreservesMadeCurrentAt() {
+    JobRow timestampJob =
+        DbTestUtils.newJob(jdbiForTesting, namespaceRow.getName(), newJobName().getValue());
+    String datasetName = "made-current-" + UUID.randomUUID();
+    DbTestUtils.newDataset(jdbiForTesting, namespaceRow.getName(), datasetName);
+    UUID datasetUuid =
+        datasetDao.findDatasetAsRow(namespaceRow.getName(), datasetName).orElseThrow().getUuid();
+    ExtendedJobVersionRow firstVersion =
+        DbTestUtils.newJobVersion(
+            jdbiForTesting,
+            timestampJob.getUuid(),
+            UUID.randomUUID(),
+            timestampJob.getName(),
+            namespaceRow.getUuid(),
+            namespaceRow.getName());
+    ExtendedJobVersionRow secondVersion =
+        DbTestUtils.newJobVersion(
+            jdbiForTesting,
+            timestampJob.getUuid(),
+            UUID.randomUUID(),
+            timestampJob.getName(),
+            namespaceRow.getUuid(),
+            namespaceRow.getName());
+    jobVersionDao.upsertInputDatasetsFor(
+        firstVersion.getUuid(), List.of(datasetUuid), timestampJob.getUuid(), null);
+    Instant sentinel = Instant.parse("2000-01-01T00:00:00Z");
+    jdbiForTesting.useHandle(
+        handle ->
+            handle
+                .createUpdate(
+                    """
+                    UPDATE job_versions_io_mapping
+                    SET made_current_at = :sentinel
+                    WHERE job_version_uuid = :jobVersionUuid
+                      AND dataset_uuid = :datasetUuid
+                      AND io_type = 'INPUT'
+                    """)
+                .bind("sentinel", sentinel)
+                .bind("jobVersionUuid", firstVersion.getUuid())
+                .bind("datasetUuid", datasetUuid)
+                .execute());
+
+    jobVersionDao.upsertInputDatasetsFor(
+        secondVersion.getUuid(), List.of(datasetUuid), timestampJob.getUuid(), null);
+    jobVersionDao.upsertInputDatasetsFor(
+        firstVersion.getUuid(), List.of(datasetUuid), timestampJob.getUuid(), null);
+
+    boolean timestampPreserved =
+        jdbiForTesting.withHandle(
+            handle ->
+                handle
+                    .createQuery(
+                        """
+                        SELECT made_current_at = :sentinel
+                        FROM job_versions_io_mapping
+                        WHERE job_version_uuid = :jobVersionUuid
+                          AND dataset_uuid = :datasetUuid
+                          AND io_type = 'INPUT'
+                        """)
+                    .bind("sentinel", sentinel)
+                    .bind("jobVersionUuid", firstVersion.getUuid())
+                    .bind("datasetUuid", datasetUuid)
+                    .mapTo(Boolean.class)
+                    .one());
+    assertThat(timestampPreserved).isTrue();
+    assertThat(countMappings(firstVersion.getUuid(), INPUT, true)).isEqualTo(1);
+    assertThat(countMappings(secondVersion.getUuid(), INPUT, false)).isEqualTo(1);
   }
 
   @Test

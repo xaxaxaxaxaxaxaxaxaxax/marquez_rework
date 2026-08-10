@@ -77,6 +77,11 @@ public interface DatasetDao extends BaseDao {
 
   @Transaction
   default int updateVersions(List<DatasetCurrentVersionUpdate> updates) {
+    return updateVersionsInTransaction(updates);
+  }
+
+  /** Updates current versions without opening a transaction; the caller owns chunk atomicity. */
+  default int updateVersionsInTransaction(List<DatasetCurrentVersionUpdate> updates) {
     if (updates.isEmpty()) {
       return 0;
     }

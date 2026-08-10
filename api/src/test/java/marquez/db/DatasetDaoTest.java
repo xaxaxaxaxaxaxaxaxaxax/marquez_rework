@@ -11,6 +11,7 @@ import static marquez.db.LineageTestUtils.SCHEMA_URL;
 import static marquez.db.LineageTestUtils.createLineageRow;
 import static marquez.db.LineageTestUtils.newDatasetFacet;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
@@ -160,6 +161,37 @@ class DatasetDaoTest {
     assertThat(datasetDao.updateVersions(updates)).isEqualTo(2);
     assertRawDatasetVersion(first.getUuid(), firstVersion, updatedAt);
     assertRawDatasetVersion(second.getUuid(), secondVersion, updatedAt);
+
+    Instant coreUpdatedAt = updatedAt.plusSeconds(60);
+    UUID coreVersion = UUID.randomUUID();
+    jdbi.useTransaction(
+        handle ->
+            assertThat(
+                    handle
+                        .attach(DatasetDao.class)
+                        .updateVersionsInTransaction(
+                            List.of(
+                                new DatasetCurrentVersionUpdate(
+                                    first.getUuid(), coreUpdatedAt, coreVersion))))
+                .isEqualTo(1));
+    assertRawDatasetVersion(first.getUuid(), coreVersion, coreUpdatedAt);
+
+    assertThatThrownBy(
+            () ->
+                jdbi.useTransaction(
+                    handle -> {
+                      handle
+                          .attach(DatasetDao.class)
+                          .updateVersionsInTransaction(
+                              List.of(
+                                  new DatasetCurrentVersionUpdate(
+                                      first.getUuid(),
+                                      coreUpdatedAt.plusSeconds(60),
+                                      UUID.randomUUID())));
+                      throw new IllegalStateException("rollback");
+                    }))
+        .isInstanceOf(IllegalStateException.class);
+    assertRawDatasetVersion(first.getUuid(), coreVersion, coreUpdatedAt);
   }
 
   private static void assertRawDatasetVersion(

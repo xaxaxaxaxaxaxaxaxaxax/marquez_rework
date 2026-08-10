@@ -71,13 +71,18 @@ public interface ColumnLineageDao extends BaseDao {
     return Collections.emptyList();
   }
 
-  /**
-   * Intake-only write path for already resolved column lineage. Unlike the compatibility methods
-   * above, this method can batch physical edges across output datasets and deliberately performs no
-   * database readback.
-   */
+  /** Compatibility entry point for callers that already resolved input fields to physical UUIDs. */
   @Transaction
   default void upsertColumnLineageRowsForIntake(
+      List<ColumnLineageDatasetWrite> datasetWrites, Instant now) {
+    upsertColumnLineageRowsForIntakeInTransaction(datasetWrites, now);
+  }
+
+  /**
+   * Intake-only physical write path. The caller must already be inside the surrounding OpenLineage
+   * projection transaction. This method deliberately performs no database readback.
+   */
+  default void upsertColumnLineageRowsForIntakeInTransaction(
       List<ColumnLineageDatasetWrite> datasetWrites, Instant now) {
     record EdgeKey(
         UUID outputDatasetVersionUuid,

@@ -17,13 +17,18 @@ import org.jdbi.v3.sqlobject.statement.SqlUpdate;
 @RegisterRowMapper(RunArgsRowMapper.class)
 public interface RunArgsDao {
   default RunArgsRow upsertRunArgs(UUID uuid, Instant now, String args, String checksum) {
-    doUpsertRunArgs(uuid, now, args, checksum);
-    return findRunArgsByChecksum(checksum).orElseThrow();
+    Optional<RunArgsRow> existing = findRunArgsByChecksum(checksum);
+    if (existing.isPresent()) {
+      return existing.get();
+    }
+    return insertRunArgs(uuid, now, args, checksum)
+        .orElseGet(() -> findRunArgsByChecksum(checksum).orElseThrow());
   }
 
   @SqlQuery("SELECT * FROM run_args WHERE checksum=:checksum")
   Optional<RunArgsRow> findRunArgsByChecksum(String checksum);
 
+  /** Compatibility entry point retaining the original insert-without-readback contract. */
   @SqlUpdate(
       "INSERT INTO run_args ( "
           + "uuid, "
@@ -37,4 +42,19 @@ public interface RunArgsDao {
           + ":checksum "
           + ") ON CONFLICT(checksum) DO NOTHING")
   void doUpsertRunArgs(UUID uuid, Instant now, String args, String checksum);
+
+  @SqlQuery(
+      "INSERT INTO run_args ( "
+          + "uuid, "
+          + "created_at, "
+          + "args, "
+          + "checksum "
+          + ") VALUES ( "
+          + ":uuid, "
+          + ":now, "
+          + ":args, "
+          + ":checksum "
+          + ") ON CONFLICT(checksum) DO NOTHING "
+          + "RETURNING *")
+  Optional<RunArgsRow> insertRunArgs(UUID uuid, Instant now, String args, String checksum);
 }

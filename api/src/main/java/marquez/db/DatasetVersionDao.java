@@ -8,6 +8,8 @@ package marquez.db;
 import com.google.common.collect.ImmutableSet;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -21,6 +23,7 @@ import marquez.common.models.TagName;
 import marquez.common.models.Version;
 import marquez.db.DatasetFieldDao.DatasetFieldMapping;
 import marquez.db.DatasetFieldDao.DatasetFieldTag;
+import marquez.db.DatasetFieldDao.DatasetFieldUpsert;
 import marquez.db.mappers.DatasetVersionMapper;
 import marquez.db.mappers.DatasetVersionRowMapper;
 import marquez.db.mappers.ExtendedDatasetVersionRowMapper;
@@ -36,6 +39,7 @@ import marquez.service.models.LineageEvent.SchemaField;
 import marquez.service.models.Run;
 import marquez.service.models.StreamMeta;
 import org.jdbi.v3.sqlobject.config.RegisterRowMapper;
+import org.jdbi.v3.sqlobject.customizer.Bind;
 import org.jdbi.v3.sqlobject.statement.SqlQuery;
 import org.jdbi.v3.sqlobject.statement.SqlUpdate;
 import org.jdbi.v3.sqlobject.transaction.Transaction;
@@ -61,13 +65,18 @@ public interface DatasetVersionDao extends BaseDao {
     List<DatasetFieldTag> datasetFieldTags = new ArrayList<>();
     for (Field field : datasetMeta.getFields()) {
       DatasetFieldRow datasetFieldRow =
-          datasetFieldDao.upsert(
-              UUID.randomUUID(),
-              now,
-              field.getName().getValue(),
-              field.getType(),
-              field.getDescription().orElse(null),
-              datasetRow.getUuid());
+          datasetFieldDao
+              .upsertAllInTransaction(
+                  Collections.singletonList(
+                      new DatasetFieldUpsert(
+                          UUID.randomUUID(),
+                          now,
+                          now,
+                          datasetRow.getUuid(),
+                          field.getName().getValue(),
+                          field.getType(),
+                          field.getDescription().orElse(null))))
+              .get(0);
       datasetFields.add(datasetFieldRow);
       for (TagName tagName : field.getTags()) {
         TagRow tag = tagDao.upsert(UUID.randomUUID(), now, tagName.getValue());
@@ -80,7 +89,7 @@ public interface DatasetVersionDao extends BaseDao {
     UUID newDatasetVersionUuid = UUID.randomUUID();
     UUID datasetSchemaVersionUuid =
         createDatasetSchemaVersionDao()
-            .upsertSchemaVersion(datasetRow, datasetFields, now)
+            .upsertSchemaVersionInTransaction(datasetRow, datasetFields, now)
             .getValue();
     DatasetVersionRow datasetVersionRow =
         upsert(
@@ -113,7 +122,7 @@ public interface DatasetVersionDao extends BaseDao {
       datasetFieldMappings.add(
           new DatasetFieldMapping(datasetVersionRow.getUuid(), datasetFieldRow.getUuid()));
     }
-    datasetFieldDao.updateFieldMapping(datasetFieldMappings);
+    datasetFieldDao.updateFieldMappingInTransaction(datasetFieldMappings);
 
     createDatasetDao().updateVersion(datasetRow.getUuid(), now, datasetVersionRow.getUuid());
     return datasetVersionRow;
@@ -314,6 +323,15 @@ public interface DatasetVersionDao extends BaseDao {
 
   @SqlQuery(SELECT + "WHERE dv.uuid = :uuid")
   Optional<DatasetVersionRow> findRowByUuid(UUID uuid);
+
+  default List<DatasetVersionRow> findRowsByUuids(Collection<UUID> uuids) {
+    return uuids.isEmpty()
+        ? Collections.emptyList()
+        : findRowsByUuidArray(uuids.toArray(UUID[]::new));
+  }
+
+  @SqlQuery(SELECT + "WHERE dv.uuid = ANY(CAST(:uuids AS uuid[]))")
+  List<DatasetVersionRow> findRowsByUuidArray(@Bind("uuids") UUID[] uuids);
 
   @SqlQuery(
       """

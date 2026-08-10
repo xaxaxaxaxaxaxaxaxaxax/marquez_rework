@@ -342,8 +342,9 @@ public interface RunDao extends BaseDao {
   @SqlUpdate(
       """
       INSERT INTO runs_input_mapping (run_uuid, dataset_version_uuid)
-      SELECT :runUuid, mappings.dataset_version_uuid
+      SELECT DISTINCT :runUuid, mappings.dataset_version_uuid
       FROM unnest(CAST(:datasetVersionUuids AS uuid[])) mappings(dataset_version_uuid)
+      ORDER BY mappings.dataset_version_uuid
       ON CONFLICT (run_uuid, dataset_version_uuid) DO NOTHING
       """)
   void insertInputMappingsChunk(
@@ -355,6 +356,11 @@ public interface RunDao extends BaseDao {
    */
   @Transaction
   default void updateInputMappings(UUID runUuid, Iterable<UUID> datasetVersionUuids) {
+    updateInputMappingsInTransaction(runUuid, datasetVersionUuids);
+  }
+
+  /** Transaction-assuming core used when the caller already owns the surrounding transaction. */
+  default void updateInputMappingsInTransaction(UUID runUuid, Iterable<UUID> datasetVersionUuids) {
     Objects.requireNonNull(runUuid, "runUuid");
     Iterator<UUID> iterator =
         Objects.requireNonNull(datasetVersionUuids, "datasetVersionUuids").iterator();

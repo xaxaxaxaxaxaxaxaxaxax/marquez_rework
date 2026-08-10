@@ -32,6 +32,7 @@ import marquez.service.models.Dataset;
 import marquez.service.models.DatasetVersion;
 import org.apache.commons.lang3.tuple.Pair;
 import org.jdbi.v3.sqlobject.config.RegisterRowMapper;
+import org.jdbi.v3.sqlobject.customizer.Bind;
 import org.jdbi.v3.sqlobject.customizer.BindBean;
 import org.jdbi.v3.sqlobject.customizer.BindBeanList;
 import org.jdbi.v3.sqlobject.statement.SqlBatch;
@@ -46,6 +47,7 @@ import org.jdbi.v3.sqlobject.transaction.Transaction;
 public interface DatasetFieldDao extends BaseDao {
   // Each row binds seven values; keep chunks comfortably below PostgreSQL's bind limit.
   int MAX_FIELDS_PER_UPSERT = 1000;
+  int MAX_FIELD_MAPPINGS_PER_INSERT = 1000;
 
   @SqlQuery(
       """
@@ -265,7 +267,7 @@ public interface DatasetFieldDao extends BaseDao {
   @Transaction
   default DatasetFieldRow upsert(
       UUID uuid, Instant now, String name, String type, String description, UUID datasetUuid) {
-    return upsertAll(
+    return upsertAllInTransaction(
             Collections.singletonList(
                 new DatasetFieldUpsert(uuid, now, now, datasetUuid, name, type, description)))
         .get(0);
@@ -273,6 +275,14 @@ public interface DatasetFieldDao extends BaseDao {
 
   @Transaction
   default List<DatasetFieldRow> upsertAll(List<DatasetFieldUpsert> fields) {
+    return upsertAllInTransaction(fields);
+  }
+
+  /**
+   * Upserts fields without opening a transaction. Callers must already be in a transaction when
+   * more than one chunk must commit atomically.
+   */
+  default List<DatasetFieldRow> upsertAllInTransaction(List<DatasetFieldUpsert> fields) {
     if (fields.isEmpty()) {
       return Collections.emptyList();
     }
@@ -395,10 +405,54 @@ public interface DatasetFieldDao extends BaseDao {
     return left.getUuid().compareTo(right.getUuid());
   }
 
-  @SqlBatch(
-      "INSERT INTO dataset_versions_field_mapping (dataset_version_uuid, dataset_field_uuid) "
-          + "VALUES (:datasetVersionUuid, :datasetFieldUuid) ON CONFLICT DO NOTHING")
-  void updateFieldMapping(@BindBean List<DatasetFieldMapping> datasetFieldMappings);
+  @SqlUpdate(
+      """
+          INSERT INTO dataset_versions_field_mapping (
+              dataset_version_uuid,
+              dataset_field_uuid
+          )
+          SELECT DISTINCT
+              mapping.dataset_version_uuid,
+              mapping.dataset_field_uuid
+          FROM unnest(
+              CAST(:datasetVersionUuids AS uuid[]),
+              CAST(:datasetFieldUuids AS uuid[])
+          ) AS mapping(dataset_version_uuid, dataset_field_uuid)
+          ORDER BY mapping.dataset_version_uuid, mapping.dataset_field_uuid
+          ON CONFLICT DO NOTHING
+          """)
+  void insertFieldMappingsChunk(
+      @Bind("datasetVersionUuids") UUID[] datasetVersionUuids,
+      @Bind("datasetFieldUuids") UUID[] datasetFieldUuids);
+
+  @Transaction
+  default void updateFieldMapping(List<DatasetFieldMapping> datasetFieldMappings) {
+    updateFieldMappingInTransaction(datasetFieldMappings);
+  }
+
+  /**
+   * Associates dataset versions and fields without opening a transaction. Callers must already be
+   * in a transaction so all chunks are rolled back together if any chunk fails.
+   */
+  default void updateFieldMappingInTransaction(List<DatasetFieldMapping> datasetFieldMappings) {
+    if (datasetFieldMappings.isEmpty()) {
+      return;
+    }
+
+    List<DatasetFieldMapping> mappings = List.copyOf(datasetFieldMappings);
+    for (int start = 0; start < mappings.size(); start += MAX_FIELD_MAPPINGS_PER_INSERT) {
+      int end = Math.min(start + MAX_FIELD_MAPPINGS_PER_INSERT, mappings.size());
+      UUID[] datasetVersionUuids = new UUID[end - start];
+      UUID[] datasetFieldUuids = new UUID[end - start];
+      for (int index = start; index < end; index++) {
+        DatasetFieldMapping mapping = mappings.get(index);
+        int chunkIndex = index - start;
+        datasetVersionUuids[chunkIndex] = mapping.getDatasetVersionUuid();
+        datasetFieldUuids[chunkIndex] = mapping.getDatasetFieldUuid();
+      }
+      insertFieldMappingsChunk(datasetVersionUuids, datasetFieldUuids);
+    }
+  }
 
   @Value
   class DatasetFieldMapping {

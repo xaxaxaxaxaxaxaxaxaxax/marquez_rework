@@ -8,15 +8,16 @@ package marquez.db;
 import static marquez.db.Columns.stringOrThrow;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ImmutableSortedSet;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 import lombok.NonNull;
 import lombok.Value;
 import marquez.api.models.JobVersion;
@@ -45,8 +46,6 @@ import org.jdbi.v3.core.mapper.RowMapper;
 import org.jdbi.v3.core.statement.StatementContext;
 import org.jdbi.v3.sqlobject.config.RegisterRowMapper;
 import org.jdbi.v3.sqlobject.customizer.Bind;
-import org.jdbi.v3.sqlobject.statement.BatchChunkSize;
-import org.jdbi.v3.sqlobject.statement.SqlBatch;
 import org.jdbi.v3.sqlobject.statement.SqlQuery;
 import org.jdbi.v3.sqlobject.statement.SqlUpdate;
 import org.jdbi.v3.sqlobject.transaction.Transaction;
@@ -201,24 +200,40 @@ public interface JobVersionDao extends BaseDao {
       UUID namespaceUuid,
       String namespaceName);
 
-  @BatchChunkSize(JOB_VERSION_IO_BATCH_SIZE)
-  @SqlBatch(
-      value =
-          """
+  @SqlUpdate(
+      """
     INSERT INTO job_versions_io_mapping (
       job_version_uuid, dataset_uuid, io_type, job_uuid, job_symlink_target_uuid, is_current_job_version, made_current_at)
-    VALUES (:jobVersionUuid, :datasetUuid, :ioType, :jobUuid, :symlinkTargetJobUuid, TRUE, NOW())
+    SELECT :jobVersionUuid, requested.dataset_uuid, :ioType, :jobUuid,
+      :symlinkTargetJobUuid, TRUE, NOW()
+    FROM unnest(CAST(:datasetUuids AS uuid[])) requested(dataset_uuid)
+    ORDER BY requested.dataset_uuid
     ON CONFLICT (job_version_uuid, dataset_uuid, io_type, job_uuid) DO UPDATE
     SET is_current_job_version = TRUE
     WHERE job_versions_io_mapping.is_current_job_version IS DISTINCT FROM TRUE
-  """,
-      transactional = true)
-  void upsertCurrentInputOrOutputDatasetsFor(
+  """)
+  void upsertCurrentInputOrOutputDatasetsChunk(
       @Bind("jobVersionUuid") UUID jobVersionUuid,
-      @Bind("datasetUuid") Iterable<UUID> datasetUuids,
+      @Bind("datasetUuids") UUID[] datasetUuids,
       @Bind("jobUuid") UUID jobUuid,
       @Bind("symlinkTargetJobUuid") UUID symlinkTargetJobUuid,
       @Bind("ioType") IoType ioType);
+
+  /** Compatibility entry point retaining the pre-batching public DAO contract. */
+  @Transaction
+  default void upsertCurrentInputOrOutputDatasetsFor(
+      UUID jobVersionUuid,
+      Iterable<UUID> datasetUuids,
+      UUID jobUuid,
+      UUID symlinkTargetJobUuid,
+      IoType ioType) {
+    upsertCurrentInputOrOutputDatasetsInCurrentTransaction(
+        jobVersionUuid,
+        ImmutableSortedSet.copyOf(Objects.requireNonNull(datasetUuids, "datasetUuids")),
+        jobUuid,
+        symlinkTargetJobUuid,
+        ioType);
+  }
 
   /** Used to upsert a single input or output dataset to a given job version. */
   default void upsertCurrentInputOrOutputDatasetFor(
@@ -268,11 +283,9 @@ public interface JobVersionDao extends BaseDao {
   @Transaction
   default void upsertInputDatasetsFor(
       UUID jobVersionUuid, List<UUID> inputDatasetUuids, UUID jobUuid, UUID symlinkTargetJobUuid) {
-    ImmutableSet<UUID> uniqueDatasetUuids = ImmutableSet.copyOf(inputDatasetUuids);
-    if (!uniqueDatasetUuids.isEmpty()) {
-      upsertInputOrOutputDatasetsFor(
-          jobVersionUuid, uniqueDatasetUuids, jobUuid, symlinkTargetJobUuid, IoType.INPUT);
-    }
+    flushCurrentJobVersionIoInCurrentTransaction(
+        CurrentJobVersionIoWrite.of(
+            jobVersionUuid, jobUuid, symlinkTargetJobUuid, inputDatasetUuids, List.of()));
   }
 
   /**
@@ -291,22 +304,52 @@ public interface JobVersionDao extends BaseDao {
   @Transaction
   default void upsertOutputDatasetsFor(
       UUID jobVersionUuid, List<UUID> outputDatasetUuids, UUID jobUuid, UUID symlinkTargetJobUuid) {
-    ImmutableSet<UUID> uniqueDatasetUuids = ImmutableSet.copyOf(outputDatasetUuids);
-    if (!uniqueDatasetUuids.isEmpty()) {
-      upsertInputOrOutputDatasetsFor(
-          jobVersionUuid, uniqueDatasetUuids, jobUuid, symlinkTargetJobUuid, IoType.OUTPUT);
+    flushCurrentJobVersionIoInCurrentTransaction(
+        CurrentJobVersionIoWrite.of(
+            jobVersionUuid, jobUuid, symlinkTargetJobUuid, List.of(), outputDatasetUuids));
+  }
+
+  /**
+   * Flushes deterministic job-version I/O mutations in input-then-output order. The caller owns the
+   * surrounding transaction.
+   */
+  default void flushCurrentJobVersionIoInCurrentTransaction(CurrentJobVersionIoWrite write) {
+    if (!write.inputDatasetUuids().isEmpty()) {
+      markInputOrOutputDatasetAsPreviousFor(write.jobVersionUuid(), write.jobUuid(), IoType.INPUT);
+      upsertCurrentInputOrOutputDatasetsInCurrentTransaction(
+          write.jobVersionUuid(),
+          write.inputDatasetUuids(),
+          write.jobUuid(),
+          write.symlinkTargetJobUuid(),
+          IoType.INPUT);
+    }
+    if (!write.outputDatasetUuids().isEmpty()) {
+      markInputOrOutputDatasetAsPreviousFor(write.jobVersionUuid(), write.jobUuid(), IoType.OUTPUT);
+      upsertCurrentInputOrOutputDatasetsInCurrentTransaction(
+          write.jobVersionUuid(),
+          write.outputDatasetUuids(),
+          write.jobUuid(),
+          write.symlinkTargetJobUuid(),
+          IoType.OUTPUT);
     }
   }
 
-  private void upsertInputOrOutputDatasetsFor(
+  private void upsertCurrentInputOrOutputDatasetsInCurrentTransaction(
       UUID jobVersionUuid,
-      ImmutableSet<UUID> datasetUuids,
+      ImmutableSortedSet<UUID> datasetUuids,
       UUID jobUuid,
       UUID symlinkTargetJobUuid,
       IoType ioType) {
-    markInputOrOutputDatasetAsPreviousFor(jobVersionUuid, jobUuid, ioType);
-    upsertCurrentInputOrOutputDatasetsFor(
-        jobVersionUuid, datasetUuids, jobUuid, symlinkTargetJobUuid, ioType);
+    List<UUID> sortedDatasetUuids = datasetUuids.asList();
+    for (int from = 0; from < sortedDatasetUuids.size(); from += JOB_VERSION_IO_BATCH_SIZE) {
+      int to = Math.min(from + JOB_VERSION_IO_BATCH_SIZE, sortedDatasetUuids.size());
+      upsertCurrentInputOrOutputDatasetsChunk(
+          jobVersionUuid,
+          sortedDatasetUuids.subList(from, to).toArray(UUID[]::new),
+          jobUuid,
+          symlinkTargetJobUuid,
+          ioType);
+    }
   }
 
   /**
@@ -452,23 +495,33 @@ public interface JobVersionDao extends BaseDao {
 
   /**
    * Used to upsert an immutable {@link JobVersionRow}. A {@link Version} is generated using {@link
-   * Utils#newJobVersionFor(NamespaceName, JobName, ImmutableSet, ImmutableSet, String)} based on
-   * the jobs inputs and inputs, source code location, and context.
+   * Utils#newJobVersionFor} based on the jobs inputs and inputs, source code location, and context.
    *
    * @param jobRow The job.
    * @return A {@link BagOfJobVersionInfo} object.
    */
+  @Transaction
   default BagOfJobVersionInfo upsertRunlessJobVersion(
       @NonNull JobRow jobRow, List<DatasetRecord> inputs, List<DatasetRecord> outputs) {
     // Get the namespace for the job.
     final NamespaceRow namespaceRow =
         createNamespaceDao().findNamespaceByName(jobRow.getNamespaceName()).get();
 
-    return upsertRunlessJobVersion(jobRow, namespaceRow, inputs, outputs);
+    return upsertRunlessJobVersionInTransaction(jobRow, namespaceRow, inputs, outputs);
   }
 
   /** Intake variant that reuses the namespace already resolved for the event. */
+  @Transaction
   default BagOfJobVersionInfo upsertRunlessJobVersion(
+      @NonNull JobRow jobRow,
+      @NonNull NamespaceRow namespaceRow,
+      List<DatasetRecord> inputs,
+      List<DatasetRecord> outputs) {
+    return upsertRunlessJobVersionInTransaction(jobRow, namespaceRow, inputs, outputs);
+  }
+
+  /** Transaction-assuming runless core that reuses the namespace already resolved for the event. */
+  default BagOfJobVersionInfo upsertRunlessJobVersionInTransaction(
       @NonNull JobRow jobRow,
       @NonNull NamespaceRow namespaceRow,
       List<DatasetRecord> inputs,
@@ -505,23 +558,18 @@ public interface JobVersionDao extends BaseDao {
             namespaceRow.getUuid(),
             jobRow.getNamespaceName());
 
-    // Link the input datasets to the job version.
-    jobVersionDao.upsertInputDatasetsFor(
-        jobVersionRow.getUuid(),
-        inputs.stream()
-            .map(input -> input.getDatasetVersionRow().getDatasetUuid())
-            .collect(Collectors.toList()),
-        jobVersionRow.getJobUuid(),
-        jobRow.getSymlinkTargetId());
-
-    // Link the output datasets to the job version.
-    jobVersionDao.upsertOutputDatasetsFor(
-        jobVersionRow.getUuid(),
-        outputs.stream()
-            .map(output -> output.getDatasetVersionRow().getDatasetUuid())
-            .collect(Collectors.toList()),
-        jobVersionRow.getJobUuid(),
-        jobRow.getSymlinkTargetId());
+    // Link the input and output datasets inside the caller's event transaction.
+    jobVersionDao.flushCurrentJobVersionIoInCurrentTransaction(
+        CurrentJobVersionIoWrite.of(
+            jobVersionRow.getUuid(),
+            jobVersionRow.getJobUuid(),
+            jobRow.getSymlinkTargetId(),
+            inputs.stream()
+                .map(input -> input.getDatasetVersionRow().getDatasetUuid())
+                .collect(Collectors.toList()),
+            outputs.stream()
+                .map(output -> output.getDatasetVersionRow().getDatasetUuid())
+                .collect(Collectors.toList())));
 
     jobDao.updateVersionFor(jobRow.getUuid(), jobRow.getCreatedAt(), jobVersionRow.getUuid());
 
@@ -551,17 +599,28 @@ public interface JobVersionDao extends BaseDao {
 
   /**
    * Used to upsert an immutable {@link JobVersionRow} object when a {@link Run} has transitioned. A
-   * {@link Version} is generated using {@link Utils#newJobVersionFor(NamespaceName, JobName,
-   * ImmutableSet, ImmutableSet, String)} based on the jobs inputs and inputs, source code location,
-   * and context. A version for a given job is created <i>only</i> when a {@link Run} transitions
-   * into a {@code COMPLETED}, {@code ABORTED}, or {@code FAILED} state.
+   * {@link Version} is generated using {@link Utils#newJobVersionFor} based on the jobs inputs and
+   * inputs, source code location, and context. A version for a given job is created <i>only</i>
+   * when a {@link Run} transitions into a {@code COMPLETED}, {@code ABORTED}, or {@code FAILED}
+   * state.
    *
    * @param jobRowRunDetails The job row with run details.
    * @param runState The current run state.
    * @param transitionedAt The timestamp of the run state transition.
    * @return A {@link BagOfJobVersionInfo} object.
    */
+  @Transaction
   default BagOfJobVersionInfo upsertJobVersionOnRunTransition(
+      @NonNull JobRowRunDetails jobRowRunDetails,
+      @NonNull RunState runState,
+      @NonNull Instant transitionedAt,
+      boolean linkJobToJobVersion) {
+    return upsertJobVersionOnRunTransitionInTransaction(
+        jobRowRunDetails, runState, transitionedAt, linkJobToJobVersion);
+  }
+
+  /** Transaction-assuming core for a run transition that creates or refreshes a job version. */
+  default BagOfJobVersionInfo upsertJobVersionOnRunTransitionInTransaction(
       @NonNull JobRowRunDetails jobRowRunDetails,
       @NonNull RunState runState,
       @NonNull Instant transitionedAt,
@@ -583,23 +642,18 @@ public interface JobVersionDao extends BaseDao {
             jobRowRunDetails.namespaceRow.getUuid(),
             jobRowRunDetails.jobRow.getNamespaceName());
 
-    // Link the input datasets to the job version.
-    jobVersionDao.upsertInputDatasetsFor(
-        jobVersionRow.getUuid(),
-        jobRowRunDetails.jobVersionInputs.stream()
-            .map(ExtendedDatasetVersionRow::getDatasetUuid)
-            .collect(Collectors.toList()),
-        jobVersionRow.getJobUuid(),
-        jobRowRunDetails.jobRow.getSymlinkTargetId());
-
-    // Link the output datasets to the job version.
-    jobVersionDao.upsertOutputDatasetsFor(
-        jobVersionRow.getUuid(),
-        jobRowRunDetails.jobVersionOutputs.stream()
-            .map(ExtendedDatasetVersionRow::getDatasetUuid)
-            .collect(Collectors.toList()),
-        jobVersionRow.getJobUuid(),
-        jobRowRunDetails.jobRow.getSymlinkTargetId());
+    // Link the input and output datasets inside the caller's event transaction.
+    jobVersionDao.flushCurrentJobVersionIoInCurrentTransaction(
+        CurrentJobVersionIoWrite.of(
+            jobVersionRow.getUuid(),
+            jobVersionRow.getJobUuid(),
+            jobRowRunDetails.jobRow.getSymlinkTargetId(),
+            jobRowRunDetails.jobVersionInputs.stream()
+                .map(ExtendedDatasetVersionRow::getDatasetUuid)
+                .collect(Collectors.toList()),
+            jobRowRunDetails.jobVersionOutputs.stream()
+                .map(ExtendedDatasetVersionRow::getDatasetUuid)
+                .collect(Collectors.toList())));
 
     // Link the job version to the run.
     createRunDao().updateJobVersion(jobRowRunDetails.runUuid, jobVersionRow.getUuid());
@@ -702,6 +756,28 @@ public interface JobVersionDao extends BaseDao {
   }
 
   record JobDataset(String namespace, String name, IoType ioType) {}
+
+  record CurrentJobVersionIoWrite(
+      UUID jobVersionUuid,
+      UUID jobUuid,
+      @Nullable UUID symlinkTargetJobUuid,
+      ImmutableSortedSet<UUID> inputDatasetUuids,
+      ImmutableSortedSet<UUID> outputDatasetUuids) {
+    public static CurrentJobVersionIoWrite of(
+        UUID jobVersionUuid,
+        UUID jobUuid,
+        @Nullable UUID symlinkTargetJobUuid,
+        Iterable<UUID> inputDatasetUuids,
+        Iterable<UUID> outputDatasetUuids) {
+      return new CurrentJobVersionIoWrite(
+          Objects.requireNonNull(jobVersionUuid, "jobVersionUuid"),
+          Objects.requireNonNull(jobUuid, "jobUuid"),
+          symlinkTargetJobUuid,
+          ImmutableSortedSet.copyOf(Objects.requireNonNull(inputDatasetUuids, "inputDatasetUuids")),
+          ImmutableSortedSet.copyOf(
+              Objects.requireNonNull(outputDatasetUuids, "outputDatasetUuids")));
+    }
+  }
 
   record JobRowRunDetails(
       JobRow jobRow,

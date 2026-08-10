@@ -5,21 +5,32 @@
 
 package marquez.db;
 
+import static marquez.db.DbTestUtils.createJobWithSymlinkTarget;
+import static marquez.db.DbTestUtils.createJobWithoutSymlinkTarget;
 import static marquez.db.LineageTestUtils.NAMESPACE;
 import static marquez.db.LineageTestUtils.PRODUCER_URL;
 import static marquez.db.LineageTestUtils.SCHEMA_URL;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import marquez.common.models.DatasetName;
 import marquez.common.models.DatasetVersionId;
 import marquez.common.models.NamespaceName;
+import marquez.db.models.JobRow;
+import marquez.db.models.NamespaceRow;
 import marquez.db.models.UpdateLineageRow;
 import marquez.db.models.UpdateLineageRow.DatasetRecord;
 import marquez.jdbi.MarquezJdbiExternalPostgresExtension;
@@ -35,6 +46,9 @@ import marquez.service.models.Run;
 import org.assertj.core.api.InstanceOfAssertFactories;
 import org.assertj.core.groups.Tuple;
 import org.jdbi.v3.core.Jdbi;
+import org.jdbi.v3.core.statement.SqlLogger;
+import org.jdbi.v3.core.statement.SqlStatements;
+import org.jdbi.v3.core.statement.StatementContext;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -58,19 +72,25 @@ class OpenLineageDaoTest {
   private static DatasetSymlinkDao symlinkDao;
   private static NamespaceDao namespaceDao;
   private static DatasetFieldDao datasetFieldDao;
+  private static DatasetDao datasetDao;
   private static ColumnLineageDao columnLineageDao;
+  private static JobDao jobDao;
   private static RunDao runDao;
+  private static Jdbi jdbi;
   private final DatasetFacets datasetFacets =
       LineageTestUtils.newDatasetFacet(
           new SchemaField("name", "STRING", "my name"), new SchemaField("age", "INT", "my age"));
 
   @BeforeAll
-  public static void setUpOnce(Jdbi jdbi) {
+  public static void setUpOnce(Jdbi configuredJdbi) {
+    jdbi = configuredJdbi;
     dao = jdbi.onDemand(OpenLineageDao.class);
     symlinkDao = jdbi.onDemand(DatasetSymlinkDao.class);
     namespaceDao = jdbi.onDemand(NamespaceDao.class);
     datasetFieldDao = jdbi.onDemand(DatasetFieldDao.class);
+    datasetDao = jdbi.onDemand(DatasetDao.class);
     columnLineageDao = jdbi.onDemand(ColumnLineageDao.class);
+    jobDao = jdbi.onDemand(JobDao.class);
     runDao = jdbi.onDemand(RunDao.class);
   }
 
@@ -117,6 +137,178 @@ class OpenLineageDaoTest {
     assertThat(datasetFieldDao.findByDatasetSchemaVersion(schemaVersionUuid))
         .extracting((ds) -> ds.getName().getValue())
         .containsExactlyInAnyOrder("name", "age");
+  }
+
+  @Test
+  void batchesDistinctDatasetFieldsAndMappingsOncePerSide() {
+    String suffix = UUID.randomUUID().toString();
+    String datasetNamespace = "side_batch_" + suffix;
+    Dataset existingInput = new Dataset(datasetNamespace, "input_a", datasetFacets);
+    LineageTestUtils.createLineageRow(dao, existingInput);
+
+    List<String> executedSql = new ArrayList<>();
+    UpdateLineageRow[] projected = new UpdateLineageRow[1];
+    jdbi.useHandle(
+        handle -> {
+          handle
+              .getConfig(SqlStatements.class)
+              .setSqlLogger(
+                  new SqlLogger() {
+                    @Override
+                    public void logAfterExecution(StatementContext context) {
+                      executedSql.add(context.getRawSql());
+                    }
+                  });
+          OpenLineageDao attachedDao = handle.attach(OpenLineageDao.class);
+          projected[0] =
+              LineageTestUtils.createLineageRow(
+                  attachedDao,
+                  "side_batch_job_" + suffix,
+                  "COMPLETE",
+                  JobFacet.builder().build(),
+                  List.of(existingInput, new Dataset(datasetNamespace, "input_b", datasetFacets)),
+                  List.of(
+                      new Dataset(datasetNamespace, "output_a", datasetFacets),
+                      new Dataset(datasetNamespace, "output_b", datasetFacets)));
+        });
+
+    assertThat(projected[0].getInputs().orElseThrow())
+        .extracting(record -> record.getDatasetRow().getName())
+        .containsExactly("input_a", "input_b");
+    assertThat(projected[0].getOutputs().orElseThrow())
+        .extracting(record -> record.getDatasetRow().getName())
+        .containsExactly("output_a", "output_b");
+    assertThat(
+            executedSql.stream().filter(sql -> sql.contains("INSERT INTO dataset_fields")).count())
+        .isEqualTo(2);
+    assertThat(
+            executedSql.stream()
+                .filter(sql -> sql.contains("INSERT INTO dataset_versions_field_mapping"))
+                .count())
+        .isEqualTo(2);
+    assertThat(executedSql.stream().filter(sql -> sql.contains("WHERE dv.uuid = ANY")).count())
+        .isEqualTo(1);
+    assertThat(
+            executedSql.stream()
+                .filter(sql -> sql.contains("INSERT INTO runs_input_mapping"))
+                .count())
+        .isEqualTo(1);
+  }
+
+  @Test
+  void ordersInputMappingResolutionOutputMappingAndPhysicalColumnLineageFlush() {
+    UUID runUuid = UUID.randomUUID();
+    String suffix = runUuid.toString();
+    String datasetNamespace = "column_order_" + suffix;
+    String inputName = "input_" + suffix;
+    String outputName = "output_" + suffix;
+    Dataset input =
+        new Dataset(
+            datasetNamespace,
+            inputName,
+            LineageTestUtils.newDatasetFacet(new SchemaField(INPUT_FIELD_NAME, "STRING", "input")));
+    Dataset output =
+        new Dataset(
+            datasetNamespace,
+            outputName,
+            DatasetFacets.builder()
+                .schema(
+                    new SchemaDatasetFacet(
+                        PRODUCER_URL,
+                        SCHEMA_URL,
+                        List.of(new SchemaField(OUTPUT_COLUMN, "STRING", "output"))))
+                .columnLineage(
+                    new LineageEvent.ColumnLineageDatasetFacet(
+                        PRODUCER_URL,
+                        SCHEMA_URL,
+                        new LineageEvent.ColumnLineageDatasetFacetFields(
+                            Collections.singletonMap(
+                                OUTPUT_COLUMN,
+                                new LineageEvent.ColumnLineageOutputColumn(
+                                    List.of(
+                                        new LineageEvent.ColumnLineageInputField(
+                                            datasetNamespace, inputName, INPUT_FIELD_NAME)),
+                                    TRANSFORMATION_DESCRIPTION,
+                                    TRANSFORMATION_TYPE)))))
+                .build());
+
+    List<String> executedSql = new ArrayList<>();
+    jdbi.useHandle(
+        handle -> {
+          handle
+              .getConfig(SqlStatements.class)
+              .setSqlLogger(
+                  new SqlLogger() {
+                    @Override
+                    public void logAfterExecution(StatementContext context) {
+                      executedSql.add(context.getRawSql());
+                    }
+                  });
+          OpenLineageDao attachedDao = handle.attach(OpenLineageDao.class);
+          LineageTestUtils.createLineageRow(
+              attachedDao,
+              "column_order_job_" + suffix,
+              runUuid,
+              "COMPLETE",
+              JobFacet.builder().build(),
+              List.of(input),
+              List.of(output),
+              null,
+              ImmutableMap.of());
+        });
+
+    assertThat(
+            executedSql.stream()
+                .filter(
+                    sql ->
+                        sql.contains("FROM dataset_fields")
+                            && sql.contains("JOIN runs_input_mapping"))
+                .count())
+        .isEqualTo(1);
+    assertThat(
+            executedSql.stream().filter(sql -> sql.contains("INSERT INTO column_lineage")).count())
+        .isEqualTo(1);
+
+    int inputMapping = findSqlIndexAfter(executedSql, -1, "INSERT INTO runs_input_mapping");
+    int inputFieldResolution =
+        findSqlIndexAfter(
+            executedSql, inputMapping, "FROM dataset_fields", "JOIN runs_input_mapping");
+    int outputFieldMapping =
+        findSqlIndexAfter(
+            executedSql, inputFieldResolution, "INSERT INTO dataset_versions_field_mapping");
+    int physicalColumnLineage =
+        findSqlIndexAfter(executedSql, outputFieldMapping, "INSERT INTO column_lineage");
+
+    assertThat(inputMapping).isLessThan(inputFieldResolution);
+    assertThat(inputFieldResolution).isLessThan(outputFieldMapping);
+    assertThat(outputFieldMapping).isLessThan(physicalColumnLineage);
+  }
+
+  @Test
+  void repeatedDatasetOnOneSidePreservesOccurrenceSemantics() {
+    String suffix = UUID.randomUUID().toString();
+    Dataset repeated = new Dataset("repeated_side_" + suffix, "input", datasetFacets);
+
+    UpdateLineageRow projected =
+        LineageTestUtils.createLineageRow(
+            dao,
+            "repeated_side_job_" + suffix,
+            "COMPLETE",
+            JobFacet.builder().build(),
+            List.of(repeated, repeated),
+            Collections.emptyList());
+
+    assertThat(projected.getInputs().orElseThrow()).hasSize(2);
+    assertThat(projected.getInputs().orElseThrow())
+        .extracting(record -> record.getDatasetRow().getUuid())
+        .containsExactly(
+            projected.getInputs().orElseThrow().get(0).getDatasetRow().getUuid(),
+            projected.getInputs().orElseThrow().get(0).getDatasetRow().getUuid());
+    assertThat(projected.getInputs().orElseThrow())
+        .extracting(record -> record.getDatasetVersionRow().getUuid())
+        .containsExactly(
+            projected.getInputs().orElseThrow().get(0).getDatasetVersionRow().getUuid(),
+            projected.getInputs().orElseThrow().get(0).getDatasetVersionRow().getUuid());
   }
 
   @Test
@@ -315,8 +507,85 @@ class OpenLineageDaoTest {
   }
 
   @Test
+  void lateColumnLineageFailureRollsBackWholeProjection() {
+    UUID runUuid = UUID.randomUUID();
+    String suffix = runUuid.toString();
+    String jobName = "rollback_job_" + suffix;
+    String datasetNamespace = "rollback_namespace_" + suffix;
+    String inputName = "rollback_input_" + suffix;
+    String outputName = "rollback_output_" + suffix;
+    Dataset input =
+        new Dataset(
+            datasetNamespace,
+            inputName,
+            LineageTestUtils.newDatasetFacet(new SchemaField(INPUT_FIELD_NAME, "STRING", "input")));
+    Dataset output =
+        new Dataset(
+            datasetNamespace,
+            outputName,
+            DatasetFacets.builder()
+                .schema(
+                    new SchemaDatasetFacet(
+                        PRODUCER_URL,
+                        SCHEMA_URL,
+                        List.of(new SchemaField(OUTPUT_COLUMN, "STRING", "output"))))
+                .columnLineage(
+                    new LineageEvent.ColumnLineageDatasetFacet(
+                        PRODUCER_URL,
+                        SCHEMA_URL,
+                        new LineageEvent.ColumnLineageDatasetFacetFields(
+                            Collections.singletonMap(
+                                OUTPUT_COLUMN,
+                                new LineageEvent.ColumnLineageOutputColumn(
+                                    List.of(
+                                        new LineageEvent.ColumnLineageInputField(
+                                            datasetNamespace, inputName, INPUT_FIELD_NAME)),
+                                    TRANSFORMATION_DESCRIPTION,
+                                    // Force a physical column_lineage insert failure after the job,
+                                    // run, and both dataset sides have been projected.
+                                    "x".repeat(256))))))
+                .build());
+
+    assertThatThrownBy(
+            () ->
+                LineageTestUtils.createLineageRow(
+                    dao,
+                    jobName,
+                    runUuid,
+                    "COMPLETE",
+                    JobFacet.builder().build(),
+                    List.of(input),
+                    List.of(output),
+                    null,
+                    ImmutableMap.of()))
+        .isInstanceOf(RuntimeException.class)
+        .hasStackTraceContaining("value too long for type character varying(255)");
+
+    assertThat(runDao.findRunByUuidAsRow(runUuid)).isEmpty();
+    assertThat(jobDao.findJobByNameAsRow(NAMESPACE, jobName)).isEmpty();
+    assertThat(datasetDao.findDatasetAsRow(datasetNamespace, inputName)).isEmpty();
+    assertThat(datasetDao.findDatasetAsRow(datasetNamespace, outputName)).isEmpty();
+    assertThat(namespaceDao.findNamespaceByName(datasetNamespace)).isEmpty();
+  }
+
+  @Test
   void testGetUrlOrNullReturnsEmptyString() {
     assertEquals("", dao.getUrlOrNull(null));
+  }
+
+  private static int findSqlIndexAfter(
+      List<String> executedSql, int previousIndex, String... requiredFragments) {
+    for (int index = previousIndex + 1; index < executedSql.size(); index++) {
+      String sql = executedSql.get(index);
+      if (Arrays.stream(requiredFragments).allMatch(sql::contains)) {
+        return index;
+      }
+    }
+    throw new AssertionError(
+        "Did not execute SQL containing "
+            + Arrays.toString(requiredFragments)
+            + " after statement index "
+            + previousIndex);
   }
 
   @Test
@@ -439,6 +708,93 @@ class OpenLineageDaoTest {
                 .getType()
                 .get())
         .isEqualTo("some-type");
+  }
+
+  @Test
+  void concurrentPrimaryAndAliasEventsSerializeCanonicalJobMappings() throws Exception {
+    String suffix = UUID.randomUUID().toString();
+    NamespaceRow namespace =
+        namespaceDao.upsertNamespaceRow(
+            UUID.randomUUID(), java.time.Instant.now(), NAMESPACE, getClass().getName());
+    String primaryJobName = "canonical_job_" + suffix;
+    String aliasJobName = "alias_job_" + suffix;
+    JobRow primaryJob =
+        createJobWithoutSymlinkTarget(
+            jdbi, namespace, primaryJobName, "canonical concurrency target");
+    createJobWithSymlinkTarget(
+        jdbi, namespace, aliasJobName, primaryJob.getUuid(), "existing alias");
+
+    Dataset primaryInput = new Dataset("alias_lock_" + suffix, "primary_input", datasetFacets);
+    Dataset primaryOutput = new Dataset("alias_lock_" + suffix, "primary_output", datasetFacets);
+    Dataset aliasInput = new Dataset("alias_lock_" + suffix, "alias_input", datasetFacets);
+    Dataset aliasOutput = new Dataset("alias_lock_" + suffix, "alias_output", datasetFacets);
+
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+    CountDownLatch ready = new CountDownLatch(2);
+    CountDownLatch start = new CountDownLatch(1);
+    try {
+      Future<UpdateLineageRow> primary =
+          executor.submit(
+              () ->
+                  projectAfter(
+                      ready, start, primaryJobName, List.of(primaryInput), List.of(primaryOutput)));
+      Future<UpdateLineageRow> alias =
+          executor.submit(
+              () ->
+                  projectAfter(
+                      ready, start, aliasJobName, List.of(aliasInput), List.of(aliasOutput)));
+
+      assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue();
+      start.countDown();
+      assertThat(primary.get(20, TimeUnit.SECONDS).getJob().getUuid())
+          .isEqualTo(primaryJob.getUuid());
+      assertThat(alias.get(20, TimeUnit.SECONDS).getJob().getUuid())
+          .isEqualTo(primaryJob.getUuid());
+
+      for (JobVersionDao.IoType ioType : JobVersionDao.IoType.values()) {
+        int currentMappings =
+            jdbi.withHandle(
+                handle ->
+                    handle
+                        .createQuery(
+                            """
+                            SELECT count(*)
+                            FROM job_versions_io_mapping
+                            WHERE job_uuid = :jobUuid
+                              AND io_type = :ioType
+                              AND is_current_job_version = TRUE
+                            """)
+                        .bind("jobUuid", primaryJob.getUuid())
+                        .bind("ioType", ioType.name())
+                        .mapTo(Integer.class)
+                        .one());
+        assertThat(currentMappings).as(ioType.name()).isEqualTo(1);
+      }
+    } finally {
+      start.countDown();
+      executor.shutdownNow();
+      executor.awaitTermination(5, TimeUnit.SECONDS);
+    }
+  }
+
+  private UpdateLineageRow projectAfter(
+      CountDownLatch ready,
+      CountDownLatch start,
+      String jobName,
+      List<Dataset> inputs,
+      List<Dataset> outputs)
+      throws InterruptedException {
+    ready.countDown();
+    if (!start.await(5, TimeUnit.SECONDS)) {
+      throw new IllegalStateException("Timed out waiting to start concurrent projections");
+    }
+    return LineageTestUtils.createLineageRow(
+        jdbi.onDemand(OpenLineageDao.class),
+        jobName,
+        "COMPLETE",
+        LineageEvent.JobFacet.builder().build(),
+        inputs,
+        outputs);
   }
 
   /**

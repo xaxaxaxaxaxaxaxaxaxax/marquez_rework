@@ -13,6 +13,7 @@ import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -27,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import marquez.common.models.RunState;
 import marquez.db.ColumnLineageDao.ColumnLineageDatasetWrite;
 import marquez.db.ColumnLineageDao.ColumnLineageWrite;
 import marquez.db.OpenLineageDao.ColumnLineageContext;
@@ -47,12 +49,48 @@ import marquez.service.models.LineageEvent.DatasetFacets;
 import org.apache.commons.lang3.tuple.Pair;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 
 class OpenLineageColumnLineageContextTest {
   private static final String INPUT_NAMESPACE = "input_namespace";
   private static final String INPUT_DATASET = "input_dataset";
   private static final String INPUT_FIELD = "input_field";
   private static final String OUTPUT_COLUMN = "output_column";
+
+  @Test
+  void preservesLegacyPublicDaoEntryPoints() throws NoSuchMethodException {
+    assertThat(
+            OpenLineageDao.class.getMethod(
+                "updateMarquezOnComplete",
+                LineageEvent.class,
+                UpdateLineageRow.class,
+                RunState.class))
+        .isNotNull();
+    assertThat(
+            OpenLineageDao.class.getMethod(
+                "updateMarquezOnStreamingJob",
+                LineageEvent.class,
+                UpdateLineageRow.class,
+                RunState.class))
+        .isNotNull();
+    assertThat(
+            ColumnLineageDao.class.getMethod(
+                "upsertColumnLineageRowsForIntake", List.class, Instant.class))
+        .isNotNull();
+    assertThat(
+            JobVersionDao.class.getMethod(
+                "upsertCurrentInputOrOutputDatasetsFor",
+                UUID.class,
+                Iterable.class,
+                UUID.class,
+                UUID.class,
+                JobVersionDao.IoType.class))
+        .isNotNull();
+    assertThat(
+            RunArgsDao.class.getMethod(
+                "doUpsertRunArgs", UUID.class, Instant.class, String.class, String.class))
+        .isNotNull();
+  }
 
   @Test
   void doesNotLoadInputFieldsForOutputsWithoutNonemptyColumnLineage() {
@@ -84,7 +122,7 @@ class OpenLineageColumnLineageContextTest {
   }
 
   @Test
-  void loadsInputFieldsOnceAndFlushesMultipleOutputDatasetsInOneIntakeCall() {
+  void resolvesRunFieldsOnceAndFlushesMultipleOutputDatasetsInOnePhysicalIntakeCall() {
     UUID runUuid = UUID.randomUUID();
     UUID inputDatasetUuid = UUID.randomUUID();
     UUID inputDatasetVersionUuid = UUID.randomUUID();
@@ -92,8 +130,10 @@ class OpenLineageColumnLineageContextTest {
     UUID outputDatasetFieldUuid = UUID.randomUUID();
 
     ModelDaos daos = mock(ModelDaos.class);
+    RunDao runDao = mock(RunDao.class);
     DatasetFieldDao datasetFieldDao = mock(DatasetFieldDao.class);
     ColumnLineageDao columnLineageDao = mock(ColumnLineageDao.class);
+    when(daos.getRunDao()).thenReturn(runDao);
     when(daos.getDatasetFieldDao()).thenReturn(datasetFieldDao);
     when(daos.getColumnLineageDao()).thenReturn(columnLineageDao);
     when(datasetFieldDao.findInputFieldsDataAssociatedWithRun(runUuid))
@@ -116,6 +156,8 @@ class OpenLineageColumnLineageContextTest {
 
     LineageWriteContext context = LineageWriteContext.forIntake(daos, runUuid);
     Instant now = Instant.now();
+    context.queueInputMapping(inputDatasetVersionUuid);
+    context.flushInputMappings();
     context.collectColumnLineage(
         outputWithColumnLineage("first_output"),
         now,
@@ -128,11 +170,19 @@ class OpenLineageColumnLineageContextTest {
         secondVersion);
     context.flushColumnLineage(now);
 
-    verify(datasetFieldDao, times(1)).findInputFieldsDataAssociatedWithRun(runUuid);
     @SuppressWarnings("unchecked")
     ArgumentCaptor<List<ColumnLineageDatasetWrite>> writes = ArgumentCaptor.forClass(List.class);
-    verify(columnLineageDao, times(1)).upsertColumnLineageRowsForIntake(writes.capture(), eq(now));
+    InOrder flushOrder = inOrder(runDao, datasetFieldDao, columnLineageDao);
+    flushOrder.verify(runDao).updateInputMappingsInTransaction(eq(runUuid), any());
+    flushOrder.verify(datasetFieldDao).findInputFieldsDataAssociatedWithRun(runUuid);
+    flushOrder
+        .verify(columnLineageDao)
+        .upsertColumnLineageRowsForIntakeInTransaction(writes.capture(), eq(now));
+    verify(datasetFieldDao, times(1)).findInputFieldsDataAssociatedWithRun(runUuid);
     assertThat(writes.getValue()).hasSize(2);
+    assertThat(writes.getValue())
+        .extracting(ColumnLineageDatasetWrite::outputDatasetVersionUuid)
+        .containsExactly(firstVersion.getUuid(), secondVersion.getUuid());
     for (ColumnLineageDatasetWrite datasetWrite : writes.getValue()) {
       assertThat(datasetWrite.writes()).hasSize(1);
       assertThat(datasetWrite.writes().get(0).outputDatasetFieldUuid())
@@ -140,6 +190,8 @@ class OpenLineageColumnLineageContextTest {
       assertThat(datasetWrite.writes().get(0).inputs())
           .containsExactly(Pair.of(inputDatasetVersionUuid, inputDatasetFieldUuid));
     }
+    verify(columnLineageDao, never())
+        .upsertColumnLineageRowsForIntake(anyList(), any(Instant.class));
     verify(columnLineageDao, never())
         .upsertColumnLineageRows(any(UUID.class), anyList(), any(Instant.class));
   }
@@ -159,6 +211,28 @@ class OpenLineageColumnLineageContextTest {
             Instant.now(),
             Collections.singletonList(outputField),
             datasetVersion);
+
+    verify(daos, never()).getDatasetFieldDao();
+    verify(daos, never()).getColumnLineageDao();
+  }
+
+  @Test
+  void intakeSkipsPhysicalColumnLineageWithoutRunUuid() {
+    ModelDaos daos = mock(ModelDaos.class);
+    DatasetFieldRow outputField = mock(DatasetFieldRow.class);
+    DatasetVersionRow datasetVersion = mock(DatasetVersionRow.class);
+    when(outputField.getName()).thenReturn(OUTPUT_COLUMN);
+    when(outputField.getUuid()).thenReturn(UUID.randomUUID());
+    when(datasetVersion.getUuid()).thenReturn(UUID.randomUUID());
+
+    LineageWriteContext context = LineageWriteContext.forIntake(daos, null);
+    Instant now = Instant.now();
+    context.collectColumnLineage(
+        outputWithColumnLineage("runless_output"),
+        now,
+        Collections.singletonList(outputField),
+        datasetVersion);
+    context.flushColumnLineage(now);
 
     verify(daos, never()).getDatasetFieldDao();
     verify(daos, never()).getColumnLineageDao();

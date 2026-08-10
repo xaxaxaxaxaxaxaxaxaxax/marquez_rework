@@ -248,6 +248,20 @@ public interface JobDao extends BaseDao {
       """)
   Optional<JobRow> findJobByUuidAsRow(UUID jobUuid);
 
+  /**
+   * Locks and returns a canonical job row. Intake uses this after an alias upsert resolves through
+   * {@code jobs_view}, whose trigger locks the alias row rather than its canonical target.
+   */
+  @SqlQuery(
+      """
+        SELECT j.*, p.name::text AS parent_job_name
+        FROM jobs AS j
+        LEFT JOIN jobs AS p ON p.uuid = j.parent_job_uuid
+        WHERE j.uuid = :jobUuid
+        FOR UPDATE OF j
+      """)
+  JobRow lockJobByUuid(UUID jobUuid);
+
   @SqlQuery(
       """
         SELECT j.*, n.name AS namespace_name

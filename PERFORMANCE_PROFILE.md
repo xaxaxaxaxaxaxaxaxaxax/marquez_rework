@@ -1,6 +1,6 @@
 # Cumulative performance profile
 
-Profile date: 2026-08-10
+Profile date: 2026-08-11
 
 This is an indicative, correctness-gated PostgreSQL 14 profile of the rework against the
 unmodified repository at `/tmp/marquez-rework-upstream`. It is not a production capacity test.
@@ -146,6 +146,44 @@ work and, under HOT replay, the same job-row lock wait; total LSN movement is th
 WAL measure and endpoint latency is the primary contention measure. Three trials are indicative,
 not a production capacity test, but every large endpoint gain was directionally consistent across
 all paired trials.
+
+## Second-round intake write batching
+
+A second comparison isolates the additional `/lineage` write-path changes from commit `6232e5eb`
+at native P76. It used 32 new PostgreSQL 14 databases: the four workloads, baseline and candidate,
+and three interleaved seed-paired trials per workload, extended to seven for M3. All requests
+returned 201, every invariant passed, and all 16 paired semantic-state hashes matched. Search
+remained disabled. Absolute values below are the median trial values; percentages and multipliers
+are medians of the paired ratios.
+
+| Workload | Request p50 | Request p95 | Requests/s | SQL calls/request | SQL ms/request | LSN bytes/request |
+|---|---:|---:|---:|---:|---:|---:|
+| M0: required-only | 23.5 -> 23.2 ms (-9.1%) | 34.4 -> 33.2 ms (-11.7%) | 156.9 -> 168.1 (1.11x) | 16.1 -> 11.1 (-31.1%) | 0.53 -> 0.52 (-3.5%) | 2,631 -> 2,629 (flat) |
+| M1: 6 datasets, 8 fields | 31.3 -> 31.9 ms (+1.1%) | 65.4 -> 63.1 ms (-8.5%) | 104.3 -> 108.5 (1.04x) | 112.5 -> 74.0 (-34.2%) | 2.62 -> 2.39 (-8.9%) | 29,696 -> 29,933 (+0.8%) |
+| M3: 32 fields, 256 column edges | 41.5 -> 36.8 ms (-15.7%) | 119.8 -> 109.2 ms (-4.1%) | 59.7 -> 64.6 (1.06x) | 749.2 -> 638.2 (-14.8%) | 10.11 -> 10.30 (+2.5%) | 179,493 -> 179,165 (flat) |
+| HOT: identical COMPLETE replay | 53.6 -> 47.7 ms (-11.1%) | 318.8 -> 260.0 ms (-16.3%) | 37.9 -> 40.0 (1.04x) | 155.0 -> 83.0 (-46.4%) | 126.69 -> 119.60 (-7.4%) | 29,869 -> 30,281 (+2.2%) |
+
+The main reduction comes from set-based job-version I/O writes and flushing dataset fields,
+version-field mappings, current versions, and run-input mappings in bounded side-level batches.
+The smallest useful call-count model is:
+
+```text
+field-mapping calls per side: F -> ceil(F / 1000)
+column-lineage calls:         1 run-field lookup + ceil(E / 1000) physical inserts
+```
+
+Here `F` is the side's field-mapping count and `E` is its resolved physical column-edge count.
+Arrays are bounded at 1,000 pairs; duplicate inputs use set semantics, while occurrence-sensitive
+dataset projection remains ordered. One outer transaction covers job, run, both dataset sides,
+facets, mappings, and column lineage. A canonical base-job row lock also serializes concurrent
+primary-name and alias events before run and dataset locks.
+
+A one-statement logical column resolver was benchmarked and rejected. On M3 it reduced one SQL
+call but raised database execution time per request by about 58%, p95 by about 8%, and left
+throughput slightly worse. The final path deliberately retains the extra cached run-field lookup:
+that lookup cost about 0.4 ms per lineage event, while the logical resolver cost about 20 ms. This
+is why M3 SQL time remains effectively neutral despite 14.8% fewer executions, while p50, p95,
+and throughput improve and WAL remains flat.
 
 ## Caveats
 

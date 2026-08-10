@@ -201,7 +201,7 @@ class RunDaoTest {
     UUID runUuid = UUID.randomUUID();
     List<UUID> datasetVersionUuids = uuidSequence(RunDao.RUN_INPUT_MAPPING_CHUNK_SIZE);
 
-    batchingDao.updateInputMappings(runUuid, datasetVersionUuids);
+    batchingDao.updateInputMappingsInTransaction(runUuid, datasetVersionUuids);
 
     ArgumentCaptor<UUID[]> chunk = ArgumentCaptor.forClass(UUID[].class);
     verify(batchingDao).insertInputMappingsChunk(eq(runUuid), chunk.capture());
@@ -217,7 +217,7 @@ class RunDaoTest {
     repeatedDatasetVersionUuids.add(1, uniqueDatasetVersionUuids.get(0));
     repeatedDatasetVersionUuids.add(uniqueDatasetVersionUuids.get(999));
 
-    batchingDao.updateInputMappings(runUuid, repeatedDatasetVersionUuids);
+    batchingDao.updateInputMappingsInTransaction(runUuid, repeatedDatasetVersionUuids);
 
     ArgumentCaptor<UUID[]> chunks = ArgumentCaptor.forClass(UUID[].class);
     verify(batchingDao, times(2)).insertInputMappingsChunk(eq(runUuid), chunks.capture());
