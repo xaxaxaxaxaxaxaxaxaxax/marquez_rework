@@ -66,6 +66,13 @@ logging:
     #   environment: ${SENTRY_ENVIRONMENT}
     #   stacktraceAppPackages: ['marquez']
 
+### OPENLINEAGE INTAKE CONFIG ###
+
+# Bounds concurrent and queued OpenLineage events. Rejected requests return HTTP 503.
+openLineage:
+  workerThreads: ${OPEN_LINEAGE_WORKER_THREADS:-8}
+  queueCapacity: ${OPEN_LINEAGE_QUEUE_CAPACITY:-100}
+
 search:
   enabled: true
   scheme: http

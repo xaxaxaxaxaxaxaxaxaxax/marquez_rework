@@ -5,23 +5,25 @@
 
 package marquez.db;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Spliterator;
-import java.util.Spliterators;
+import java.util.List;
 import java.util.UUID;
-import java.util.stream.StreamSupport;
 import javax.annotation.Nullable;
 import lombok.NonNull;
-import marquez.common.Utils;
+import lombok.Value;
 import marquez.service.models.LineageEvent;
+import org.jdbi.v3.sqlobject.customizer.BindBeanList;
 import org.jdbi.v3.sqlobject.statement.SqlUpdate;
 import org.jdbi.v3.sqlobject.transaction.Transaction;
 import org.postgresql.util.PGobject;
 
 /** The DAO for {@code dataset} facets. */
 public interface DatasetFacetsDao {
+  // Each container binds eight values; keep chunks comfortably below PostgreSQL's bind limit.
+  int MAX_FACET_CONTAINERS_PER_INSERT = 1000;
+
   /* An {@code enum} used ... */
   enum Type {
     DATASET,
@@ -116,6 +118,103 @@ public interface DatasetFacetsDao {
       String name,
       PGobject facet);
 
+  @SqlUpdate(
+      """
+      WITH facet_containers (
+        created_at,
+        dataset_uuid,
+        dataset_version_uuid,
+        run_uuid,
+        lineage_event_time,
+        lineage_event_type,
+        type_override,
+        facets
+      ) AS (
+        VALUES <values>
+      )
+      INSERT INTO dataset_facets (
+        created_at,
+        dataset_uuid,
+        dataset_version_uuid,
+        run_uuid,
+        lineage_event_time,
+        lineage_event_type,
+        type,
+        name,
+        facet
+      )
+      SELECT
+        CAST(facet_containers.created_at AS timestamptz),
+        CAST(facet_containers.dataset_uuid AS uuid),
+        CAST(facet_containers.dataset_version_uuid AS uuid),
+        CAST(facet_containers.run_uuid AS uuid),
+        CAST(facet_containers.lineage_event_time AS timestamptz),
+        CAST(facet_containers.lineage_event_type AS varchar),
+        COALESCE(
+          CAST(facet_containers.type_override AS varchar),
+          CASE
+            WHEN lower(facet_entry.name) IN (
+              'documentation',
+              'description',
+              'schema',
+              'datasource',
+              'lifecyclestatechange',
+              'version',
+              'columnlineage',
+              'ownership'
+            ) THEN 'DATASET'
+            WHEN lower(facet_entry.name) IN (
+              'dataqualitymetrics',
+              'dataqualityassertions'
+            ) THEN 'INPUT'
+            WHEN lower(facet_entry.name) = 'outputstatistics' THEN 'OUTPUT'
+            ELSE 'UNKNOWN'
+          END
+        ),
+        facet_entry.name,
+        jsonb_build_object(facet_entry.name, facet_entry.value)
+      FROM facet_containers
+      CROSS JOIN LATERAL
+        jsonb_each(CAST(facet_containers.facets AS jsonb)) AS facet_entry(name, value)
+      """)
+  void doInsertDatasetFacetWrites(
+      @BindBeanList(
+              propertyNames = {
+                "createdAt",
+                "datasetUuid",
+                "datasetVersionUuid",
+                "runUuid",
+                "lineageEventTime",
+                "lineageEventType",
+                "typeOverride",
+                "facets"
+              },
+              value = "values")
+          List<DatasetFacetWrite> writes);
+
+  /**
+   * Flushes serialized facet containers in bounded batches. This is the event-scope API: callers
+   * may collect dataset, input, and output containers and write them after their referenced rows
+   * have been created.
+   */
+  @Transaction
+  default void insertDatasetFacetWrites(@NonNull List<DatasetFacetWrite> writes) {
+    List<DatasetFacetWrite> batch = new ArrayList<>(MAX_FACET_CONTAINERS_PER_INSERT);
+    for (DatasetFacetWrite write : writes) {
+      if (FacetUtils.isEmpty(write.getFacets())) {
+        continue;
+      }
+      batch.add(write);
+      if (batch.size() == MAX_FACET_CONTAINERS_PER_INSERT) {
+        doInsertDatasetFacetWrites(batch);
+        batch = new ArrayList<>(MAX_FACET_CONTAINERS_PER_INSERT);
+      }
+    }
+    if (!batch.isEmpty()) {
+      doInsertDatasetFacetWrites(batch);
+    }
+  }
+
   /**
    * @param datasetUuid
    * @param runUuid
@@ -123,7 +222,6 @@ public interface DatasetFacetsDao {
    * @param lineageEventType
    * @param datasetFacets
    */
-  @Transaction
   default void insertDatasetFacetsFor(
       @NonNull UUID datasetUuid,
       @NonNull UUID datasetVersionUuid,
@@ -131,23 +229,16 @@ public interface DatasetFacetsDao {
       @NonNull Instant lineageEventTime,
       @Nullable String lineageEventType,
       @NonNull LineageEvent.DatasetFacets datasetFacets) {
-    final Instant now = Instant.now();
-
-    JsonNode jsonNode = Utils.getMapper().valueToTree(datasetFacets);
-    StreamSupport.stream(
-            Spliterators.spliteratorUnknownSize(jsonNode.fieldNames(), Spliterator.DISTINCT), false)
-        .forEach(
-            fieldName ->
-                insertDatasetFacet(
-                    now,
-                    datasetUuid,
-                    datasetVersionUuid,
-                    runUuid,
-                    lineageEventTime,
-                    lineageEventType,
-                    DatasetFacet.typeFromName(fieldName),
-                    fieldName,
-                    FacetUtils.toPgObject(fieldName, jsonNode.get(fieldName))));
+    insertDatasetFacetWrites(
+        List.of(
+            DatasetFacetWrite.forDatasetFacets(
+                Instant.now(),
+                datasetUuid,
+                datasetVersionUuid,
+                runUuid,
+                lineageEventTime,
+                lineageEventType,
+                datasetFacets)));
   }
 
   default void insertInputDatasetFacetsFor(
@@ -157,23 +248,16 @@ public interface DatasetFacetsDao {
       @NonNull Instant lineageEventTime,
       @Nullable String lineageEventType,
       @NonNull LineageEvent.InputDatasetFacets inputFacets) {
-    final Instant now = Instant.now();
-
-    JsonNode jsonNode = Utils.getMapper().valueToTree(inputFacets);
-    StreamSupport.stream(
-            Spliterators.spliteratorUnknownSize(jsonNode.fieldNames(), Spliterator.DISTINCT), false)
-        .forEach(
-            fieldName ->
-                insertDatasetFacet(
-                    now,
-                    datasetUuid,
-                    datasetVersionUuid,
-                    runUuid,
-                    lineageEventTime,
-                    lineageEventType,
-                    Type.INPUT,
-                    fieldName,
-                    FacetUtils.toPgObject(fieldName, jsonNode.get(fieldName))));
+    insertDatasetFacetWrites(
+        List.of(
+            DatasetFacetWrite.forInputFacets(
+                Instant.now(),
+                datasetUuid,
+                datasetVersionUuid,
+                runUuid,
+                lineageEventTime,
+                lineageEventType,
+                inputFacets)));
   }
 
   default void insertOutputDatasetFacetsFor(
@@ -183,23 +267,106 @@ public interface DatasetFacetsDao {
       @NonNull Instant lineageEventTime,
       @Nullable String lineageEventType,
       @NonNull LineageEvent.OutputDatasetFacets outputFacets) {
-    final Instant now = Instant.now();
+    insertDatasetFacetWrites(
+        List.of(
+            DatasetFacetWrite.forOutputFacets(
+                Instant.now(),
+                datasetUuid,
+                datasetVersionUuid,
+                runUuid,
+                lineageEventTime,
+                lineageEventType,
+                outputFacets)));
+  }
 
-    JsonNode jsonNode = Utils.getMapper().valueToTree(outputFacets);
-    StreamSupport.stream(
-            Spliterators.spliteratorUnknownSize(jsonNode.fieldNames(), Spliterator.DISTINCT), false)
-        .forEach(
-            fieldName ->
-                insertDatasetFacet(
-                    now,
-                    datasetUuid,
-                    datasetVersionUuid,
-                    runUuid,
-                    lineageEventTime,
-                    lineageEventType,
-                    Type.OUTPUT,
-                    fieldName,
-                    FacetUtils.toPgObject(fieldName, jsonNode.get(fieldName))));
+  /** A serialized facet container plus the foreign keys shared by all fields in that container. */
+  @Value
+  class DatasetFacetWrite {
+    @NonNull Instant createdAt;
+    @NonNull UUID datasetUuid;
+    @NonNull UUID datasetVersionUuid;
+    @Nullable UUID runUuid;
+    @NonNull Instant lineageEventTime;
+    @Nullable String lineageEventType;
+    @Nullable Type typeOverride;
+    @NonNull PGobject facets;
+
+    public static DatasetFacetWrite forDatasetFacets(
+        @NonNull Instant createdAt,
+        @NonNull UUID datasetUuid,
+        @NonNull UUID datasetVersionUuid,
+        @Nullable UUID runUuid,
+        @NonNull Instant lineageEventTime,
+        @Nullable String lineageEventType,
+        @NonNull LineageEvent.DatasetFacets facets) {
+      return create(
+          createdAt,
+          datasetUuid,
+          datasetVersionUuid,
+          runUuid,
+          lineageEventTime,
+          lineageEventType,
+          null,
+          facets);
+    }
+
+    public static DatasetFacetWrite forInputFacets(
+        @NonNull Instant createdAt,
+        @NonNull UUID datasetUuid,
+        @NonNull UUID datasetVersionUuid,
+        @Nullable UUID runUuid,
+        @NonNull Instant lineageEventTime,
+        @Nullable String lineageEventType,
+        @NonNull LineageEvent.InputDatasetFacets facets) {
+      return create(
+          createdAt,
+          datasetUuid,
+          datasetVersionUuid,
+          runUuid,
+          lineageEventTime,
+          lineageEventType,
+          Type.INPUT,
+          facets);
+    }
+
+    public static DatasetFacetWrite forOutputFacets(
+        @NonNull Instant createdAt,
+        @NonNull UUID datasetUuid,
+        @NonNull UUID datasetVersionUuid,
+        @Nullable UUID runUuid,
+        @NonNull Instant lineageEventTime,
+        @Nullable String lineageEventType,
+        @NonNull LineageEvent.OutputDatasetFacets facets) {
+      return create(
+          createdAt,
+          datasetUuid,
+          datasetVersionUuid,
+          runUuid,
+          lineageEventTime,
+          lineageEventType,
+          Type.OUTPUT,
+          facets);
+    }
+
+    private static DatasetFacetWrite create(
+        Instant createdAt,
+        UUID datasetUuid,
+        UUID datasetVersionUuid,
+        UUID runUuid,
+        Instant lineageEventTime,
+        String lineageEventType,
+        Type typeOverride,
+        Object facets) {
+      return new DatasetFacetWrite(
+          createdAt,
+          datasetUuid,
+          datasetVersionUuid,
+          runUuid,
+          lineageEventTime,
+          lineageEventType,
+          typeOverride,
+          FacetUtils.toPgObject(facets));
+    }
   }
 
   record DatasetFacetRow(

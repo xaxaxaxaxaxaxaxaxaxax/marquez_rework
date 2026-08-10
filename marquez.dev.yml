@@ -18,6 +18,10 @@ migrateOnStartup: true
 graphql:
   enabled: true
 
+openLineage:
+  workerThreads: ${OPEN_LINEAGE_WORKER_THREADS:-8}
+  queueCapacity: ${OPEN_LINEAGE_QUEUE_CAPACITY:-100}
+
 logging:
   level: INFO
   appenders:

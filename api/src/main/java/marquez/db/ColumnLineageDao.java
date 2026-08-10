@@ -8,11 +8,17 @@ package marquez.db;
 import static org.jdbi.v3.sqlobject.customizer.BindList.EmptyHandling.NULL_STRING;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
-import java.util.stream.Collectors;
 import marquez.db.mappers.ColumnLineageNodeDataMapper;
 import marquez.db.mappers.ColumnLineageRowMapper;
 import marquez.db.models.ColumnLineageNodeData;
@@ -23,10 +29,14 @@ import org.jdbi.v3.sqlobject.customizer.BindBeanList;
 import org.jdbi.v3.sqlobject.customizer.BindList;
 import org.jdbi.v3.sqlobject.statement.SqlQuery;
 import org.jdbi.v3.sqlobject.statement.SqlUpdate;
+import org.jdbi.v3.sqlobject.transaction.Transaction;
 
 @RegisterRowMapper(ColumnLineageRowMapper.class)
 @RegisterRowMapper(ColumnLineageNodeDataMapper.class)
 public interface ColumnLineageDao extends BaseDao {
+  // Each row binds eight values; keep chunks comfortably below PostgreSQL's bind-parameter limit.
+  int MAX_ROWS_PER_UPSERT = 1000;
+  int MAX_FIELDS_PER_READ = 1000;
 
   default List<ColumnLineageRow> upsertColumnLineageRow(
       UUID outputDatasetVersionUuid,
@@ -40,28 +50,142 @@ public interface ColumnLineageDao extends BaseDao {
       return Collections.emptyList();
     }
 
-    doUpsertColumnLineageRow(
-        inputs.stream()
-            .map(
-                input ->
-                    new ColumnLineageRow(
-                        outputDatasetVersionUuid,
-                        outputDatasetFieldUuid,
-                        input.getLeft(), // input_dataset_version_uuid
-                        input.getRight(), // input_dataset_field_uuid
-                        transformationDescription,
-                        transformationType,
-                        now,
-                        now))
-            .collect(Collectors.toList()));
-    return findColumnLineageByDatasetVersionColumnAndOutputDatasetField(
-        outputDatasetVersionUuid, outputDatasetFieldUuid);
+    return upsertColumnLineageRows(
+        outputDatasetVersionUuid,
+        Collections.singletonList(
+            new ColumnLineageWrite(
+                outputDatasetFieldUuid, inputs, transformationDescription, transformationType)),
+        now);
+  }
+
+  default List<ColumnLineageRow> upsertColumnLineageRows(
+      UUID outputDatasetVersionUuid, List<ColumnLineageWrite> writes, Instant now) {
+    if (writes.isEmpty()) {
+      return Collections.emptyList();
+    }
+    for (ColumnLineageWrite write : writes) {
+      if (!write.inputs().isEmpty()) {
+        return upsertColumnLineageRowsInTransaction(outputDatasetVersionUuid, writes, now);
+      }
+    }
+    return Collections.emptyList();
+  }
+
+  /**
+   * Intake-only write path for already resolved column lineage. Unlike the compatibility methods
+   * above, this method can batch physical edges across output datasets and deliberately performs no
+   * database readback.
+   */
+  @Transaction
+  default void upsertColumnLineageRowsForIntake(
+      List<ColumnLineageDatasetWrite> datasetWrites, Instant now) {
+    record EdgeKey(
+        UUID outputDatasetVersionUuid,
+        UUID outputDatasetFieldUuid,
+        UUID inputDatasetVersionUuid,
+        UUID inputDatasetFieldUuid) {}
+
+    Map<EdgeKey, ColumnLineageRow> batch = new LinkedHashMap<>(MAX_ROWS_PER_UPSERT);
+    for (ColumnLineageDatasetWrite datasetWrite : datasetWrites) {
+      for (ColumnLineageWrite write : datasetWrite.writes()) {
+        for (Pair<UUID, UUID> input : write.inputs()) {
+          ColumnLineageRow row =
+              new ColumnLineageRow(
+                  datasetWrite.outputDatasetVersionUuid(),
+                  write.outputDatasetFieldUuid(),
+                  input.getLeft(),
+                  input.getRight(),
+                  write.transformationDescription(),
+                  write.transformationType(),
+                  now,
+                  now);
+          batch.put(
+              new EdgeKey(
+                  row.getOutputDatasetVersionUuid(),
+                  row.getOutputDatasetFieldUuid(),
+                  row.getInputDatasetVersionUuid(),
+                  row.getInputDatasetFieldUuid()),
+              row);
+          if (batch.size() == MAX_ROWS_PER_UPSERT) {
+            writeIntakeColumnLineageBatch(batch.values());
+            batch = new LinkedHashMap<>(MAX_ROWS_PER_UPSERT);
+          }
+        }
+      }
+    }
+    if (!batch.isEmpty()) {
+      writeIntakeColumnLineageBatch(batch.values());
+    }
+  }
+
+  private void writeIntakeColumnLineageBatch(Collection<ColumnLineageRow> batch) {
+    List<ColumnLineageRow> rows = new ArrayList<>(batch);
+    rows.sort(
+        Comparator.comparing(ColumnLineageRow::getOutputDatasetVersionUuid)
+            .thenComparing(ColumnLineageRow::getOutputDatasetFieldUuid)
+            .thenComparing(ColumnLineageRow::getInputDatasetVersionUuid)
+            .thenComparing(ColumnLineageRow::getInputDatasetFieldUuid));
+    doUpsertColumnLineageRow(rows);
+  }
+
+  @Transaction
+  default List<ColumnLineageRow> upsertColumnLineageRowsInTransaction(
+      UUID outputDatasetVersionUuid, List<ColumnLineageWrite> writes, Instant now) {
+    Set<UUID> outputDatasetFieldUuids = new LinkedHashSet<>();
+    List<ColumnLineageRow> batch = new ArrayList<>(MAX_ROWS_PER_UPSERT);
+    for (ColumnLineageWrite write : writes) {
+      if (write.inputs().isEmpty()) {
+        continue;
+      }
+      outputDatasetFieldUuids.add(write.outputDatasetFieldUuid());
+      for (Pair<UUID, UUID> input : write.inputs()) {
+        batch.add(
+            new ColumnLineageRow(
+                outputDatasetVersionUuid,
+                write.outputDatasetFieldUuid(),
+                input.getLeft(), // input_dataset_version_uuid
+                input.getRight(), // input_dataset_field_uuid
+                write.transformationDescription(),
+                write.transformationType(),
+                now,
+                now));
+        if (batch.size() == MAX_ROWS_PER_UPSERT) {
+          doUpsertColumnLineageRow(batch);
+          batch = new ArrayList<>(MAX_ROWS_PER_UPSERT);
+        }
+      }
+    }
+    if (!batch.isEmpty()) {
+      doUpsertColumnLineageRow(batch);
+    }
+
+    List<UUID> outputFields = new ArrayList<>(outputDatasetFieldUuids);
+    List<ColumnLineageRow> rows = new ArrayList<>();
+    for (int start = 0; start < outputFields.size(); start += MAX_FIELDS_PER_READ) {
+      rows.addAll(
+          findColumnLineageByDatasetVersionAndOutputDatasetFields(
+              outputDatasetVersionUuid,
+              outputFields.subList(
+                  start, Math.min(start + MAX_FIELDS_PER_READ, outputFields.size()))));
+    }
+    return rows;
   }
 
   @SqlQuery(
       "SELECT * FROM column_lineage WHERE output_dataset_version_uuid = :datasetVersionUuid AND output_dataset_field_uuid = :outputDatasetFieldUuid")
   List<ColumnLineageRow> findColumnLineageByDatasetVersionColumnAndOutputDatasetField(
       UUID datasetVersionUuid, UUID outputDatasetFieldUuid);
+
+  @SqlQuery(
+      """
+          SELECT *
+          FROM column_lineage
+          WHERE output_dataset_version_uuid = :datasetVersionUuid
+            AND output_dataset_field_uuid IN (<outputDatasetFieldUuids>)
+          """)
+  List<ColumnLineageRow> findColumnLineageByDatasetVersionAndOutputDatasetFields(
+      UUID datasetVersionUuid,
+      @BindList("outputDatasetFieldUuids") List<UUID> outputDatasetFieldUuids);
 
   @SqlUpdate(
       """
@@ -80,6 +204,11 @@ public interface ColumnLineageDao extends BaseDao {
           transformation_description = EXCLUDED.transformation_description,
           transformation_type = EXCLUDED.transformation_type,
           updated_at = EXCLUDED.updated_at
+          WHERE column_lineage.transformation_description
+                  IS DISTINCT FROM EXCLUDED.transformation_description
+             OR column_lineage.transformation_type
+                  IS DISTINCT FROM EXCLUDED.transformation_type
+             OR column_lineage.updated_at IS DISTINCT FROM EXCLUDED.updated_at
           """)
   void doUpsertColumnLineageRow(
       @BindBeanList(
@@ -103,7 +232,7 @@ public interface ColumnLineageDao extends BaseDao {
                 SELECT DISTINCT ON (output_dataset_field_uuid, input_dataset_field_uuid) *
                 FROM column_lineage
                 WHERE created_at <= :createdAtUntil
-                ORDER BY output_dataset_field_uuid, input_dataset_field_uuid, updated_at DESC, updated_at
+                ORDER BY output_dataset_field_uuid, input_dataset_field_uuid, updated_at DESC
             ),
             dataset_fields_view AS (
               SELECT d.namespace_name as namespace_name, d.name as dataset_name, df.name as field_name, df.type, df.uuid, d.namespace_uuid
@@ -182,7 +311,7 @@ public interface ColumnLineageDao extends BaseDao {
           JOIN dataset_fields df ON df.uuid = cl.output_dataset_field_uuid
           JOIN datasets_view dv ON dv.uuid = df.dataset_uuid
           WHERE ARRAY[<values>]::DATASET_NAME[] && dv.dataset_symlinks -- array of string pairs is cast onto array of DATASET_NAME types to be checked if it has non-empty intersection with dataset symlinks
-          ORDER BY output_dataset_field_uuid, input_dataset_field_uuid, updated_at DESC, updated_at
+          ORDER BY output_dataset_field_uuid, input_dataset_field_uuid, updated_at DESC
         ),
         dataset_fields_view AS (
             SELECT
@@ -240,4 +369,21 @@ public interface ColumnLineageDao extends BaseDao {
               propertyNames = {"left", "right"},
               value = "values")
           List<Pair<String, String>> datasets);
+
+  record ColumnLineageDatasetWrite(UUID outputDatasetVersionUuid, List<ColumnLineageWrite> writes) {
+    public ColumnLineageDatasetWrite {
+      Objects.requireNonNull(outputDatasetVersionUuid, "outputDatasetVersionUuid");
+      writes = List.copyOf(writes);
+    }
+  }
+
+  record ColumnLineageWrite(
+      UUID outputDatasetFieldUuid,
+      List<Pair<UUID, UUID>> inputs,
+      String transformationDescription,
+      String transformationType) {
+    public ColumnLineageWrite {
+      inputs = List.copyOf(new LinkedHashSet<>(inputs));
+    }
+  }
 }

@@ -8,14 +8,20 @@ package marquez.db;
 import static marquez.db.LineageTestUtils.PRODUCER_URL;
 import static marquez.db.LineageTestUtils.SCHEMA_URL;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.CALLS_REAL_METHODS;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 import com.google.common.collect.ImmutableMap;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import marquez.api.JdbiUtils;
+import marquez.db.DatasetFacetsDao.DatasetFacetWrite;
 import marquez.db.models.UpdateLineageRow;
 import marquez.jdbi.MarquezJdbiExternalPostgresExtension;
 import marquez.service.models.LineageEvent;
@@ -27,6 +33,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.postgresql.util.PGobject;
 
 @ExtendWith(MarquezJdbiExternalPostgresExtension.class)
@@ -367,6 +374,69 @@ public class DatasetFacetsDaoTest {
         .isEqualTo("{\"inputFacet1\": \"{some-facet1}\"}");
     assertThat(getDatasetFacet(lineageRow, "inputFacet2").facet().toString())
         .isEqualTo("{\"inputFacet2\": \"{some-facet2}\"}");
+  }
+
+  @Test
+  public void testInsertDatasetFacetWritesCombinesContainerKinds() {
+    UpdateLineageRow lineageRow =
+        createLineageRowWithInputDataset(
+            LineageEvent.DatasetFacets.builder().description("existing-description"));
+    UpdateLineageRow.DatasetRecord datasetRecord = lineageRow.getInputs().orElseThrow().get(0);
+    Instant createdAt = Instant.now();
+
+    datasetFacetsDao.insertDatasetFacetWrites(
+        List.of(
+            DatasetFacetWrite.forDatasetFacets(
+                createdAt,
+                datasetRecord.getDatasetRow().getUuid(),
+                datasetRecord.getDatasetVersionRow().getUuid(),
+                lineageRow.getRun().getUuid(),
+                lineageRow.getRun().getCreatedAt(),
+                "COMPLETE",
+                LineageEvent.DatasetFacets.builder()
+                    .additional(Map.of("bulk-dataset", Map.of("nested", true)))
+                    .build()),
+            DatasetFacetWrite.forInputFacets(
+                createdAt,
+                datasetRecord.getDatasetRow().getUuid(),
+                datasetRecord.getDatasetVersionRow().getUuid(),
+                lineageRow.getRun().getUuid(),
+                lineageRow.getRun().getCreatedAt(),
+                "COMPLETE",
+                LineageEvent.InputDatasetFacets.builder()
+                    .additional(Map.of("documentation", "input-override"))
+                    .build())));
+
+    assertThat(getDatasetFacet(lineageRow, "bulk-dataset").type())
+        .isEqualTo(DatasetFacetsDao.Type.UNKNOWN);
+    DatasetFacetsDao.DatasetFacetRow inputOverride = getDatasetFacet(lineageRow, "documentation");
+    assertThat(inputOverride.type()).isEqualTo(DatasetFacetsDao.Type.INPUT);
+    assertThat(inputOverride.facet().toString())
+        .isEqualTo("{\"documentation\": \"input-override\"}");
+  }
+
+  @Test
+  @SuppressWarnings({"rawtypes", "unchecked"})
+  public void testInsertDatasetFacetWritesUsesBoundedContainerBatches() {
+    DatasetFacetsDao batchingDao = mock(DatasetFacetsDao.class, CALLS_REAL_METHODS);
+    DatasetFacetWrite write =
+        DatasetFacetWrite.forDatasetFacets(
+            Instant.now(),
+            UUID.randomUUID(),
+            UUID.randomUUID(),
+            null,
+            lineageEventTime,
+            null,
+            LineageEvent.DatasetFacets.builder().description("description").build());
+
+    batchingDao.insertDatasetFacetWrites(
+        Collections.nCopies(DatasetFacetsDao.MAX_FACET_CONTAINERS_PER_INSERT + 1, write));
+
+    ArgumentCaptor<List<DatasetFacetWrite>> batches = ArgumentCaptor.forClass(List.class);
+    verify(batchingDao, times(2)).doInsertDatasetFacetWrites(batches.capture());
+    assertThat(batches.getAllValues())
+        .extracting(List::size)
+        .containsExactly(DatasetFacetsDao.MAX_FACET_CONTAINERS_PER_INSERT, 1);
   }
 
   private UpdateLineageRow createLineageRowWithInputDataset(

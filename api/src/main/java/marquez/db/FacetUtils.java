@@ -5,20 +5,18 @@
 
 package marquez.db;
 
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.NonNull;
-import marquez.common.Utils;
 import org.postgresql.util.PGobject;
 
-public class FacetUtils {
+final class FacetUtils {
 
-  static ObjectNode asJson(@NonNull final String facetName, @NonNull Object facetValue) {
-    final ObjectNode facetAsJson = Utils.getMapper().createObjectNode();
-    facetAsJson.putPOJO(facetName, facetValue);
-    return facetAsJson;
+  private FacetUtils() {}
+
+  static PGobject toPgObject(@NonNull Object facetContainer) {
+    return Columns.toPgObject(facetContainer);
   }
 
-  static PGobject toPgObject(String name, Object o) {
-    return Columns.toPgObject(asJson(name, o));
+  static boolean isEmpty(@NonNull PGobject facetContainer) {
+    return "{}".equals(facetContainer.getValue());
   }
 }

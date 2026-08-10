@@ -7,10 +7,16 @@ package marquez.db;
 
 import com.google.common.collect.ImmutableSet;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
+import lombok.NonNull;
 import lombok.Value;
 import marquez.common.models.Field;
 import marquez.common.models.TagName;
@@ -27,15 +33,20 @@ import marquez.service.models.DatasetVersion;
 import org.apache.commons.lang3.tuple.Pair;
 import org.jdbi.v3.sqlobject.config.RegisterRowMapper;
 import org.jdbi.v3.sqlobject.customizer.BindBean;
+import org.jdbi.v3.sqlobject.customizer.BindBeanList;
 import org.jdbi.v3.sqlobject.statement.SqlBatch;
 import org.jdbi.v3.sqlobject.statement.SqlQuery;
 import org.jdbi.v3.sqlobject.statement.SqlUpdate;
+import org.jdbi.v3.sqlobject.transaction.Transaction;
 
 @RegisterRowMapper(DatasetFieldRowMapper.class)
 @RegisterRowMapper(DatasetFieldMapper.class)
 @RegisterRowMapper(FieldDataMapper.class)
 @RegisterRowMapper(PairUuidInstantMapper.class)
 public interface DatasetFieldDao extends BaseDao {
+  // Each row binds seven values; keep chunks comfortably below PostgreSQL's bind limit.
+  int MAX_FIELDS_PER_UPSERT = 1000;
+
   @SqlQuery(
       """
           SELECT EXISTS (
@@ -251,30 +262,138 @@ public interface DatasetFieldDao extends BaseDao {
           """)
   List<InputFieldData> findInputFieldsDataAssociatedWithRun(UUID runUuid);
 
+  @Transaction
+  default DatasetFieldRow upsert(
+      UUID uuid, Instant now, String name, String type, String description, UUID datasetUuid) {
+    return upsertAll(
+            Collections.singletonList(
+                new DatasetFieldUpsert(uuid, now, now, datasetUuid, name, type, description)))
+        .get(0);
+  }
+
+  @Transaction
+  default List<DatasetFieldRow> upsertAll(List<DatasetFieldUpsert> fields) {
+    if (fields.isEmpty()) {
+      return Collections.emptyList();
+    }
+
+    List<DatasetFieldUpsert> inputs = List.copyOf(fields);
+    Map<DatasetFieldIdentity, DatasetFieldUpsert> nonNullTypeWrites = new LinkedHashMap<>();
+    List<DatasetFieldUpsert> writes = new ArrayList<>(inputs.size());
+    for (DatasetFieldUpsert field : inputs) {
+      if (field.getType() == null) {
+        // PostgreSQL 14 considers NULL values distinct for this unique constraint. Keep every
+        // occurrence so the batched path has the same semantics as repeated singleton inserts.
+        writes.add(field);
+      } else {
+        DatasetFieldIdentity identity = DatasetFieldIdentity.of(field);
+        nonNullTypeWrites.merge(identity, field, DatasetFieldDao::mergeNonNullTypeWrites);
+      }
+    }
+    writes.addAll(nonNullTypeWrites.values());
+    writes.sort(DatasetFieldDao::compareForWrite);
+
+    Map<DatasetFieldIdentity, DatasetFieldRow> rowsByIdentity = new LinkedHashMap<>();
+    Map<UUID, DatasetFieldRow> nullTypeRowsByUuid = new LinkedHashMap<>();
+    for (int start = 0; start < writes.size(); start += MAX_FIELDS_PER_UPSERT) {
+      List<DatasetFieldRow> returned =
+          upsertAllChunk(
+              writes.subList(start, Math.min(start + MAX_FIELDS_PER_UPSERT, writes.size())));
+      for (DatasetFieldRow row : returned) {
+        if (row.getType() == null) {
+          nullTypeRowsByUuid.put(row.getUuid(), row);
+        } else {
+          rowsByIdentity.put(DatasetFieldIdentity.of(row), row);
+        }
+      }
+    }
+
+    // PostgreSQL does not promise RETURNING order. Rebuild an occurrence-sized result in the
+    // caller's order; safely deduplicated non-null identities resolve to the same stored row.
+    List<DatasetFieldRow> ordered = new ArrayList<>(inputs.size());
+    for (DatasetFieldUpsert input : inputs) {
+      DatasetFieldRow row =
+          input.getType() == null
+              ? nullTypeRowsByUuid.get(input.getUuid())
+              : rowsByIdentity.get(DatasetFieldIdentity.of(input));
+      if (row == null) {
+        throw new IllegalStateException(
+            "Dataset field upsert did not return a row for "
+                + input.getDatasetUuid()
+                + "/"
+                + input.getName());
+      }
+      ordered.add(row);
+    }
+    return ordered;
+  }
+
   @SqlQuery(
-      "INSERT INTO dataset_fields ("
-          + "uuid, "
-          + "type, "
-          + "created_at, "
-          + "updated_at, "
-          + "dataset_uuid, "
-          + "name, "
-          + "description"
-          + ") VALUES ("
-          + ":uuid, "
-          + ":type, "
-          + ":now, "
-          + ":now, "
-          + ":datasetUuid, "
-          + ":name, "
-          + ":description) "
-          + "ON CONFLICT(dataset_uuid, name, type) "
-          + "DO UPDATE SET "
-          + "updated_at = EXCLUDED.updated_at, "
-          + "description = EXCLUDED.description "
-          + "RETURNING *")
-  DatasetFieldRow upsert(
-      UUID uuid, Instant now, String name, String type, String description, UUID datasetUuid);
+      """
+          INSERT INTO dataset_fields (
+              uuid,
+              type,
+              created_at,
+              updated_at,
+              dataset_uuid,
+              name,
+              description
+          ) VALUES <values>
+          ON CONFLICT(dataset_uuid, name, type)
+          DO UPDATE SET
+              updated_at = EXCLUDED.updated_at,
+              description = EXCLUDED.description
+          RETURNING *
+          """)
+  List<DatasetFieldRow> upsertAllChunk(
+      @BindBeanList(
+              value = "values",
+              propertyNames = {
+                "uuid",
+                "type",
+                "createdAt",
+                "updatedAt",
+                "datasetUuid",
+                "name",
+                "description"
+              })
+          List<DatasetFieldUpsert> fields);
+
+  private static DatasetFieldUpsert mergeNonNullTypeWrites(
+      DatasetFieldUpsert first, DatasetFieldUpsert latest) {
+    return new DatasetFieldUpsert(
+        first.getUuid(),
+        first.getCreatedAt(),
+        latest.getUpdatedAt(),
+        first.getDatasetUuid(),
+        first.getName(),
+        first.getType(),
+        latest.getDescription());
+  }
+
+  private static int compareForWrite(DatasetFieldUpsert left, DatasetFieldUpsert right) {
+    int compared = left.getDatasetUuid().compareTo(right.getDatasetUuid());
+    if (compared != 0) {
+      return compared;
+    }
+    compared = left.getName().compareTo(right.getName());
+    if (compared != 0) {
+      return compared;
+    }
+    if (left.getType() == null && right.getType() != null) {
+      return -1;
+    }
+    if (left.getType() != null && right.getType() == null) {
+      return 1;
+    }
+    if (left.getType() != null) {
+      compared = left.getType().compareTo(right.getType());
+      if (compared != 0) {
+        return compared;
+      }
+    }
+    return left.getUuid().compareTo(right.getUuid());
+  }
 
   @SqlBatch(
       "INSERT INTO dataset_versions_field_mapping (dataset_version_uuid, dataset_field_uuid) "
@@ -285,6 +404,32 @@ public interface DatasetFieldDao extends BaseDao {
   class DatasetFieldMapping {
     UUID datasetVersionUuid;
     UUID datasetFieldUuid;
+  }
+
+  @Value
+  class DatasetFieldUpsert {
+    @NonNull UUID uuid;
+    @NonNull Instant createdAt;
+    @NonNull Instant updatedAt;
+    @NonNull UUID datasetUuid;
+    @NonNull String name;
+    @Nullable String type;
+    @Nullable String description;
+  }
+
+  @Value
+  class DatasetFieldIdentity {
+    @NonNull UUID datasetUuid;
+    @NonNull String name;
+    @NonNull String type;
+
+    static DatasetFieldIdentity of(DatasetFieldUpsert field) {
+      return new DatasetFieldIdentity(field.getDatasetUuid(), field.getName(), field.getType());
+    }
+
+    static DatasetFieldIdentity of(DatasetFieldRow field) {
+      return new DatasetFieldIdentity(field.getDatasetUuid(), field.getName(), field.getType());
+    }
   }
 
   @Value

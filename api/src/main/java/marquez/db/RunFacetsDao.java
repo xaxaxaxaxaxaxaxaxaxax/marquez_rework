@@ -5,29 +5,20 @@
 
 package marquez.db;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import java.time.Instant;
-import java.util.Spliterator;
-import java.util.Spliterators;
 import java.util.UUID;
-import java.util.stream.StreamSupport;
 import lombok.NonNull;
-import marquez.common.Utils;
 import marquez.db.mappers.RunFacetsMapper;
 import marquez.service.models.LineageEvent;
 import marquez.service.models.RunFacets;
 import org.jdbi.v3.sqlobject.config.RegisterRowMapper;
 import org.jdbi.v3.sqlobject.statement.SqlQuery;
 import org.jdbi.v3.sqlobject.statement.SqlUpdate;
-import org.jdbi.v3.sqlobject.transaction.Transaction;
 import org.postgresql.util.PGobject;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 @RegisterRowMapper(RunFacetsMapper.class)
 /** The DAO for {@code run} facets. */
 public interface RunFacetsDao {
-  Logger log = LoggerFactory.getLogger(RunFacetsDao.class);
   String SPARK_UNKNOWN = "spark_unknown";
   String SPARK_LOGICAL_PLAN = "spark.logicalPlan";
 
@@ -65,6 +56,49 @@ public interface RunFacetsDao {
       String name,
       PGobject facet);
 
+  /**
+   * Inserts every field in a serialized run-facet container in one statement. The logical-plan
+   * existence check intentionally keeps the legacy behavior: identifying the special field is
+   * case-insensitive, while matching an already stored facet name is case-sensitive.
+   */
+  @SqlUpdate(
+      """
+      INSERT INTO run_facets (
+         created_at,
+         run_uuid,
+         lineage_event_time,
+         lineage_event_type,
+         name,
+         facet
+      )
+      SELECT
+         :createdAt,
+         :runUuid,
+         :lineageEventTime,
+         :lineageEventType,
+         facet_entry.name,
+         jsonb_build_object(facet_entry.name, facet_entry.value)
+      FROM jsonb_each(CAST(:facets AS jsonb)) AS facet_entry(name, value)
+      WHERE lower(facet_entry.name) <> lower(:sparkUnknown)
+        AND (
+          lower(facet_entry.name) <> lower(:sparkLogicalPlan)
+          OR NOT EXISTS (
+            SELECT 1
+            FROM run_facets existing
+            WHERE existing.run_uuid = :runUuid
+              AND existing.name = facet_entry.name
+          )
+        )
+      """)
+  void insertRunFacetContainer(
+      Instant createdAt,
+      UUID runUuid,
+      Instant lineageEventTime,
+      String lineageEventType,
+      PGobject facets,
+      String sparkUnknown,
+      String sparkLogicalPlan);
+
   @SqlQuery("SELECT EXISTS (SELECT 1 FROM run_facets WHERE name = :name AND run_uuid = :runUuid)")
   boolean runFacetExists(String name, UUID runUuid);
 
@@ -91,41 +125,23 @@ public interface RunFacetsDao {
    * @param lineageEventType
    * @param runFacet
    */
-  @Transaction
   default void insertRunFacetsFor(
       @NonNull UUID runUuid,
       @NonNull Instant lineageEventTime,
       @NonNull String lineageEventType,
       @NonNull LineageEvent.RunFacet runFacet) {
-    final Instant now = Instant.now();
-
-    JsonNode jsonNode = Utils.getMapper().valueToTree(runFacet);
-    StreamSupport.stream(
-            Spliterators.spliteratorUnknownSize(jsonNode.fieldNames(), Spliterator.DISTINCT), false)
-        .filter(fieldName -> !fieldName.equalsIgnoreCase(SPARK_UNKNOWN))
-        .filter(
-            fieldName -> {
-              if (fieldName.equalsIgnoreCase(SPARK_LOGICAL_PLAN)) {
-                if (runFacetExists(fieldName, runUuid)) {
-                  log.info(
-                      "Facet '{}' has already been linked to run '{}', skipping...",
-                      fieldName,
-                      runUuid);
-                  // row already exists
-                  return false;
-                }
-              }
-              return true;
-            })
-        .forEach(
-            fieldName ->
-                insertRunFacet(
-                    now,
-                    runUuid,
-                    lineageEventTime,
-                    lineageEventType,
-                    fieldName,
-                    FacetUtils.toPgObject(fieldName, jsonNode.get(fieldName))));
+    PGobject facets = FacetUtils.toPgObject(runFacet);
+    if (FacetUtils.isEmpty(facets)) {
+      return;
+    }
+    insertRunFacetContainer(
+        Instant.now(),
+        runUuid,
+        lineageEventTime,
+        lineageEventType,
+        facets,
+        SPARK_UNKNOWN,
+        SPARK_LOGICAL_PLAN);
   }
 
   record RunFacetRow(

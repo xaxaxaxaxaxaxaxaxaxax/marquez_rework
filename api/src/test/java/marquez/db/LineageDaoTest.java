@@ -246,6 +246,9 @@ public class LineageDaoTest {
 
     Map<UUID, JobData> actualJobRows =
         connectedJobs.stream().collect(Collectors.toMap(JobData::getUuid, Functions.identity()));
+    UUID originalDatasetUuid = writeJob.getOutputs().orElseThrow().get(0).getDatasetRow().getUuid();
+    assertThat(actualJobRows.get(targetJob.getUuid()).getOutputUuids())
+        .containsExactly(originalDatasetUuid);
     for (JobLineage expected : jobRows) {
       JobData job = actualJobRows.get(expected.getId());
       assertThat(job.getInputUuids())
@@ -255,11 +258,12 @@ public class LineageDaoTest {
           .containsAll(
               expected.getOutput().map(ds -> ds.getDatasetRow().getUuid()).stream()::iterator);
     }
-    Set<UUID> lineageForOriginalJob =
-        lineageDao.getLineage(new HashSet<>(Arrays.asList(writeJob.getJob().getUuid())), 2).stream()
-            .map(JobData::getUuid)
-            .collect(Collectors.toSet());
-    assertThat(lineageForOriginalJob).isEqualTo(jobIds);
+    Map<UUID, JobData> lineageForOriginalJob =
+        lineageDao.getLineage(Set.of(writeJob.getJob().getUuid()), 2).stream()
+            .collect(Collectors.toMap(JobData::getUuid, Functions.identity()));
+    assertThat(lineageForOriginalJob.keySet()).isEqualTo(jobIds);
+    assertThat(lineageForOriginalJob.get(targetJob.getUuid()).getOutputUuids())
+        .containsExactly(originalDatasetUuid);
 
     UpdateLineageRow updatedTargetJob =
         LineageTestUtils.createLineageRow(
@@ -274,24 +278,169 @@ public class LineageDaoTest {
                     "a_new_dataset",
                     newDatasetFacet(new SchemaField("firstname", "string", "the first name")))));
     assertThat(updatedTargetJob.getJob().getUuid()).isEqualTo(targetJob.getUuid());
+    UUID updatedDatasetUuid =
+        updatedTargetJob.getOutputs().orElseThrow().get(0).getDatasetRow().getUuid();
 
     // get lineage for original job - the old datasets/jobs should no longer be present
-    assertThat(
-            lineageDao
-                .getLineage(new HashSet<>(Arrays.asList(writeJob.getJob().getUuid())), 2)
-                .stream()
-                .map(JobData::getUuid)
-                .collect(Collectors.toSet()))
+    Set<JobData> updatedLineageForOriginal =
+        lineageDao.getLineage(Set.of(writeJob.getJob().getUuid()), 2);
+    assertThat(updatedLineageForOriginal)
         .hasSize(1)
-        .containsExactlyInAnyOrder(targetJob.getUuid());
+        .first()
+        .satisfies(
+            job -> {
+              assertThat(job.getUuid()).isEqualTo(targetJob.getUuid());
+              assertThat(job.getOutputUuids()).containsExactly(updatedDatasetUuid);
+              assertThat(job.getOutputUuids()).doesNotContain(originalDatasetUuid);
+            });
 
     // fetching lineage for target job should yield the same results
-    assertThat(
-            lineageDao.getLineage(new HashSet<>(Arrays.asList(targetJob.getUuid())), 2).stream()
-                .map(JobData::getUuid)
-                .collect(Collectors.toSet()))
+    assertThat(lineageDao.getLineage(Set.of(targetJob.getUuid()), 2))
         .hasSize(1)
-        .containsExactlyInAnyOrder(targetJob.getUuid());
+        .first()
+        .satisfies(
+            job -> {
+              assertThat(job.getUuid()).isEqualTo(targetJob.getUuid());
+              assertThat(job.getOutputUuids()).containsExactly(updatedDatasetUuid);
+            });
+  }
+
+  @Test
+  public void testGetLineageRespectsDepthAndAggregatesFrontierIo() {
+    Dataset firstDataset = new Dataset(NAMESPACE, "depth-first", newDatasetFacet());
+    Dataset secondDataset = new Dataset(NAMESPACE, "depth-second", newDatasetFacet());
+    Dataset thirdDataset = new Dataset(NAMESPACE, "depth-third", newDatasetFacet());
+    UpdateLineageRow firstJob =
+        LineageTestUtils.createLineageRow(
+            openLineageDao,
+            "depth-first-job",
+            "COMPLETE",
+            jobFacet,
+            List.of(),
+            List.of(firstDataset));
+    UpdateLineageRow secondJob =
+        LineageTestUtils.createLineageRow(
+            openLineageDao,
+            "depth-second-job",
+            "COMPLETE",
+            jobFacet,
+            List.of(firstDataset),
+            List.of(secondDataset));
+    UpdateLineageRow thirdJob =
+        LineageTestUtils.createLineageRow(
+            openLineageDao,
+            "depth-third-job",
+            "COMPLETE",
+            jobFacet,
+            List.of(secondDataset),
+            List.of(thirdDataset));
+    UpdateLineageRow fourthJob =
+        LineageTestUtils.createLineageRow(
+            openLineageDao,
+            "depth-fourth-job",
+            "COMPLETE",
+            jobFacet,
+            List.of(thirdDataset),
+            List.of());
+
+    Set<JobData> depthZero = lineageDao.getLineage(Set.of(firstJob.getJob().getUuid()), 0);
+    assertThat(depthZero).extracting(JobData::getUuid).containsExactly(firstJob.getJob().getUuid());
+    assertThat(depthZero)
+        .first()
+        .extracting(JobData::getOutputUuids, InstanceOfAssertFactories.iterable(UUID.class))
+        .containsExactly(firstJob.getOutputs().orElseThrow().get(0).getDatasetRow().getUuid());
+
+    Set<JobData> depthOne = lineageDao.getLineage(Set.of(firstJob.getJob().getUuid()), 1);
+    assertThat(depthOne)
+        .extracting(JobData::getUuid)
+        .containsExactlyInAnyOrder(firstJob.getJob().getUuid(), secondJob.getJob().getUuid());
+    assertThat(depthOne)
+        .filteredOn(job -> job.getUuid().equals(secondJob.getJob().getUuid()))
+        .singleElement()
+        .extracting(JobData::getOutputUuids, InstanceOfAssertFactories.iterable(UUID.class))
+        .containsExactly(secondJob.getOutputs().orElseThrow().get(0).getDatasetRow().getUuid());
+
+    assertThat(lineageDao.getLineage(Set.of(firstJob.getJob().getUuid()), 2))
+        .extracting(JobData::getUuid)
+        .containsExactlyInAnyOrder(
+            firstJob.getJob().getUuid(), secondJob.getJob().getUuid(), thirdJob.getJob().getUuid())
+        .doesNotContain(fourthJob.getJob().getUuid());
+  }
+
+  @Test
+  public void testGetLineageConnectsJobsWithSameDirectionIo() {
+    Dataset sharedOutput = new Dataset(NAMESPACE, "same-direction-output", newDatasetFacet());
+    UpdateLineageRow firstProducer =
+        LineageTestUtils.createLineageRow(
+            openLineageDao,
+            "same-direction-first",
+            "COMPLETE",
+            jobFacet,
+            List.of(),
+            List.of(sharedOutput));
+    UpdateLineageRow secondProducer =
+        LineageTestUtils.createLineageRow(
+            openLineageDao,
+            "same-direction-second",
+            "COMPLETE",
+            jobFacet,
+            List.of(),
+            List.of(sharedOutput));
+    UUID sharedDatasetUuid =
+        firstProducer.getOutputs().orElseThrow().get(0).getDatasetRow().getUuid();
+
+    Set<JobData> lineage = lineageDao.getLineage(Set.of(firstProducer.getJob().getUuid()), 1);
+
+    assertThat(lineage)
+        .extracting(JobData::getUuid)
+        .containsExactlyInAnyOrder(
+            firstProducer.getJob().getUuid(), secondProducer.getJob().getUuid());
+    assertThat(lineage)
+        .allSatisfy(job -> assertThat(job.getOutputUuids()).containsExactly(sharedDatasetUuid));
+  }
+
+  @Test
+  public void testGetLineageTerminatesAndDeduplicatesCycle() {
+    Dataset firstDataset = new Dataset(NAMESPACE, "cycle-first", newDatasetFacet());
+    Dataset secondDataset = new Dataset(NAMESPACE, "cycle-second", newDatasetFacet());
+    Dataset thirdDataset = new Dataset(NAMESPACE, "cycle-third", newDatasetFacet());
+    UpdateLineageRow firstJob =
+        LineageTestUtils.createLineageRow(
+            openLineageDao,
+            "cycle-first-job",
+            "COMPLETE",
+            jobFacet,
+            List.of(thirdDataset),
+            List.of(firstDataset));
+    UpdateLineageRow secondJob =
+        LineageTestUtils.createLineageRow(
+            openLineageDao,
+            "cycle-second-job",
+            "COMPLETE",
+            jobFacet,
+            List.of(firstDataset),
+            List.of(secondDataset));
+    UpdateLineageRow thirdJob =
+        LineageTestUtils.createLineageRow(
+            openLineageDao,
+            "cycle-third-job",
+            "COMPLETE",
+            jobFacet,
+            List.of(secondDataset),
+            List.of(thirdDataset));
+
+    Set<JobData> lineage = lineageDao.getLineage(Set.of(firstJob.getJob().getUuid()), 20);
+
+    assertThat(lineage)
+        .extracting(JobData::getUuid)
+        .containsExactlyInAnyOrder(
+            firstJob.getJob().getUuid(), secondJob.getJob().getUuid(), thirdJob.getJob().getUuid());
+    assertThat(lineage)
+        .allSatisfy(
+            job -> {
+              assertThat(job.getInputUuids()).hasSize(1);
+              assertThat(job.getOutputUuids()).hasSize(1);
+            });
   }
 
   @Test

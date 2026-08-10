@@ -585,8 +585,20 @@ paths:
             schema:
               $ref: '#/components/schemas/LineageEvent'
       responses:
-        '200':
-          description: OK
+        '201':
+          description: Lineage event accepted and stored
+        '400':
+          description: Invalid lineage event
+        '500':
+          description: Lineage event processing failed
+        '503':
+          description: OpenLineage intake is at capacity; retry the request later
+          headers:
+            Retry-After:
+              description: Minimum number of seconds to wait before retrying
+              schema:
+                type: integer
+                minimum: 1
     get:
       operationId: getLineage
       parameters:

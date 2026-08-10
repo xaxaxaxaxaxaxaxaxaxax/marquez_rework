@@ -29,6 +29,9 @@ public interface SourceDao {
   @SqlQuery("SELECT * FROM sources WHERE name = :name")
   Optional<Source> findBy(String name);
 
+  @SqlQuery("SELECT * FROM sources WHERE name = :name")
+  Optional<SourceRow> findRowByName(String name);
+
   @SqlQuery("SELECT * FROM sources ORDER BY name LIMIT :limit OFFSET :offset")
   List<Source> findAll(int limit, int offset);
 
@@ -108,8 +111,31 @@ public interface SourceDao {
           + ":now, "
           + ":defaultName, "
           + ":defaultConnectionUrl"
-          + ") ON CONFLICT(name) DO UPDATE SET updated_at = EXCLUDED.updated_at "
+          + ") ON CONFLICT(name) DO NOTHING "
           + "RETURNING *")
-  SourceRow upsertOrDefault(
+  Optional<SourceRow> insertDefaultIfAbsent(
       UUID uuid, String defaultType, Instant now, String defaultName, String defaultConnectionUrl);
+
+  @Transaction
+  default SourceRow upsertOrDefault(
+      UUID uuid, String defaultType, Instant now, String defaultName, String defaultConnectionUrl) {
+    Optional<SourceRow> existing = findRowByName(defaultName);
+    if (existing.isPresent()) {
+      return existing.get();
+    }
+
+    Optional<SourceRow> inserted =
+        insertDefaultIfAbsent(uuid, defaultType, now, defaultName, defaultConnectionUrl);
+    if (inserted.isPresent()) {
+      return inserted.get();
+    }
+
+    // A concurrent transaction inserted the same source name. Under READ COMMITTED this new
+    // statement observes the winner after ON CONFLICT has waited for it to finish.
+    return findRowByName(defaultName)
+        .orElseThrow(
+            () ->
+                new IllegalStateException(
+                    "Default source disappeared after a concurrent insert: " + defaultName));
+  }
 }

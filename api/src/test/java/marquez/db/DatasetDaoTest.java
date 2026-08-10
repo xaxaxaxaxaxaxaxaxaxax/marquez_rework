@@ -18,6 +18,8 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import io.openlineage.client.OpenLineage;
 import java.net.URI;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -27,10 +29,15 @@ import java.util.UUID;
 import lombok.Getter;
 import marquez.api.JdbiUtils;
 import marquez.common.models.DatasetName;
+import marquez.common.models.DatasetType;
 import marquez.common.models.Field;
 import marquez.common.models.NamespaceName;
 import marquez.common.models.RunId;
 import marquez.common.models.SourceName;
+import marquez.db.DatasetDao.DatasetCurrentVersionUpdate;
+import marquez.db.models.DatasetRow;
+import marquez.db.models.NamespaceRow;
+import marquez.db.models.SourceRow;
 import marquez.jdbi.MarquezJdbiExternalPostgresExtension;
 import marquez.service.models.DatasetVersion;
 import marquez.service.models.DbTableMeta;
@@ -118,6 +125,60 @@ class DatasetDaoTest {
     // test count of dataset versions
     int jobCount = datasetVersionDao.countDatasetVersions(NAMESPACE, DATASET);
     assertEquals(jobCount, 2);
+  }
+
+  @Test
+  void testUpdateVersionsUsesBoundedLastWriteWinsUpdates() {
+    Instant createdAt = Instant.parse("2024-01-01T00:00:00Z");
+    Instant updatedAt = createdAt.plusSeconds(60);
+    NamespaceRow namespace =
+        jdbi.onDemand(NamespaceDao.class)
+            .upsertNamespaceRow(
+                UUID.randomUUID(),
+                createdAt,
+                "dataset-version-update-test",
+                OpenLineageDao.DEFAULT_NAMESPACE_OWNER);
+    SourceRow source =
+        jdbi.onDemand(SourceDao.class)
+            .upsertOrDefault(
+                UUID.randomUUID(), "POSTGRES", createdAt, "dataset-version-update-source", "");
+    DatasetRow first = newDatasetRow(namespace, source, createdAt, "first-update-dataset");
+    DatasetRow second = newDatasetRow(namespace, source, createdAt, "second-update-dataset");
+
+    UUID discardedVersion = UUID.randomUUID();
+    UUID firstVersion = UUID.randomUUID();
+    UUID secondVersion = UUID.randomUUID();
+    List<DatasetCurrentVersionUpdate> updates = new ArrayList<>();
+    updates.add(new DatasetCurrentVersionUpdate(first.getUuid(), createdAt, discardedVersion));
+    for (int index = 0; index < DatasetDao.MAX_DATASET_CURRENT_VERSION_UPDATES; index++) {
+      updates.add(new DatasetCurrentVersionUpdate(UUID.randomUUID(), updatedAt, UUID.randomUUID()));
+    }
+    updates.add(new DatasetCurrentVersionUpdate(second.getUuid(), updatedAt, secondVersion));
+    updates.add(new DatasetCurrentVersionUpdate(first.getUuid(), updatedAt, firstVersion));
+
+    assertThat(datasetDao.updateVersions(Collections.emptyList())).isZero();
+    assertThat(datasetDao.updateVersions(updates)).isEqualTo(2);
+    assertRawDatasetVersion(first.getUuid(), firstVersion, updatedAt);
+    assertRawDatasetVersion(second.getUuid(), secondVersion, updatedAt);
+  }
+
+  private static void assertRawDatasetVersion(
+      UUID datasetUuid, UUID expectedVersionUuid, Instant expectedUpdatedAt) {
+    jdbi.useHandle(
+        handle ->
+            handle
+                .createQuery(
+                    "SELECT current_version_uuid, updated_at FROM datasets WHERE uuid = :uuid")
+                .bind("uuid", datasetUuid)
+                .map(
+                    (resultSet, context) -> {
+                      assertThat(resultSet.getObject("current_version_uuid", UUID.class))
+                          .isEqualTo(expectedVersionUuid);
+                      assertThat(resultSet.getTimestamp("updated_at").toInstant())
+                          .isEqualTo(expectedUpdatedAt);
+                      return true;
+                    })
+                .one());
   }
 
   @Test
@@ -682,6 +743,20 @@ class DatasetDaoTest {
         .getCurrentVersion()
         .flatMap(versionUuid -> datasetVersionDao.findByUuid(versionUuid))
         .flatMap(DatasetVersion::getCurrentSchemaVersion);
+  }
+
+  private DatasetRow newDatasetRow(
+      NamespaceRow namespace, SourceRow source, Instant now, String name) {
+    return datasetDao.upsert(
+        UUID.randomUUID(),
+        DatasetType.DB_TABLE,
+        now,
+        namespace.getUuid(),
+        namespace.getName(),
+        source.getUuid(),
+        source.getName(),
+        name,
+        name);
   }
 
   @Getter

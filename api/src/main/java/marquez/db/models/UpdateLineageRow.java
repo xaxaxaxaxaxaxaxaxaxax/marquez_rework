@@ -22,6 +22,10 @@ public class UpdateLineageRow {
   private RunStateRow runState;
   private Optional<List<DatasetRecord>> inputs;
   private Optional<List<DatasetRecord>> outputs;
+
+  /** Null when cumulative run I/O is not applicable; an empty snapshot means it was loaded. */
+  private RunIoSnapshot runIoSnapshot;
+
   private BagOfJobVersionInfo jobVersionBag;
 
   @Value

@@ -9,6 +9,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.collect.ImmutableSet;
 import io.dropwizard.Configuration;
 import io.dropwizard.db.DataSourceFactory;
+import javax.validation.Valid;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
@@ -17,6 +18,7 @@ import marquez.db.FlywayFactory;
 import marquez.graphql.GraphqlConfig;
 import marquez.jobs.DbRetentionConfig;
 import marquez.search.SearchConfig;
+import marquez.service.OpenLineageConfig;
 import marquez.service.models.Tag;
 import marquez.tracing.SentryConfig;
 
@@ -48,6 +50,11 @@ public class MarquezConfig extends Configuration {
   @Getter
   @JsonProperty("search")
   private final SearchConfig searchConfig = new SearchConfig();
+
+  @Getter
+  @Valid
+  @JsonProperty("openLineage")
+  private final OpenLineageConfig openLineageConfig = new OpenLineageConfig();
 
   @Getter
   @Setter

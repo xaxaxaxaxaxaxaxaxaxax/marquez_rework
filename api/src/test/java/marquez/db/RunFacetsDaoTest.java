@@ -70,7 +70,8 @@ public class RunFacetsDaoTest {
                 .of(
                     "custom-run-facet", "some-run-facet",
                     "spark.logicalPlan", "{some-spark-logical-plan:true}",
-                    "errorMessage", "{some-error-message-facet:true}"));
+                    "errorMessage", "{some-error-message-facet:true}",
+                    "SPARK_UNKNOWN", "{must-not-be-stored:true}"));
   }
 
   @AfterEach
@@ -149,7 +150,7 @@ public class RunFacetsDaoTest {
 
   @Test
   public void testInsertRunFacetsForSparkUnknown() {
-    assertThat(getRunFacetRow("sparkUnknown")).hasSize(0);
+    assertThat(getRunFacetRow("SPARK_UNKNOWN")).isEmpty();
   }
 
   @Test

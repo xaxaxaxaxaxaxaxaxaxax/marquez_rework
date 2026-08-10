@@ -26,12 +26,12 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import java.util.stream.Collectors;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 import marquez.common.Utils;
@@ -53,6 +53,11 @@ public final class RunMapper implements RowMapper<Run> {
   private final String columnPrefix;
 
   private static final ObjectMapper MAPPER = Utils.getMapper();
+  private static final TypeReference<List<QueryDatasetVersion>> DATASET_VERSIONS_TYPE =
+      new TypeReference<>() {};
+  private static final TypeReference<ImmutableList<QueryDatasetFacet>> DATASET_FACETS_TYPE =
+      new TypeReference<>() {};
+  private static final TypeReference<Map<String, String>> RUN_ARGS_TYPE = new TypeReference<>() {};
 
   public RunMapper() {
     this("");
@@ -79,6 +84,8 @@ public final class RunMapper implements RowMapper<Run> {
         columnNames.contains(columnPrefix + Columns.OUTPUT_VERSIONS)
             ? toQueryDatasetVersion(results, columnPrefix + Columns.OUTPUT_VERSIONS)
             : ImmutableList.of();
+    DatasetFacetIndex datasetFacetIndex =
+        indexDatasetFacets(getQueryDatasetFacets(results, columnNames));
     return new Run(
         RunId.of(uuidOrThrow(results, columnPrefix + Columns.ROW_UUID)),
         timestampOrThrow(results, columnPrefix + Columns.CREATED_AT),
@@ -100,8 +107,8 @@ public final class RunMapper implements RowMapper<Run> {
         stringOrThrow(results, columnPrefix + Columns.JOB_NAME),
         uuidOrNull(results, columnPrefix + Columns.JOB_VERSION),
         stringOrNull(results, columnPrefix + Columns.LOCATION),
-        toInputDatasetVersions(results, inputDatasetVersions, true),
-        toOutputDatasetVersions(results, outputDatasetVersions, false),
+        toInputDatasetVersions(inputDatasetVersions, datasetFacetIndex.input()),
+        toOutputDatasetVersions(outputDatasetVersions, datasetFacetIndex.output()),
         toFacetsOrNull(results, columnPrefix + Columns.FACETS));
   }
 
@@ -111,7 +118,7 @@ public final class RunMapper implements RowMapper<Run> {
     if (dsString == null) {
       return Collections.emptyList();
     }
-    return Utils.fromJson(dsString, new TypeReference<List<QueryDatasetVersion>>() {});
+    return Utils.fromJson(dsString, DATASET_VERSIONS_TYPE);
   }
 
   private Map<String, String> toArgsOrNull(ResultSet results, String argsColumn)
@@ -123,19 +130,20 @@ public final class RunMapper implements RowMapper<Run> {
     if (args == null) {
       return null;
     }
-    return Utils.fromJson(args, new TypeReference<Map<String, String>>() {});
+    return Utils.fromJson(args, RUN_ARGS_TYPE);
   }
 
   private List<InputDatasetVersion> toInputDatasetVersions(
-      ResultSet rs, List<QueryDatasetVersion> datasetVersionIds, boolean input)
-      throws SQLException {
-    ImmutableList<QueryDatasetFacet> queryFacets = getQueryDatasetFacets(rs);
+      List<QueryDatasetVersion> datasetVersionIds,
+      ImmutableMap<String, ImmutableMap<String, Object>> facetsByDatasetVersion) {
     try {
       return datasetVersionIds.stream()
           .map(
               version ->
                   new InputDatasetVersion(
-                      version.toDatasetVersionId(), getFacetsMap(input, queryFacets, version)))
+                      version.toDatasetVersionId(),
+                      facetsByDatasetVersion.getOrDefault(
+                          version.datasetVersionUUID(), ImmutableMap.of())))
           .collect(toList());
     } catch (IllegalStateException e) {
       return Collections.emptyList();
@@ -143,63 +151,92 @@ public final class RunMapper implements RowMapper<Run> {
   }
 
   private List<OutputDatasetVersion> toOutputDatasetVersions(
-      ResultSet rs, List<QueryDatasetVersion> datasetVersionIds, boolean input)
-      throws SQLException {
-    ImmutableList<QueryDatasetFacet> queryFacets = getQueryDatasetFacets(rs);
+      List<QueryDatasetVersion> datasetVersionIds,
+      ImmutableMap<String, ImmutableMap<String, Object>> facetsByDatasetVersion) {
     try {
       return datasetVersionIds.stream()
           .map(
               version ->
                   new OutputDatasetVersion(
-                      version.toDatasetVersionId(), getFacetsMap(input, queryFacets, version)))
+                      version.toDatasetVersionId(),
+                      facetsByDatasetVersion.getOrDefault(
+                          version.datasetVersionUUID(), ImmutableMap.of())))
           .collect(toList());
     } catch (IllegalStateException e) {
       return Collections.emptyList();
     }
   }
 
-  private ImmutableMap<String, Object> getFacetsMap(
-      boolean input,
-      ImmutableList<QueryDatasetFacet> queryDatasetFacets,
-      QueryDatasetVersion queryDatasetVersion) {
-    return ImmutableMap.copyOf(
-        queryDatasetFacets.stream()
-            .filter(rf -> rf.type.equalsIgnoreCase(input ? "input" : "output"))
-            .filter(rf -> rf.datasetVersionUUID.equals(queryDatasetVersion.datasetVersionUUID))
-            .collect(
-                Collectors.toMap(
-                    QueryDatasetFacet::name,
-                    facet ->
-                        Utils.getMapper()
-                            .convertValue(
-                                Utils.getMapper().valueToTree(facet.facet).get(facet.name),
-                                Object.class),
-                    (a1, a2) -> a2 // in case of duplicates, choose more recent
-                    )));
+  private DatasetFacetIndex indexDatasetFacets(
+      ImmutableList<QueryDatasetFacet> queryDatasetFacets) {
+    if (queryDatasetFacets.isEmpty()) {
+      return DatasetFacetIndex.EMPTY;
+    }
+
+    Map<String, Map<String, Object>> inputFacets = new HashMap<>();
+    Map<String, Map<String, Object>> outputFacets = new HashMap<>();
+    for (QueryDatasetFacet queryFacet : queryDatasetFacets) {
+      Map<String, Map<String, Object>> facetsByDatasetVersion;
+      if ("input".equalsIgnoreCase(queryFacet.type())) {
+        facetsByDatasetVersion = inputFacets;
+      } else if ("output".equalsIgnoreCase(queryFacet.type())) {
+        facetsByDatasetVersion = outputFacets;
+      } else {
+        continue;
+      }
+
+      facetsByDatasetVersion
+          .computeIfAbsent(queryFacet.datasetVersionUUID(), ignored -> new HashMap<>())
+          // Facets arrive in ascending creation order, so the latest duplicate must win.
+          .put(queryFacet.name(), queryFacet.facet().get(queryFacet.name()));
+    }
+
+    return new DatasetFacetIndex(
+        toImmutableFacetIndex(inputFacets), toImmutableFacetIndex(outputFacets));
   }
 
-  private ImmutableList<QueryDatasetFacet> getQueryDatasetFacets(ResultSet resultSet)
-      throws SQLException {
+  private ImmutableMap<String, ImmutableMap<String, Object>> toImmutableFacetIndex(
+      Map<String, Map<String, Object>> mutableFacetIndex) {
+    ImmutableMap.Builder<String, ImmutableMap<String, Object>> immutableFacetIndex =
+        ImmutableMap.builder();
+    mutableFacetIndex.forEach(
+        (datasetVersionUuid, facets) ->
+            immutableFacetIndex.put(datasetVersionUuid, ImmutableMap.copyOf(facets)));
+    return immutableFacetIndex.build();
+  }
+
+  private ImmutableList<QueryDatasetFacet> getQueryDatasetFacets(
+      ResultSet resultSet, Set<String> columnNames) throws SQLException {
     String column = columnPrefix + Columns.DATASET_FACETS;
-    ImmutableList<QueryDatasetFacet> queryDatasetFacets = ImmutableList.of();
-    if (Columns.exists(resultSet, column) && resultSet.getObject(column) != null) {
-      try {
-        queryDatasetFacets =
-            MAPPER.readValue(
-                ((PGobject) resultSet.getObject(column)).getValue(),
-                new TypeReference<ImmutableList<QueryDatasetFacet>>() {});
-      } catch (JsonProcessingException e) {
-        log.error(String.format("Could not read dataset from job row %s", column), e);
-      }
+    if (!columnNames.contains(column)) {
+      return ImmutableList.of();
     }
-    return queryDatasetFacets;
+
+    Object datasetFacets = resultSet.getObject(column);
+    if (datasetFacets == null) {
+      return ImmutableList.of();
+    }
+
+    try {
+      return MAPPER.readValue(((PGobject) datasetFacets).getValue(), DATASET_FACETS_TYPE);
+    } catch (JsonProcessingException e) {
+      log.error("Could not read dataset facets from run row column {}", column, e);
+      return ImmutableList.of();
+    }
+  }
+
+  private record DatasetFacetIndex(
+      ImmutableMap<String, ImmutableMap<String, Object>> input,
+      ImmutableMap<String, ImmutableMap<String, Object>> output) {
+    private static final DatasetFacetIndex EMPTY =
+        new DatasetFacetIndex(ImmutableMap.of(), ImmutableMap.of());
   }
 
   record QueryDatasetFacet(
       @JsonProperty("dataset_version_uuid") String datasetVersionUUID,
       String name,
       String type,
-      Object facet) {}
+      Map<String, Object> facet) {}
 
   record QueryDatasetVersion(
       String namespace,

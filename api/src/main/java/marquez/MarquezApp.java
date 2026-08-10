@@ -22,6 +22,9 @@ import io.prometheus.client.exporter.MetricsServlet;
 import io.prometheus.client.hotspot.DefaultExports;
 import io.sentry.Sentry;
 import java.util.EnumSet;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
 import javax.servlet.DispatcherType;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
@@ -138,10 +141,20 @@ public final class MarquezApp extends Application<MarquezConfig> {
     }
 
     final Jdbi jdbi = newJdbi(config, env, source);
+    final int openLineageWorkerThreads = config.getOpenLineageConfig().getWorkerThreads();
+    final ExecutorService openLineageExecutor =
+        env.lifecycle()
+            .executorService("open-lineage-intake-%d")
+            .minThreads(openLineageWorkerThreads)
+            .maxThreads(openLineageWorkerThreads)
+            .workQueue(new ArrayBlockingQueue<>(config.getOpenLineageConfig().getQueueCapacity()))
+            .rejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy())
+            .build();
     final MarquezContext marquezContext =
         MarquezContext.builder()
             .jdbi(jdbi)
             .searchConfig(config.getSearchConfig())
+            .openLineageExecutor(openLineageExecutor)
             .tags(config.getTags())
             .build();
 

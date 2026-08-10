@@ -11,8 +11,8 @@ import static marquez.tracing.SentryPropagating.withSentry;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.time.ZoneId;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -21,19 +21,15 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ForkJoinPool;
-import java.util.stream.Collectors;
+import java.util.concurrent.RejectedExecutionException;
 import lombok.extern.slf4j.Slf4j;
 import marquez.common.Utils;
-import marquez.common.models.DatasetName;
-import marquez.common.models.DatasetVersionId;
 import marquez.common.models.JobName;
 import marquez.common.models.JobVersionId;
 import marquez.common.models.NamespaceName;
 import marquez.common.models.RunId;
 import marquez.common.models.RunState;
 import marquez.db.BaseDao;
-import marquez.db.DatasetDao;
-import marquez.db.DatasetVersionDao;
 import marquez.db.models.ExtendedDatasetVersionRow;
 import marquez.db.models.JobRow;
 import marquez.db.models.RunArgsRow;
@@ -42,8 +38,6 @@ import marquez.db.models.RunStateRow;
 import marquez.db.models.UpdateLineageRow;
 import marquez.service.RunTransitionListener.JobInputUpdate;
 import marquez.service.RunTransitionListener.JobOutputUpdate;
-import marquez.service.RunTransitionListener.RunInput;
-import marquez.service.RunTransitionListener.RunOutput;
 import marquez.service.RunTransitionListener.RunTransition;
 import marquez.service.models.DatasetEvent;
 import marquez.service.models.JobEvent;
@@ -53,108 +47,121 @@ import marquez.service.models.RunMeta;
 @Slf4j
 public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao {
   private final RunService runService;
-  private final DatasetVersionDao datasetVersionDao;
+  private final SearchService searchService;
   private final ObjectMapper mapper = Utils.newObjectMapper();
-
   private final Executor executor;
 
   public OpenLineageService(BaseDao baseDao, RunService runService) {
-    this(baseDao, runService, ForkJoinPool.commonPool());
+    this(baseDao, runService, null, ForkJoinPool.commonPool());
   }
 
   public OpenLineageService(BaseDao baseDao, RunService runService, Executor executor) {
+    this(baseDao, runService, null, executor);
+  }
+
+  public OpenLineageService(
+      BaseDao baseDao, RunService runService, SearchService searchService, Executor executor) {
     super(baseDao.createOpenLineageDao());
     this.runService = runService;
-    this.datasetVersionDao = baseDao.createDatasetVersionDao();
+    this.searchService = searchService;
     this.executor = executor;
   }
 
   public CompletableFuture<Void> createAsync(DatasetEvent event) {
-    CompletableFuture<Void> openLineage =
-        CompletableFuture.runAsync(
-            withSentry(
-                withMdc(
-                    () ->
-                        createDatasetEvent(
-                            event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
-                            createJsonArray(event, mapper),
-                            event.getProducer()))),
-            executor);
-
-    CompletableFuture<Void> marquez =
-        CompletableFuture.runAsync(
-            withSentry(
-                withMdc(
-                    () -> {
-                      updateMarquezModel(event, mapper);
-                    })),
-            executor);
-
-    return CompletableFuture.allOf(marquez, openLineage);
+    return submit(
+        () ->
+            attemptBoth(
+                () ->
+                    createDatasetEvent(
+                        event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
+                        createJsonArray(event, mapper),
+                        event.getProducer()),
+                () -> updateMarquezModel(event, mapper)));
   }
 
   public CompletableFuture<Void> createAsync(JobEvent event) {
-    CompletableFuture<Void> openLineage =
-        CompletableFuture.runAsync(
-            withSentry(
-                withMdc(
-                    () ->
-                        createJobEvent(
-                            event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
-                            event.getJob().getName(),
-                            event.getJob().getNamespace(),
-                            createJsonArray(event, mapper),
-                            event.getProducer()))),
-            executor);
-
-    CompletableFuture<Void> marquez =
-        CompletableFuture.runAsync(
-            withSentry(
-                withMdc(
-                    () -> {
-                      updateMarquezModel(event, mapper);
-                    })),
-            executor);
-
-    return CompletableFuture.allOf(marquez, openLineage);
+    return submit(
+        () ->
+            attemptBoth(
+                () ->
+                    createJobEvent(
+                        event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
+                        event.getJob().getName(),
+                        event.getJob().getNamespace(),
+                        createJsonArray(event, mapper),
+                        event.getProducer()),
+                () -> updateMarquezModel(event, mapper)));
   }
 
   public CompletableFuture<Void> createAsync(LineageEvent event) {
-    UUID runUuid = runUuidFromEvent(event.getRun());
-    CompletableFuture<Void> openLineage =
-        CompletableFuture.runAsync(
-            withSentry(
-                withMdc(
-                    () ->
-                        createLineageEvent(
-                            event.getEventType() == null ? "" : event.getEventType(),
-                            event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
-                            runUuid,
-                            event.getJob().getName(),
-                            event.getJob().getNamespace(),
-                            createJsonArray(event, mapper),
-                            event.getProducer()))),
-            executor);
+    return submit(
+        () -> {
+          if (searchService != null) {
+            searchService.indexEvent(event);
+          }
 
-    CompletableFuture<Void> marquez =
-        CompletableFuture.supplyAsync(
-                withSentry(withMdc(() -> updateMarquezModel(event, mapper))), executor)
-            .thenAccept(
-                (update) -> {
-                  if (event.getEventType() != null) {
-                    boolean isStreaming =
-                        Optional.ofNullable(event.getJob())
-                            .map(j -> j.isStreamingJob())
-                            .orElse(false);
-                    if (event.getEventType().equalsIgnoreCase("COMPLETE") || isStreaming) {
-                      buildJobOutputUpdate(update).ifPresent(runService::notify);
-                    }
-                    buildJobInputUpdate(update).ifPresent(runService::notify);
-                    buildRunTransition(update).ifPresent(runService::notify);
-                  }
-                });
+          UUID runUuid = runUuidFromEvent(event.getRun());
+          attemptBoth(
+              () ->
+                  createLineageEvent(
+                      event.getEventType() == null ? "" : event.getEventType(),
+                      event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
+                      runUuid,
+                      event.getJob().getName(),
+                      event.getJob().getNamespace(),
+                      createJsonArray(event, mapper),
+                      event.getProducer()),
+              () -> notifyListeners(event, updateMarquezModel(event, mapper)));
+        });
+  }
 
-    return CompletableFuture.allOf(marquez, openLineage);
+  private CompletableFuture<Void> submit(Runnable task) {
+    try {
+      return CompletableFuture.runAsync(withSentry(withMdc(task)), executor);
+    } catch (RejectedExecutionException e) {
+      return CompletableFuture.failedFuture(new IntakeOverloadedException(e));
+    }
+  }
+
+  private void attemptBoth(Runnable rawEventWrite, Runnable relationalProjection) {
+    RuntimeException failure = null;
+    try {
+      rawEventWrite.run();
+    } catch (RuntimeException e) {
+      failure = e;
+    }
+
+    try {
+      relationalProjection.run();
+    } catch (RuntimeException e) {
+      if (failure == null) {
+        failure = e;
+      } else {
+        failure.addSuppressed(e);
+      }
+    }
+
+    if (failure != null) {
+      throw failure;
+    }
+  }
+
+  private void notifyListeners(LineageEvent event, UpdateLineageRow update) {
+    if (event.getEventType() == null || !runService.hasRunTransitionListeners()) {
+      return;
+    }
+
+    boolean isStreaming =
+        Optional.ofNullable(event.getJob()).map(j -> j.isStreamingJob()).orElse(false);
+    if (update.getRunIoSnapshot() != null) {
+      if (event.getEventType().equalsIgnoreCase("COMPLETE") || isStreaming) {
+        buildJobOutputUpdate(update).ifPresent(runService::notify);
+      }
+      buildJobInputUpdate(update).ifPresent(runService::notify);
+    } else {
+      log.warn("No run I/O snapshot available for run {}", update.getRun().getUuid());
+    }
+    buildRunTransition(update).ifPresent(runService::notify);
   }
 
   /**
@@ -203,25 +210,15 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
 
   Optional<JobOutputUpdate> buildJobOutput(
       RunId runId, JobVersionId jobVersionId, UpdateLineageRow record) {
-    // We query for all datasets since they can come in slowly over time
     List<ExtendedDatasetVersionRow> datasets =
-        datasetVersionDao.findOutputDatasetVersionsFor(record.getRun().getUuid());
-    DatasetDao datasetDao = createDatasetDao();
-    datasets.forEach(
-        versionRow ->
-            datasetDao.updateVersion(
-                versionRow.getDatasetUuid(), Instant.now(), versionRow.getUuid()));
+        record.getRunIoSnapshot() == null
+            ? Collections.emptyList()
+            : record.getRunIoSnapshot().getOutputs();
 
     // Do not trigger a JobOutput event if there are no new datasets
     if (datasets.isEmpty() && record.getOutputs().isEmpty()) {
       return Optional.empty();
     }
-
-    List<RunOutput> runOutputs =
-        datasets.stream()
-            .map(this::buildDatasetVersionId)
-            .map(RunOutput::new)
-            .collect(Collectors.toList());
 
     return Optional.of(
         new JobOutputUpdate(
@@ -229,7 +226,7 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
             jobVersionId,
             JobName.of(record.getJob().getName()),
             NamespaceName.of(record.getJob().getNamespaceName()),
-            runOutputs));
+            RunService.buildRunOutputs(datasets)));
   }
 
   Optional<JobInputUpdate> buildJobInput(
@@ -239,9 +236,10 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
       JobVersionId jobVersionId,
       RunId runId,
       UpdateLineageRow record) {
-    // We query for all datasets since they can come in slowly over time
     List<ExtendedDatasetVersionRow> datasets =
-        datasetVersionDao.findInputDatasetVersionsFor(record.getRun().getUuid());
+        record.getRunIoSnapshot() == null
+            ? Collections.emptyList()
+            : record.getRunIoSnapshot().getInputs();
     // Do not trigger a JobInput event if there are no new datasets
     if (datasets.isEmpty() || record.getInputs().isEmpty()) {
       return Optional.empty();
@@ -253,12 +251,6 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
     } catch (Exception e) {
       runArgs = new HashMap<>();
     }
-
-    List<RunInput> runInputs =
-        datasets.stream()
-            .map(this::buildDatasetVersionId)
-            .map(RunInput::new)
-            .collect(Collectors.toList());
 
     return Optional.of(
         new JobInputUpdate(
@@ -272,15 +264,7 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
             jobVersionId,
             JobName.of(jobRow.getName()),
             NamespaceName.of(jobRow.getNamespaceName()),
-            runInputs));
-  }
-
-  private DatasetVersionId buildDatasetVersionId(ExtendedDatasetVersionRow ds) {
-    return DatasetVersionId.builder()
-        .version(ds.getUuid())
-        .namespace(NamespaceName.of(ds.getNamespaceName()))
-        .name(DatasetName.of(ds.getDatasetName()))
-        .build();
+            RunService.buildRunInputs(datasets)));
   }
 
   private Optional<RunTransition> buildRunTransition(UpdateLineageRow record) {

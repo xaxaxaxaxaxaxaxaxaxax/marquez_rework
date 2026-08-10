@@ -89,6 +89,37 @@ public class JobFacetsDaoTest {
   }
 
   @Test
+  public void insertJobFacetContainerForVersion() {
+    lineageRow =
+        LineageTestUtils.createLineageRow(
+            openLineageDao,
+            "job_" + UUID.randomUUID(),
+            "COMPLETE",
+            JobFacet.builder().build(),
+            Collections.emptyList(),
+            Collections.emptyList());
+    JobFacet facets =
+        JobFacet.builder()
+            .documentation(
+                new LineageEvent.DocumentationJobFacet(
+                    PRODUCER_URL, SCHEMA_URL, "version-documentation"))
+            .sql(new LineageEvent.SQLJobFacet(PRODUCER_URL, SCHEMA_URL, "select 1"))
+            .build();
+
+    jobFacetsDao.insertJobFacetsFor(
+        lineageRow.getJob().getUuid(),
+        lineageRow.getJobVersionBag().getJobVersionRow().getUuid(),
+        lineageEventTime,
+        facets);
+
+    assertThat(getJobFacetRow())
+        .hasSize(2)
+        .extracting(JobFacetsDao.JobFacetRow::name)
+        .containsExactlyInAnyOrder("documentation", "sql");
+    assertThat(getJobFacetRow()).extracting(JobFacetsDao.JobFacetRow::runUuid).containsOnlyNulls();
+  }
+
+  @Test
   public void testGetFacetsByRunUuid() {
     LineageEvent.JobFacet jobFacet =
         JobFacet.builder()

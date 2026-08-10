@@ -76,6 +76,7 @@ public final class JobMapper implements RowMapper<Job> {
             uuidOrNull(results, Columns.CURRENT_VERSION_UUID),
             getLabels(facetsOrNull),
             toTags(results, "tags"));
+    job.setCurrentRunUuid(uuidOrNull(results, Columns.CURRENT_RUN_UUID));
     return job;
   }
 

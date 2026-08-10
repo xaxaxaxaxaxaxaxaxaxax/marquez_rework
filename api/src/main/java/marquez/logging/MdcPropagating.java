@@ -19,30 +19,47 @@ public class MdcPropagating {
   public static <T> Supplier<T> withMdc(Supplier<T> supplier) {
     Map<String, String> mdcContext = MDC.getCopyOfContextMap();
     return () -> {
-      if (mdcContext != null) {
-        MDC.setContextMap(mdcContext);
+      Map<String, String> previousContext = MDC.getCopyOfContextMap();
+      setContext(mdcContext);
+      try {
+        return supplier.get();
+      } finally {
+        setContext(previousContext);
       }
-      return supplier.get();
     };
   }
 
   public static <T> Consumer<T> withMdc(Consumer<T> consumer) {
     Map<String, String> mdcContext = MDC.getCopyOfContextMap();
     return (t) -> {
-      if (mdcContext != null) {
-        MDC.setContextMap(mdcContext);
+      Map<String, String> previousContext = MDC.getCopyOfContextMap();
+      setContext(mdcContext);
+      try {
+        consumer.accept(t);
+      } finally {
+        setContext(previousContext);
       }
-      consumer.accept(t);
     };
   }
 
   public static Runnable withMdc(Runnable runnable) {
     Map<String, String> mdcContext = MDC.getCopyOfContextMap();
     return () -> {
-      if (mdcContext != null) {
-        MDC.setContextMap(mdcContext);
+      Map<String, String> previousContext = MDC.getCopyOfContextMap();
+      setContext(mdcContext);
+      try {
+        runnable.run();
+      } finally {
+        setContext(previousContext);
       }
-      runnable.run();
     };
+  }
+
+  private static void setContext(Map<String, String> context) {
+    if (context == null) {
+      MDC.clear();
+    } else {
+      MDC.setContextMap(context);
+    }
   }
 }

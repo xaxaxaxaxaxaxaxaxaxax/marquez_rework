@@ -9,7 +9,12 @@ import static marquez.db.OpenLineageDao.DEFAULT_NAMESPACE_OWNER;
 
 import com.google.common.collect.ImmutableSet;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -38,6 +43,7 @@ import marquez.service.models.LineageEvent.SchemaField;
 import marquez.service.models.Run;
 import marquez.service.models.RunMeta;
 import org.jdbi.v3.sqlobject.config.RegisterRowMapper;
+import org.jdbi.v3.sqlobject.customizer.Bind;
 import org.jdbi.v3.sqlobject.statement.SqlQuery;
 import org.jdbi.v3.sqlobject.statement.SqlUpdate;
 import org.jdbi.v3.sqlobject.transaction.Transaction;
@@ -47,6 +53,8 @@ import org.jdbi.v3.sqlobject.transaction.Transaction;
 @RegisterRowMapper(RunMapper.class)
 @RegisterRowMapper(JobRowMapper.class)
 public interface RunDao extends BaseDao {
+  int RUN_INPUT_MAPPING_CHUNK_SIZE = 1000;
+
   @SqlQuery("SELECT EXISTS (SELECT 1 FROM runs WHERE uuid = :rowUuid)")
   boolean exists(UUID rowUuid);
 
@@ -74,58 +82,83 @@ public interface RunDao extends BaseDao {
           + "WHERE uuid = :rowUuid")
   void updateEndState(UUID rowUuid, Instant transitionedAt, UUID endRunStateUuid);
 
-  String BASE_FIND_RUN_SQL =
+  String FIND_RUN_SELECT_SQL =
       """
       SELECT r.*, ra.args, f.facets,
       jv.version AS job_version,
       ri.input_versions, ro.output_versions, df.dataset_facets
-      FROM runs_view AS r
-      LEFT OUTER JOIN
-      (
-          SELECT rf.run_uuid, JSON_AGG(rf.facet ORDER BY rf.lineage_event_time ASC) AS facets
-          FROM run_facets_view rf
-          GROUP BY rf.run_uuid
-      ) AS f ON r.uuid=f.run_uuid
+      """;
+
+  String FIND_RUN_CORE_ENRICHMENT_SQL =
+      """
       LEFT OUTER JOIN run_args AS ra ON ra.uuid = r.run_args_uuid
-      LEFT OUTER JOIN job_versions jv ON jv.uuid=r.job_version_uuid
-      LEFT OUTER JOIN (
-          SELECT im.run_uuid, JSON_AGG(json_build_object('namespace', dv.namespace_name,
+      LEFT OUTER JOIN LATERAL (
+          SELECT JSON_AGG(json_build_object('namespace', dv.namespace_name,
               'name', dv.dataset_name,
               'version', dv.version,
-              'dataset_version_uuid', uuid)) AS input_versions
+              'dataset_version_uuid', dv.uuid)) AS input_versions
           FROM runs_input_mapping im
           INNER JOIN dataset_versions dv on im.dataset_version_uuid = dv.uuid
-          GROUP BY im.run_uuid
-      ) ri ON ri.run_uuid=r.uuid
-      LEFT OUTER JOIN (
-          SELECT run_uuid, JSON_AGG(json_build_object('namespace', namespace_name,
-                                                      'name', dataset_name,
-                                                      'version', version,
-                                                      'dataset_version_uuid', uuid
-                                                      )) AS output_versions
-          FROM dataset_versions
-          GROUP BY run_uuid
-      ) ro ON ro.run_uuid=r.uuid
-      LEFT OUTER JOIN (
-          SELECT
-              run_uuid,
-              JSON_AGG(json_build_object(
-                  'dataset_version_uuid', dataset_version_uuid,
-                  'name', name,
-                  'type', type,
-                  'facet', facet
-              ) ORDER BY created_at ASC) as dataset_facets
-          FROM dataset_facets_view
-          WHERE (type ILIKE 'output' OR type ILIKE 'input')
-          GROUP BY run_uuid
-      ) AS df ON r.uuid = df.run_uuid
+          WHERE im.run_uuid = r.uuid
+      ) ri ON TRUE
+      LEFT OUTER JOIN LATERAL (
+          SELECT JSON_AGG(json_build_object('namespace', dv.namespace_name,
+              'name', dv.dataset_name,
+              'version', dv.version,
+              'dataset_version_uuid', dv.uuid
+              )) AS output_versions
+          FROM dataset_versions dv
+          WHERE dv.run_uuid = r.uuid
+      ) ro ON TRUE
       """;
+
+  String FIND_RUN_ENRICHMENT_SQL =
+      """
+      LEFT OUTER JOIN LATERAL (
+          SELECT JSON_AGG(rf.facet ORDER BY rf.lineage_event_time ASC) AS facets
+          FROM run_facets_view rf
+          WHERE rf.run_uuid = r.uuid
+      ) AS f ON TRUE
+      """
+          + FIND_RUN_CORE_ENRICHMENT_SQL
+          + """
+      LEFT OUTER JOIN job_versions jv ON jv.uuid=r.job_version_uuid
+      LEFT OUTER JOIN LATERAL (
+          SELECT JSON_AGG(json_build_object(
+                  'dataset_version_uuid', df.dataset_version_uuid,
+                  'name', df.name,
+                  'type', df.type,
+                  'facet', df.facet
+              ) ORDER BY df.created_at ASC) as dataset_facets
+          FROM dataset_facets_view df
+          WHERE df.run_uuid = r.uuid
+            AND (df.type ILIKE 'output' OR df.type ILIKE 'input')
+      ) AS df ON TRUE
+      """;
+
+  String BASE_FIND_RUN_SQL =
+      FIND_RUN_SELECT_SQL + " FROM runs_view AS r\n" + FIND_RUN_ENRICHMENT_SQL;
+
+  String BASE_FIND_EXTENDED_RUN_SQL =
+      """
+      SELECT r.*, ra.args, ri.input_versions, ro.output_versions
+      FROM runs_view AS r
+      """
+          + FIND_RUN_CORE_ENRICHMENT_SQL;
 
   @SqlQuery(BASE_FIND_RUN_SQL + "WHERE r.uuid = :runUuid")
   Optional<Run> findRunByUuid(UUID runUuid);
 
-  @SqlQuery(BASE_FIND_RUN_SQL + "WHERE r.uuid = :runUuid")
+  @SqlQuery(BASE_FIND_EXTENDED_RUN_SQL + "WHERE r.uuid = :runUuid")
   Optional<ExtendedRunRow> findRunByUuidAsExtendedRow(UUID runUuid);
+
+  @SqlQuery(
+      BASE_FIND_RUN_SQL + "WHERE r.uuid = ANY(CAST(:runUuids AS uuid[])) " + "ORDER BY r.uuid")
+  List<Run> findRunsByUuidsQuery(@Bind("runUuids") UUID[] runUuids);
+
+  default List<Run> findRunsByUuids(Collection<UUID> runUuids) {
+    return runUuids.isEmpty() ? List.of() : findRunsByUuidsQuery(runUuids.toArray(UUID[]::new));
+  }
 
   @SqlQuery("SELECT * FROM runs r WHERE r.uuid = :runUuid")
   Optional<RunRow> findRunByUuidAsRow(UUID runUuid);
@@ -148,78 +181,18 @@ public interface RunDao extends BaseDao {
             FROM jobs_view jv
             WHERE jv.namespace_name=:namespace AND (jv.name=:jobName OR :jobName = ANY(jv.aliases))
           ),
-          run_facets_agg AS (
-            SELECT
-                run_uuid,
-                JSON_AGG(facet ORDER BY lineage_event_time ASC) AS facets
-            FROM run_facets_view
-            -- This filter here is used for performance purpose: we only aggregate the json of run_uuid that matters
-            WHERE
-                run_uuid IN (SELECT uuid FROM runs_view WHERE job_uuid IN (SELECT uuid FROM filtered_jobs))
-            GROUP BY run_uuid
-          ),
-          input_versions_agg AS (
-               SELECT
-                   im.run_uuid,
-                   JSON_AGG(json_build_object('namespace', dv.namespace_name,
-                        'name', dv.dataset_name,
-                        'version', dv.version,
-                        'dataset_version_uuid', dv.uuid
-                   )) AS input_versions
-               FROM runs_input_mapping im
-               INNER JOIN dataset_versions dv ON im.dataset_version_uuid = dv.uuid
-               -- This filter here is used for performance purpose: we only aggregate the json of run_uuid that matters
-               WHERE
-                   im.run_uuid IN (SELECT uuid FROM runs_view WHERE job_uuid IN (SELECT uuid FROM filtered_jobs))
-               GROUP BY im.run_uuid
-          ),
-          output_versions_agg AS (
-              SELECT
-                  dv.run_uuid,
-              JSON_AGG(json_build_object('namespace', namespace_name,
-                                       'name', dataset_name,
-                                       'version', version,
-                                       'dataset_version_uuid', uuid
-                                       )) AS output_versions
-              FROM dataset_versions dv
-              -- This filter here is used for performance purpose: we only aggregate the json of run_uuid that matters
-              WHERE dv.run_uuid IN (SELECT uuid FROM runs_view WHERE job_uuid IN (SELECT uuid FROM filtered_jobs))
-              GROUP BY dv.run_uuid
-          ),
-          dataset_facets_agg AS (
-              SELECT
-                  run_uuid,
-                  JSON_AGG(json_build_object(
-                      'dataset_version_uuid', dataset_version_uuid,
-                      'name', name,
-                      'type', type,
-                      'facet', facet
-                  ) ORDER BY created_at ASC) as dataset_facets
-              FROM dataset_facets_view
-              -- This filter here is used for performance purpose: we only aggregate the json of run_uuid that matters
-              WHERE run_uuid IN (SELECT uuid FROM runs_view WHERE job_uuid IN (SELECT uuid FROM filtered_jobs))
-              AND (type ILIKE 'output' OR type ILIKE 'input')
-              GROUP BY run_uuid
+          selected_runs AS MATERIALIZED (
+              SELECT r.*
+              FROM runs_view r
+              INNER JOIN filtered_jobs fj ON r.job_uuid = fj.uuid
+              ORDER BY r.started_at DESC NULLS LAST, r.uuid DESC
+              LIMIT :limit OFFSET :offset
           )
-          SELECT
-              r.*,
-              ra.args,
-              f.facets,
-              jv.version AS job_version,
-              ri.input_versions,
-              ro.output_versions,
-              df.dataset_facets
-          FROM runs_view r
-          INNER JOIN filtered_jobs fj ON r.job_uuid = fj.uuid
-          LEFT JOIN run_facets_agg f ON r.uuid = f.run_uuid
-          LEFT JOIN run_args ra ON ra.uuid = r.run_args_uuid
-          LEFT JOIN job_versions jv ON jv.uuid = r.job_version_uuid
-          LEFT JOIN input_versions_agg ri ON r.uuid = ri.run_uuid
-          LEFT JOIN output_versions_agg ro ON r.uuid = ro.run_uuid
-          LEFT JOIN dataset_facets_agg df ON r.uuid = df.run_uuid
-          ORDER BY r.started_at DESC NULLS LAST
-          LIMIT :limit OFFSET :offset
-      """)
+      """
+          + FIND_RUN_SELECT_SQL
+          + " FROM selected_runs AS r\n"
+          + FIND_RUN_ENRICHMENT_SQL
+          + " ORDER BY r.started_at DESC NULLS LAST, r.uuid DESC")
   List<Run> findAll(String namespace, String jobName, int limit, int offset);
 
   @SqlQuery(
@@ -367,9 +340,52 @@ public interface RunDao extends BaseDao {
   }
 
   @SqlUpdate(
-      "INSERT INTO runs_input_mapping (run_uuid, dataset_version_uuid) "
-          + "VALUES (:runUuid, :datasetVersionUuid) ON CONFLICT DO NOTHING")
-  void updateInputMapping(UUID runUuid, UUID datasetVersionUuid);
+      """
+      INSERT INTO runs_input_mapping (run_uuid, dataset_version_uuid)
+      SELECT :runUuid, mappings.dataset_version_uuid
+      FROM unnest(CAST(:datasetVersionUuids AS uuid[])) mappings(dataset_version_uuid)
+      ON CONFLICT (run_uuid, dataset_version_uuid) DO NOTHING
+      """)
+  void insertInputMappingsChunk(
+      UUID runUuid, @Bind("datasetVersionUuids") UUID[] datasetVersionUuids);
+
+  /**
+   * Associates input dataset versions with a run using bounded, set-based inserts. All chunks are
+   * committed atomically, including when this method is called outside a surrounding transaction.
+   */
+  @Transaction
+  default void updateInputMappings(UUID runUuid, Iterable<UUID> datasetVersionUuids) {
+    Objects.requireNonNull(runUuid, "runUuid");
+    Iterator<UUID> iterator =
+        Objects.requireNonNull(datasetVersionUuids, "datasetVersionUuids").iterator();
+    if (!iterator.hasNext()) {
+      return;
+    }
+
+    Set<UUID> seenDatasetVersionUuids = new HashSet<>();
+    List<UUID> chunk = new ArrayList<>(RUN_INPUT_MAPPING_CHUNK_SIZE);
+
+    while (iterator.hasNext()) {
+      UUID datasetVersionUuid =
+          Objects.requireNonNull(iterator.next(), "datasetVersionUuids contains null");
+      if (seenDatasetVersionUuids.add(datasetVersionUuid)) {
+        chunk.add(datasetVersionUuid);
+      }
+      if (chunk.size() == RUN_INPUT_MAPPING_CHUNK_SIZE) {
+        insertInputMappingsChunk(runUuid, chunk.toArray(UUID[]::new));
+        chunk.clear();
+      }
+    }
+
+    if (!chunk.isEmpty()) {
+      insertInputMappingsChunk(runUuid, chunk.toArray(UUID[]::new));
+    }
+  }
+
+  /** Used to associate one input dataset version with a run. */
+  default void updateInputMapping(UUID runUuid, UUID datasetVersionUuid) {
+    updateInputMappings(runUuid, List.of(datasetVersionUuid));
+  }
 
   @Transaction
   default void notifyJobChange(UUID runUuid, JobRow jobRow, JobMeta jobMeta) {
@@ -442,15 +458,17 @@ public interface RunDao extends BaseDao {
       return;
     }
     DatasetDao datasetDao = createDatasetDao();
+    List<UUID> datasetVersionUuids = new ArrayList<>(inputs.size());
 
     for (DatasetId datasetId : inputs) {
       Optional<Dataset> dataset =
           datasetDao.findDatasetByName(
               datasetId.getNamespace().getValue(), datasetId.getName().getValue());
       if (dataset.isPresent() && dataset.get().getCurrentVersion().isPresent()) {
-        updateInputMapping(runUuid, dataset.get().getCurrentVersion().get());
+        datasetVersionUuids.add(dataset.get().getCurrentVersion().get());
       }
     }
+    updateInputMappings(runUuid, datasetVersionUuids);
   }
 
   @SqlUpdate(
@@ -504,38 +522,55 @@ public interface RunDao extends BaseDao {
     return runRow;
   }
 
-  @SqlUpdate("UPDATE runs SET job_version_uuid = :jobVersionUuid WHERE uuid = :runUuid")
+  @SqlUpdate(
+      "UPDATE runs SET job_version_uuid = :jobVersionUuid "
+          + "WHERE uuid = :runUuid AND job_version_uuid IS DISTINCT FROM :jobVersionUuid")
   void updateJobVersion(UUID runUuid, UUID jobVersionUuid);
 
   @SqlQuery(
-      BASE_FIND_RUN_SQL
-          + """
-      WHERE r.uuid IN (
-        SELECT j.current_run_uuid FROM jobs_view j
-        WHERE j.namespace_name=:namespace AND (j.name=:jobName OR j.name=ANY(j.aliases))
+      """
+      WITH selected_runs AS MATERIALIZED (
+          SELECT r.*
+          FROM runs_view r
+          WHERE r.uuid IN (
+            SELECT j.current_run_uuid FROM jobs_view j
+            WHERE j.namespace_name=:namespace
+              AND (j.name=:jobName OR :jobName = ANY(j.aliases))
+          )
+          ORDER BY r.transitioned_at DESC, r.started_at DESC, r.uuid DESC
+          LIMIT :limit OFFSET :offset
       )
-      ORDER BY transitioned_at DESC, started_at DESC
-      LIMIT :limit OFFSET :offset
-      """)
+      """
+          + FIND_RUN_SELECT_SQL
+          + " FROM selected_runs AS r\n"
+          + FIND_RUN_ENRICHMENT_SQL
+          + " ORDER BY r.transitioned_at DESC, r.started_at DESC, r.uuid DESC")
   List<Run> findCurrentRunByJob(String namespace, String jobName, int limit, int offset);
 
   @SqlQuery(
-      BASE_FIND_RUN_SQL
-          + """
-      WHERE r.job_uuid IN (
-        SELECT j.uuid FROM jobs j
-        WHERE j.uuid IN (
-          SELECT jv.uuid FROM jobs_view jv
-          WHERE jv.namespace_name=:namespace AND (jv.name=:jobName OR jv.name=ANY(jv.aliases))
-        )
-        OR j.symlink_target_uuid IN (
-          SELECT jv.uuid FROM jobs_view jv
-          WHERE jv.namespace_name=:namespace AND (jv.name=:jobName OR jv.name=ANY(jv.aliases))
-        )
+      """
+      WITH filtered_jobs AS MATERIALIZED (
+          SELECT jv.uuid
+          FROM jobs_view jv
+          WHERE jv.namespace_name=:namespace
+            AND (jv.name=:jobName OR :jobName = ANY(jv.aliases))
+      ),
+      selected_runs AS MATERIALIZED (
+          SELECT r.*
+          FROM runs_view r
+          WHERE r.job_uuid IN (
+            SELECT j.uuid FROM jobs j
+            WHERE j.uuid IN (SELECT uuid FROM filtered_jobs)
+               OR j.symlink_target_uuid IN (SELECT uuid FROM filtered_jobs)
+          )
+          ORDER BY r.transitioned_at DESC, r.started_at DESC, r.uuid DESC
+          LIMIT :limit OFFSET :offset
       )
-      ORDER BY transitioned_at DESC, started_at DESC
-      LIMIT :limit OFFSET :offset
-      """)
+      """
+          + FIND_RUN_SELECT_SQL
+          + " FROM selected_runs AS r\n"
+          + FIND_RUN_ENRICHMENT_SQL
+          + " ORDER BY r.transitioned_at DESC, r.started_at DESC, r.uuid DESC")
   List<Run> findByLatestJob(String namespace, String jobName, int limit, int offset);
 
   @Builder

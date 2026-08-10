@@ -10,7 +10,6 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.core.type.TypeReference;
-import java.net.MalformedURLException;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
@@ -23,22 +22,25 @@ import marquez.db.Columns;
 import marquez.service.models.Job;
 import org.jdbi.v3.core.statement.StatementContext;
 import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.postgresql.util.PGobject;
 
 class JobMapperTest {
 
-  private static ResultSet resultSet;
-  private static TimeZone defaultTZ = TimeZone.getDefault();
+  private static final TimeZone DEFAULT_TZ = TimeZone.getDefault();
+  private static final UUID CURRENT_RUN_UUID =
+      UUID.fromString("caed5d2f-24c5-4435-a2d7-c67358f4e3c6");
 
-  private static String JOB_FACET =
+  private static final String JOB_FACET =
       """
       [{"jobType": {"jobType": "QUERY", "integration": "FLINK", "processingType": "STREAMING"}}]
       """;
 
-  @BeforeAll
-  public static void setUp() throws SQLException, MalformedURLException {
+  private ResultSet resultSet;
+
+  @BeforeEach
+  public void setUp() throws SQLException {
     TimeZone.setDefault(TimeZone.getTimeZone("UTC"));
     resultSet = mock(ResultSet.class);
     when(resultSet.getMetaData()).thenReturn(mock(ResultSetMetaData.class));
@@ -64,6 +66,8 @@ class JobMapperTest {
         .thenReturn(UUID.fromString("b1d626a2-6d3a-475e-9ecf-943176d4a8c6"));
     when(resultSet.getObject(Columns.CURRENT_VERSION_UUID, UUID.class))
         .thenReturn(UUID.fromString("b1d626a2-6d3a-475e-9ecf-943176d4a8c6"));
+    when(resultSet.getObject(Columns.CURRENT_RUN_UUID)).thenReturn(CURRENT_RUN_UUID);
+    when(resultSet.getObject(Columns.CURRENT_RUN_UUID, UUID.class)).thenReturn(CURRENT_RUN_UUID);
     when(resultSet.getString("current_location")).thenReturn("https://github.com/");
     when(resultSet.getObject("current_location")).thenReturn("https://github.com/");
     when(resultSet.getString(Columns.FACETS)).thenReturn(null);
@@ -79,7 +83,7 @@ class JobMapperTest {
 
   @AfterAll
   public static void reset() {
-    TimeZone.setDefault(defaultTZ);
+    TimeZone.setDefault(DEFAULT_TZ);
   }
 
   @Test
@@ -92,6 +96,19 @@ class JobMapperTest {
 
     Job actual = underTest.map(resultSet, mock(StatementContext.class));
     assertThat(actual).isEqualTo(expected);
+    assertThat(actual.getCurrentRunUuid()).contains(CURRENT_RUN_UUID);
+    assertThat(Utils.toJson(actual)).doesNotContain("currentRunUuid");
+    assertThat(actual.toString()).doesNotContain("currentRunUuid", CURRENT_RUN_UUID.toString());
+  }
+
+  @Test
+  void shouldMapMissingCurrentRunUuid() throws SQLException {
+    when(resultSet.getObject(Columns.CURRENT_RUN_UUID)).thenReturn(null);
+    when(resultSet.getObject(Columns.CURRENT_RUN_UUID, UUID.class)).thenReturn(null);
+
+    Job actual = new JobMapper().map(resultSet, mock(StatementContext.class));
+
+    assertThat(actual.getCurrentRunUuid()).isEmpty();
   }
 
   @Test

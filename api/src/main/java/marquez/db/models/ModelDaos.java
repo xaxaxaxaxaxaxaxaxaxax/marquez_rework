@@ -5,6 +5,7 @@
 
 package marquez.db.models;
 
+import java.util.Objects;
 import marquez.db.BaseDao;
 import marquez.db.ColumnLineageDao;
 import marquez.db.DatasetDao;
@@ -44,10 +45,10 @@ public final class ModelDaos {
   private RunArgsDao runArgsDao = null;
   private RunStateDao runStateDao = null;
   private RunFacetsDao runFacetsDao = null;
-  private BaseDao baseDao;
+  private final BaseDao baseDao;
 
-  public void initBaseDao(BaseDao baseDao) {
-    this.baseDao = baseDao;
+  public ModelDaos(BaseDao baseDao) {
+    this.baseDao = Objects.requireNonNull(baseDao, "baseDao");
   }
 
   public NamespaceDao getNamespaceDao() {

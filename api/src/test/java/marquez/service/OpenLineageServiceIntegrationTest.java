@@ -10,6 +10,7 @@ import static marquez.db.LineageTestUtils.SCHEMA_URL;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import io.dropwizard.util.Resources;
 import java.io.IOException;
@@ -158,6 +159,7 @@ public class OpenLineageServiceIntegrationTest {
     jobDao = jdbi.onDemand(JobDao.class);
     jobVersionDao = jdbi.onDemand(JobVersionDao.class);
     runService = mock(RunService.class);
+    when(runService.hasRunTransitionListeners()).thenReturn(true);
     jobService = new JobService(jobDao, runService);
     runInputListener = ArgumentCaptor.forClass(JobInputUpdate.class);
     doNothing().when(runService).notify(runInputListener.capture());
@@ -165,7 +167,7 @@ public class OpenLineageServiceIntegrationTest {
     doNothing().when(runService).notify(runOutputListener.capture());
     runTransitionListener = ArgumentCaptor.forClass(RunTransition.class);
     doNothing().when(runService).notify(runTransitionListener.capture());
-    lineageService = new OpenLineageService(openLineageDao, runService);
+    lineageService = new OpenLineageService(openLineageDao, runService, Runnable::run);
     datasetDao = jdbi.onDemand(DatasetDao.class);
 
     NamespaceRow namespace =

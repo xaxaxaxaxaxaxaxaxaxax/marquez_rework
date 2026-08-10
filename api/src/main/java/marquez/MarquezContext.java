@@ -11,6 +11,8 @@ import com.google.common.collect.Lists;
 import graphql.kickstart.servlet.GraphQLHttpServlet;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ForkJoinPool;
 import lombok.Getter;
 import lombok.NonNull;
 import marquez.api.ColumnLineageResource;
@@ -117,7 +119,8 @@ public final class MarquezContext {
       @NonNull final Jdbi jdbi,
       @NonNull final SearchConfig searchConfig,
       @NonNull final ImmutableSet<Tag> tags,
-      List<RunTransitionListener> runTransitionListeners) {
+      List<RunTransitionListener> runTransitionListeners,
+      @NonNull Executor openLineageExecutor) {
     if (runTransitionListeners == null) {
       runTransitionListeners = new ArrayList<>();
     }
@@ -152,10 +155,11 @@ public final class MarquezContext {
     this.jobService = new JobService(baseDao, runService);
     this.tagService = new TagService(baseDao);
     this.tagService.init(tags);
-    this.openLineageService = new OpenLineageService(baseDao, runService);
+    this.searchService = new SearchService(searchConfig);
+    this.openLineageService =
+        new OpenLineageService(baseDao, runService, searchService, openLineageExecutor);
     this.lineageService = new LineageService(lineageDao, jobDao, runDao);
     this.columnLineageService = new ColumnLineageService(columnLineageDao, datasetFieldDao);
-    this.searchService = new SearchService(searchConfig);
     this.statsService = new StatsService(statsDao);
     this.jdbiException = new JdbiExceptionExceptionMapper();
     this.jsonException = new JsonProcessingExceptionMapper();
@@ -215,10 +219,12 @@ public final class MarquezContext {
     private SearchConfig searchConfig;
     private ImmutableSet<Tag> tags;
     private List<RunTransitionListener> runTransitionListeners;
+    private Executor openLineageExecutor;
 
     Builder() {
       this.tags = ImmutableSet.of();
       this.runTransitionListeners = new ArrayList<>();
+      this.openLineageExecutor = ForkJoinPool.commonPool();
     }
 
     public Builder jdbi(@NonNull Jdbi jdbi) {
@@ -246,8 +252,14 @@ public final class MarquezContext {
       return this;
     }
 
+    public Builder openLineageExecutor(@NonNull Executor openLineageExecutor) {
+      this.openLineageExecutor = openLineageExecutor;
+      return this;
+    }
+
     public MarquezContext build() {
-      return new MarquezContext(jdbi, searchConfig, tags, runTransitionListeners);
+      return new MarquezContext(
+          jdbi, searchConfig, tags, runTransitionListeners, openLineageExecutor);
     }
   }
 }

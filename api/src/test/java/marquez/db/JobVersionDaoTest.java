@@ -12,14 +12,23 @@ import static marquez.common.models.CommonModelGenerator.newJobType;
 import static marquez.common.models.CommonModelGenerator.newLocation;
 import static marquez.common.models.CommonModelGenerator.newVersion;
 import static marquez.db.JobVersionDao.BagOfJobVersionInfo;
+import static marquez.db.JobVersionDao.IoType.INPUT;
+import static marquez.db.JobVersionDao.IoType.OUTPUT;
 import static marquez.db.models.DbModelGenerator.newRowUuid;
 import static marquez.service.models.ServiceModelGenerator.newInputsWith;
 import static marquez.service.models.ServiceModelGenerator.newJobMetaWith;
 import static marquez.service.models.ServiceModelGenerator.newOutputsWith;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.google.common.collect.ImmutableSet;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -38,6 +47,7 @@ import marquez.db.models.JobRow;
 import marquez.db.models.ModelDaos;
 import marquez.db.models.NamespaceRow;
 import marquez.db.models.RunArgsRow;
+import marquez.db.models.RunIoSnapshot;
 import marquez.db.models.RunRow;
 import marquez.db.models.UpdateLineageRow.DatasetRecord;
 import marquez.jdbi.MarquezJdbiExternalPostgresExtension;
@@ -49,6 +59,7 @@ import org.jdbi.v3.core.Jdbi;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 
 /** The test suite for {@link JobVersionDao}. */
 @org.junit.jupiter.api.Tag("IntegrationTests")
@@ -83,11 +94,204 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
     when(modelDaos.getDatasetSymlinkDao()).thenReturn(jdbi.onDemand(DatasetSymlinkDao.class));
     when(modelDaos.getDatasetDao()).thenReturn(jdbi.onDemand(DatasetDao.class));
     when(modelDaos.getDatasetVersionDao()).thenReturn(jdbi.onDemand(DatasetVersionDao.class));
+    when(modelDaos.getDatasetSchemaVersionDao())
+        .thenReturn(jdbi.onDemand(DatasetSchemaVersionDao.class));
     when(modelDaos.getDatasetFieldDao()).thenReturn(jdbi.onDemand(DatasetFieldDao.class));
 
     // Each tests requires both a namespace and job row.
     namespaceRow = DbTestUtils.newNamespace(jdbiForTesting);
     jobRow = DbTestUtils.newJob(jdbiForTesting, namespaceRow.getName(), newJobName().getValue());
+  }
+
+  @Test
+  public void testPluralDatasetUpsertMarksPreviousOnceAndDeduplicates() {
+    JobVersionDao batchingDao = mock(JobVersionDao.class, CALLS_REAL_METHODS);
+    UUID jobVersionUuid = UUID.randomUUID();
+    UUID jobUuid = UUID.randomUUID();
+    UUID symlinkTargetJobUuid = UUID.randomUUID();
+    UUID firstDatasetUuid = UUID.randomUUID();
+    UUID secondDatasetUuid = UUID.randomUUID();
+    UUID outputDatasetUuid = UUID.randomUUID();
+
+    batchingDao.upsertInputDatasetsFor(
+        jobVersionUuid,
+        List.of(firstDatasetUuid, secondDatasetUuid, firstDatasetUuid),
+        jobUuid,
+        symlinkTargetJobUuid);
+
+    verify(batchingDao).markInputOrOutputDatasetAsPreviousFor(jobVersionUuid, jobUuid, INPUT);
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    ArgumentCaptor<Iterable<UUID>> datasetUuids = ArgumentCaptor.forClass(Iterable.class);
+    verify(batchingDao)
+        .upsertCurrentInputOrOutputDatasetsFor(
+            eq(jobVersionUuid),
+            datasetUuids.capture(),
+            eq(jobUuid),
+            eq(symlinkTargetJobUuid),
+            eq(INPUT));
+    assertThat(datasetUuids.getValue())
+        .containsExactlyInAnyOrder(firstDatasetUuid, secondDatasetUuid);
+
+    batchingDao.upsertOutputDatasetsFor(
+        jobVersionUuid, List.of(outputDatasetUuid), jobUuid, symlinkTargetJobUuid);
+    verify(batchingDao).markInputOrOutputDatasetAsPreviousFor(jobVersionUuid, jobUuid, OUTPUT);
+    verify(batchingDao)
+        .upsertCurrentInputOrOutputDatasetsFor(
+            eq(jobVersionUuid),
+            eq(ImmutableSet.of(outputDatasetUuid)),
+            eq(jobUuid),
+            eq(symlinkTargetJobUuid),
+            eq(OUTPUT));
+  }
+
+  @Test
+  public void testPluralDatasetUpsertDoesNothingForEmptyLists() {
+    JobVersionDao batchingDao = mock(JobVersionDao.class, CALLS_REAL_METHODS);
+    UUID jobVersionUuid = UUID.randomUUID();
+    UUID jobUuid = UUID.randomUUID();
+    UUID symlinkTargetJobUuid = UUID.randomUUID();
+
+    batchingDao.upsertInputDatasetsFor(jobVersionUuid, List.of(), jobUuid, symlinkTargetJobUuid);
+    batchingDao.upsertOutputDatasetsFor(jobVersionUuid, List.of(), jobUuid, symlinkTargetJobUuid);
+
+    verify(batchingDao, never())
+        .markInputOrOutputDatasetAsPreviousFor(
+            any(UUID.class), any(UUID.class), any(JobVersionDao.IoType.class));
+    verify(batchingDao, never())
+        .upsertCurrentInputOrOutputDatasetsFor(
+            any(UUID.class),
+            any(),
+            any(UUID.class),
+            any(UUID.class),
+            any(JobVersionDao.IoType.class));
+  }
+
+  @Test
+  public void testPluralDatasetUpsertRollsBackInvalidationWhenBatchFails() {
+    final JobMeta jobMeta =
+        new JobMeta(
+            newJobType(),
+            newInputsWith(NamespaceName.of(namespaceRow.getName()), 1),
+            newOutputsWith(NamespaceName.of(namespaceRow.getName()), 0),
+            newLocation(),
+            newDescription(),
+            null,
+            null);
+    final JobRow transactionJob =
+        DbTestUtils.newJobWith(
+            jdbiForTesting, namespaceRow.getName(), newJobName().getValue(), jobMeta);
+    DatasetId inputDatasetId = jobMeta.getInputs().stream().findFirst().orElseThrow();
+    UUID inputDatasetUuid =
+        datasetDao
+            .getUuid(inputDatasetId.getNamespace().getValue(), inputDatasetId.getName().getValue())
+            .orElseThrow()
+            .getUuid();
+
+    ExtendedJobVersionRow oldVersion =
+        DbTestUtils.newJobVersion(
+            jdbiForTesting,
+            transactionJob.getUuid(),
+            UUID.randomUUID(),
+            transactionJob.getName(),
+            namespaceRow.getUuid(),
+            namespaceRow.getName());
+    jobVersionDao.upsertInputDatasetsFor(
+        oldVersion.getUuid(),
+        List.of(inputDatasetUuid),
+        transactionJob.getUuid(),
+        transactionJob.getSymlinkTargetId());
+
+    ExtendedJobVersionRow newVersion =
+        DbTestUtils.newJobVersion(
+            jdbiForTesting,
+            transactionJob.getUuid(),
+            UUID.randomUUID(),
+            transactionJob.getName(),
+            namespaceRow.getUuid(),
+            namespaceRow.getName());
+
+    assertThatThrownBy(
+            () ->
+                jobVersionDao.upsertInputDatasetsFor(
+                    newVersion.getUuid(),
+                    List.of(inputDatasetUuid, UUID.randomUUID()),
+                    transactionJob.getUuid(),
+                    transactionJob.getSymlinkTargetId()))
+        .isInstanceOf(RuntimeException.class);
+
+    assertThat(countMappings(oldVersion.getUuid(), INPUT, true)).isEqualTo(1);
+    assertThat(countMappings(newVersion.getUuid(), INPUT, true)).isZero();
+  }
+
+  @Test
+  public void testTargetJobVersionMarksSymlinkMappingsPrevious() {
+    final JobRow targetJob =
+        DbTestUtils.createJobWithoutSymlinkTarget(
+            jdbiForTesting, namespaceRow, newJobName().getValue(), "the target of the symlink");
+    final JobMeta symlinkJobMeta =
+        new JobMeta(
+            newJobType(),
+            newInputsWith(NamespaceName.of(namespaceRow.getName()), 1),
+            newOutputsWith(NamespaceName.of(namespaceRow.getName()), 0),
+            newLocation(),
+            newDescription(),
+            null,
+            null);
+    String symlinkJobName = newJobName().getValue();
+    DbTestUtils.newJobWith(
+        jdbiForTesting,
+        namespaceRow.getName(),
+        symlinkJobName,
+        targetJob.getUuid(),
+        symlinkJobMeta);
+    UUID symlinkJobUuid =
+        jdbiForTesting.withHandle(
+            handle ->
+                handle
+                    .createQuery(
+                        """
+                        SELECT uuid
+                        FROM jobs
+                        WHERE namespace_name = :namespaceName AND name = :jobName
+                        """)
+                    .bind("namespaceName", namespaceRow.getName())
+                    .bind("jobName", symlinkJobName)
+                    .mapTo(UUID.class)
+                    .one());
+    DatasetId inputDatasetId = symlinkJobMeta.getInputs().stream().findFirst().orElseThrow();
+    UUID inputDatasetUuid =
+        datasetDao
+            .getUuid(inputDatasetId.getNamespace().getValue(), inputDatasetId.getName().getValue())
+            .orElseThrow()
+            .getUuid();
+
+    ExtendedJobVersionRow symlinkVersion =
+        DbTestUtils.newJobVersion(
+            jdbiForTesting,
+            symlinkJobUuid,
+            UUID.randomUUID(),
+            symlinkJobName,
+            namespaceRow.getUuid(),
+            namespaceRow.getName());
+    jobVersionDao.upsertInputDatasetsFor(
+        symlinkVersion.getUuid(), List.of(inputDatasetUuid), symlinkJobUuid, targetJob.getUuid());
+
+    ExtendedJobVersionRow targetVersion =
+        DbTestUtils.newJobVersion(
+            jdbiForTesting,
+            targetJob.getUuid(),
+            UUID.randomUUID(),
+            targetJob.getName(),
+            namespaceRow.getUuid(),
+            namespaceRow.getName());
+    jobVersionDao.upsertInputDatasetsFor(
+        targetVersion.getUuid(),
+        List.of(inputDatasetUuid),
+        targetJob.getUuid(),
+        targetJob.getSymlinkTargetId());
+
+    assertThat(countMappings(symlinkVersion.getUuid(), INPUT, false)).isEqualTo(1);
+    assertThat(countMappings(targetVersion.getUuid(), INPUT, true)).isEqualTo(1);
   }
 
   @Test
@@ -363,6 +567,98 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
         .get()
         .extracting(JobVersion::getInputs, InstanceOfAssertFactories.list(UUID.class))
         .isNotEmpty();
+    assertThat(jobVersion)
+        .isPresent()
+        .get()
+        .extracting(JobVersion::getOutputs, InstanceOfAssertFactories.list(DatasetId.class))
+        .isNotEmpty();
+  }
+
+  @Test
+  public void testRunIoSnapshotMatchesLegacyQueriesAndPreservesDirection() {
+    final JobMeta jobMeta = newJobMetaWith(NamespaceName.of(namespaceRow.getName()));
+    final JobRow snapshotJob =
+        DbTestUtils.newJobWith(
+            jdbiForTesting, namespaceRow.getName(), newJobName().getValue(), jobMeta);
+    final RunRow runRow = DbTestUtils.newRun(jdbiForTesting, snapshotJob);
+    DbTestUtils.transitionRunWithOutputs(
+        jdbiForTesting, runRow.getUuid(), RunState.COMPLETED, jobMeta.getOutputs());
+
+    List<ExtendedDatasetVersionRow> legacyInputs =
+        datasetVersionDao.findInputDatasetVersionsFor(runRow.getUuid());
+    List<ExtendedDatasetVersionRow> legacyOutputs =
+        datasetVersionDao.findOutputDatasetVersionsFor(runRow.getUuid());
+    RunIoSnapshot snapshot = jobVersionDao.findRunIoSnapshot(runRow.getUuid());
+
+    assertThat(snapshot.getInputs()).containsExactlyInAnyOrderElementsOf(legacyInputs);
+    assertThat(snapshot.getOutputs()).containsExactlyInAnyOrderElementsOf(legacyOutputs);
+
+    ExtendedDatasetVersionRow outputAlsoUsedAsInput = legacyOutputs.get(0);
+    runDao.updateInputMapping(runRow.getUuid(), outputAlsoUsedAsInput.getUuid());
+    RunIoSnapshot overlappingSnapshot = jobVersionDao.findRunIoSnapshot(runRow.getUuid());
+
+    assertThat(overlappingSnapshot.getInputs()).contains(outputAlsoUsedAsInput);
+    assertThat(overlappingSnapshot.getOutputs()).contains(outputAlsoUsedAsInput);
+    assertThatThrownBy(() -> overlappingSnapshot.getInputs().add(outputAlsoUsedAsInput))
+        .isInstanceOf(UnsupportedOperationException.class);
+  }
+
+  @Test
+  public void testRunIoSnapshotIsEmptyForRunWithoutDatasets() {
+    final JobMeta emptyJobMeta =
+        new JobMeta(
+            newJobType(),
+            ImmutableSet.of(),
+            ImmutableSet.of(),
+            newLocation(),
+            newDescription(),
+            null,
+            null);
+    final JobRow emptyJob =
+        DbTestUtils.newJobWith(
+            jdbiForTesting, namespaceRow.getName(), newJobName().getValue(), emptyJobMeta);
+    final RunRow emptyRun = DbTestUtils.newRun(jdbiForTesting, emptyJob);
+
+    RunIoSnapshot snapshot = jobVersionDao.findRunIoSnapshot(emptyRun.getUuid());
+
+    assertThat(snapshot.getInputs()).isEmpty();
+    assertThat(snapshot.getOutputs()).isEmpty();
+  }
+
+  @Test
+  public void testKnownNamespaceAndSnapshotLoaderDoesNotReadThemAgain() {
+    JobVersionDao intakeDao = mock(JobVersionDao.class, CALLS_REAL_METHODS);
+    UUID runUuid = UUID.randomUUID();
+    RunIoSnapshot snapshot = RunIoSnapshot.empty();
+
+    JobVersionDao.JobRowRunDetails details =
+        intakeDao.loadJobRowRunDetails(jobRow, namespaceRow, runUuid, snapshot);
+
+    assertThat(details.namespaceRow()).isSameAs(namespaceRow);
+    assertThat(details.jobVersionInputs()).isSameAs(snapshot.getInputs());
+    assertThat(details.jobVersionOutputs()).isSameAs(snapshot.getOutputs());
+    verify(intakeDao, never()).createNamespaceDao();
+    verify(intakeDao, never()).findRunIoRows(any(UUID.class));
+  }
+
+  @Test
+  public void testLegacyLoaderUsesOneCombinedRunIoRead() {
+    JobVersionDao legacyDao = mock(JobVersionDao.class, CALLS_REAL_METHODS);
+    NamespaceDao namespaceDao = mock(NamespaceDao.class);
+    UUID runUuid = UUID.randomUUID();
+    when(legacyDao.createNamespaceDao()).thenReturn(namespaceDao);
+    when(namespaceDao.findNamespaceByName(jobRow.getNamespaceName()))
+        .thenReturn(Optional.of(namespaceRow));
+    when(legacyDao.findRunIoRows(runUuid)).thenReturn(List.of());
+
+    JobVersionDao.JobRowRunDetails details = legacyDao.loadJobRowRunDetails(jobRow, runUuid);
+
+    assertThat(details.jobVersionInputs()).isEmpty();
+    assertThat(details.jobVersionOutputs()).isEmpty();
+    verify(legacyDao).createNamespaceDao();
+    verify(namespaceDao).findNamespaceByName(jobRow.getNamespaceName());
+    verify(legacyDao).findRunIoRows(runUuid);
+    verify(legacyDao, never()).createDatasetVersionDao();
   }
 
   @Test
@@ -391,10 +687,10 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
               true));
     }
 
-    // RunInput list uses null as a sentinel value
+    // Attach output datasets.
     List<DatasetRecord> datasetOutputs = new ArrayList<>();
     for (DatasetId di : jobMeta.getOutputs()) {
-      datasetInputs.add(
+      datasetOutputs.add(
           openLineageDao.upsertLineageDataset(
               modelDaos,
               LineageEvent.Dataset.builder()
@@ -403,12 +699,12 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
                   .build(),
               jobRow.getCreatedAt(),
               null,
-              true));
+              false));
     }
 
     // (2) Upsert runless job version
     final BagOfJobVersionInfo bagOfJobVersionInfo =
-        jobVersionDao.upsertRunlessJobVersion(jobRow, datasetInputs, datasetOutputs);
+        jobVersionDao.upsertRunlessJobVersion(jobRow, namespaceRow, datasetInputs, datasetOutputs);
 
     // Ensure the latest version is associated with the job.
     final JobRow jobRowForLatestRun =
@@ -443,6 +739,11 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
         .isPresent()
         .get()
         .extracting(JobVersion::getInputs, InstanceOfAssertFactories.list(UUID.class))
+        .isNotEmpty();
+    assertThat(jobVersion)
+        .isPresent()
+        .get()
+        .extracting(JobVersion::getOutputs, InstanceOfAssertFactories.list(DatasetId.class))
         .isNotEmpty();
   }
 
@@ -564,5 +865,24 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
                             .one())
                 .intValue())
         .isEqualTo(2);
+  }
+
+  private int countMappings(UUID jobVersionUuid, JobVersionDao.IoType ioType, boolean current) {
+    return jdbiForTesting.withHandle(
+        handle ->
+            handle
+                .createQuery(
+                    """
+                    SELECT count(*)
+                    FROM job_versions_io_mapping
+                    WHERE job_version_uuid = :jobVersionUuid
+                      AND io_type = :ioType
+                      AND is_current_job_version = :current
+                    """)
+                .bind("jobVersionUuid", jobVersionUuid)
+                .bind("ioType", ioType.name())
+                .bind("current", current)
+                .mapTo(Integer.class)
+                .one());
   }
 }

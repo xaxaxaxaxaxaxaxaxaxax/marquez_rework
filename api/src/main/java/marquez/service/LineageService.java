@@ -7,24 +7,19 @@ package marquez.service;
 
 import static java.util.stream.Collectors.groupingBy;
 import static java.util.stream.Collectors.toList;
+import static java.util.stream.Collectors.toMap;
 
-import com.google.common.base.Functions;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ImmutableSortedSet;
 import com.google.common.collect.Maps;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
 import javax.validation.constraints.NotNull;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
@@ -42,7 +37,6 @@ import marquez.service.DelegatingDaos.DelegatingLineageDao;
 import marquez.service.LineageService.UpstreamRunLineage;
 import marquez.service.models.DatasetData;
 import marquez.service.models.Edge;
-import marquez.service.models.Graph;
 import marquez.service.models.JobData;
 import marquez.service.models.Lineage;
 import marquez.service.models.Node;
@@ -56,6 +50,8 @@ public class LineageService extends DelegatingLineageDao {
   public record UpstreamRunLineage(List<UpstreamRun> runs) {}
 
   public record UpstreamRun(JobSummary job, RunSummary run, List<DatasetSummary> inputs) {}
+
+  private record DatasetNode(DatasetData data, NodeId id) {}
 
   private final JobDao jobDao;
 
@@ -79,10 +75,9 @@ public class LineageService extends DelegatingLineageDao {
     }
     UUID job = optionalUUID.get();
     log.debug("Attempting to get lineage for job '{}'", job);
-    Set<JobData> jobData = getLineage(Collections.singleton(job), depth);
+    Set<JobData> jobData = getLineage(Set.of(job), depth);
 
-    // Ensure job data is not empty, an empty set cannot be passed to LineageDao.getCurrentRuns() or
-    // LineageDao.getCurrentRunsWithFacets().
+    // Ensure job data is not empty before attempting to load related run and dataset data.
     if (jobData.isEmpty()) {
       // Log warning, then return an orphan lineage graph; a graph should contain at most one
       // job->dataset relationship.
@@ -93,171 +88,132 @@ public class LineageService extends DelegatingLineageDao {
       return toLineageWithOrphanDataset(nodeId.asDatasetId());
     }
 
-    for (JobData j : jobData) {
-      Optional<Run> run = runDao.findRunByUuid(j.getCurrentRunUuid());
-      run.ifPresent(j::setLatestRun);
+    Set<UUID> currentRunUuids = new HashSet<>();
+    Set<UUID> datasetIds = new HashSet<>();
+    for (JobData currentJob : jobData) {
+      UUID currentRunUuid = currentJob.getCurrentRunUuid();
+      if (currentRunUuid != null) {
+        currentRunUuids.add(currentRunUuid);
+      }
+      datasetIds.addAll(currentJob.getInputUuids());
+      datasetIds.addAll(currentJob.getOutputUuids());
     }
 
-    Set<UUID> datasetIds =
-        jobData.stream()
-            .flatMap(jd -> Stream.concat(jd.getInputUuids().stream(), jd.getOutputUuids().stream()))
-            .collect(Collectors.toSet());
-    Set<DatasetData> datasets = new HashSet<>();
-    if (!datasetIds.isEmpty()) {
-      datasets.addAll(this.getDatasetData(datasetIds));
+    if (!currentRunUuids.isEmpty()) {
+      Map<UUID, Run> currentRunsById =
+          Maps.uniqueIndex(runDao.findRunsByUuids(currentRunUuids), run -> run.getId().getValue());
+      for (JobData currentJob : jobData) {
+        Run currentRun = currentRunsById.get(currentJob.getCurrentRunUuid());
+        if (currentRun != null) {
+          currentJob.setLatestRun(currentRun);
+        }
+      }
     }
+
+    Set<DatasetData> datasets = datasetIds.isEmpty() ? Set.of() : this.getDatasetData(datasetIds);
 
     if (nodeId.isDatasetType()) {
       DatasetId datasetId = nodeId.asDatasetId();
       DatasetData datasetData =
-          this.getDatasetData(datasetId.getNamespace().getValue(), datasetId.getName().getValue());
+          datasets.stream()
+              .filter(dataset -> dataset.getId().equals(datasetId))
+              .findFirst()
+              .orElseGet(
+                  () ->
+                      this.getDatasetData(
+                          datasetId.getNamespace().getValue(), datasetId.getName().getValue()));
 
       if (!datasetIds.contains(datasetData.getUuid())) {
         log.warn(
             "Found jobs {} which no longer share lineage with dataset '{}' - discarding",
             jobData.stream().map(JobData::getId).toList(),
             nodeId.getValue());
-        return toLineageWithOrphanDataset(nodeId.asDatasetId());
+        return toLineageWithOrphanDataset(datasetData);
       }
     }
     return toLineage(jobData, datasets);
   }
 
   private Lineage toLineageWithOrphanDataset(@NonNull DatasetId datasetId) {
-    final DatasetData datasetData =
-        getDatasetData(datasetId.getNamespace().getValue(), datasetId.getName().getValue());
+    return toLineageWithOrphanDataset(
+        getDatasetData(datasetId.getNamespace().getValue(), datasetId.getName().getValue()));
+  }
+
+  private Lineage toLineageWithOrphanDataset(@NonNull DatasetData datasetData) {
     return new Lineage(
         ImmutableSortedSet.of(
             Node.dataset().data(datasetData).id(NodeId.of(datasetData.getId())).build()));
   }
 
   private Lineage toLineage(Set<JobData> jobData, Set<DatasetData> datasets) {
-    Set<Node> nodes = new LinkedHashSet<>();
-    // build mapping for later
-    Map<UUID, DatasetData> datasetById =
-        datasets.stream().collect(Collectors.toMap(DatasetData::getUuid, Functions.identity()));
+    ImmutableSortedSet.Builder<Node> nodes = ImmutableSortedSet.naturalOrder();
+    Map<UUID, DatasetNode> datasetById =
+        datasets.stream()
+            .collect(
+                toMap(
+                    DatasetData::getUuid,
+                    dataset -> new DatasetNode(dataset, NodeId.of(dataset.getId()))));
+    Map<UUID, ImmutableSortedSet.Builder<Edge>> datasetInEdges = new HashMap<>();
+    Map<UUID, ImmutableSortedSet.Builder<Edge>> datasetOutEdges = new HashMap<>();
 
-    Map<DatasetData, Set<UUID>> dsInputToJob = new HashMap<>();
-    Map<DatasetData, Set<UUID>> dsOutputToJob = new HashMap<>();
-    // build jobs
-    Map<UUID, JobData> jobDataMap = Maps.uniqueIndex(jobData, JobData::getUuid);
     for (JobData data : jobData) {
-      if (data == null) {
-        log.error("Could not find job node for {}", jobData);
-        continue;
+      NodeId jobNodeId = NodeId.of(data.getId());
+      ImmutableSet.Builder<DatasetId> inputs =
+          ImmutableSet.builderWithExpectedSize(data.getInputUuids().size());
+      ImmutableSet.Builder<DatasetId> outputs =
+          ImmutableSet.builderWithExpectedSize(data.getOutputUuids().size());
+      ImmutableSortedSet.Builder<Edge> jobInEdges = ImmutableSortedSet.naturalOrder();
+      ImmutableSortedSet.Builder<Edge> jobOutEdges = ImmutableSortedSet.naturalOrder();
+
+      for (UUID datasetUuid : data.getInputUuids()) {
+        DatasetNode dataset = datasetById.get(datasetUuid);
+        if (dataset == null) {
+          continue;
+        }
+
+        inputs.add(dataset.data().getId());
+        Edge edge = Edge.of(dataset.id(), jobNodeId);
+        jobInEdges.add(edge);
+        datasetOutEdges
+            .computeIfAbsent(datasetUuid, ignored -> ImmutableSortedSet.<Edge>naturalOrder())
+            .add(edge);
       }
 
-      Optional<JobData> parentJobData = getParentJobData(data.getParentJobUuid());
-      parentJobData.ifPresent(
-          parent -> {
-            log.debug(
-                "child: {}, parent: {} with UUID: {}",
-                parent.getId().getName(),
-                data.getParentJobName(),
-                data);
-          });
+      for (UUID datasetUuid : data.getOutputUuids()) {
+        DatasetNode dataset = datasetById.get(datasetUuid);
+        if (dataset == null) {
+          continue;
+        }
 
-      Set<DatasetData> inputs =
-          data.getInputUuids().stream()
-              .map(datasetById::get)
-              .filter(Objects::nonNull)
-              .collect(Collectors.toSet());
-      Set<DatasetData> outputs =
-          data.getOutputUuids().stream()
-              .map(datasetById::get)
-              .filter(Objects::nonNull)
-              .collect(Collectors.toSet());
-      data.setInputs(buildDatasetId(inputs));
-      data.setOutputs(buildDatasetId(outputs));
+        outputs.add(dataset.data().getId());
+        Edge edge = Edge.of(jobNodeId, dataset.id());
+        jobOutEdges.add(edge);
+        datasetInEdges
+            .computeIfAbsent(datasetUuid, ignored -> ImmutableSortedSet.<Edge>naturalOrder())
+            .add(edge);
+      }
 
-      inputs.forEach(
-          ds -> dsInputToJob.computeIfAbsent(ds, e -> new HashSet<>()).add(data.getUuid()));
-      outputs.forEach(
-          ds -> dsOutputToJob.computeIfAbsent(ds, e -> new HashSet<>()).add(data.getUuid()));
-
-      NodeId origin = NodeId.of(new JobId(data.getNamespace(), data.getName()));
-      Node node =
-          new Node(
-              origin,
-              NodeType.JOB,
-              data,
-              buildDatasetEdge(inputs, origin),
-              buildDatasetEdge(origin, outputs));
-      nodes.add(node);
+      data.setInputs(inputs.build());
+      data.setOutputs(outputs.build());
+      nodes.add(new Node(jobNodeId, NodeType.JOB, data, jobInEdges.build(), jobOutEdges.build()));
     }
 
-    for (DatasetData dataset : datasets) {
-      NodeId origin = NodeId.of(new DatasetId(dataset.getNamespace(), dataset.getName()));
-      Node node =
+    for (Map.Entry<UUID, DatasetNode> entry : datasetById.entrySet()) {
+      DatasetNode dataset = entry.getValue();
+      nodes.add(
           new Node(
-              origin,
+              dataset.id(),
               NodeType.DATASET,
-              dataset,
-              buildJobEdge(dsOutputToJob.get(dataset), origin, jobDataMap),
-              buildJobEdge(origin, dsInputToJob.get(dataset), jobDataMap));
-      nodes.add(node);
+              dataset.data(),
+              buildEdges(datasetInEdges.remove(entry.getKey())),
+              buildEdges(datasetOutEdges.remove(entry.getKey()))));
     }
 
-    return new Lineage(Lineage.withSortedNodes(Graph.directed().nodes(nodes).build()));
+    return new Lineage(nodes.build());
   }
 
-  private ImmutableSet<DatasetId> buildDatasetId(Set<DatasetData> datasetData) {
-    if (datasetData == null) {
-      return ImmutableSet.of();
-    }
-    return datasetData.stream()
-        .map(ds -> new DatasetId(ds.getNamespace(), ds.getName()))
-        .collect(ImmutableSet.toImmutableSet());
-  }
-
-  private ImmutableSet<Edge> buildJobEdge(
-      NodeId origin, Set<UUID> uuids, Map<UUID, JobData> jobDataMap) {
-    if (uuids == null) {
-      return ImmutableSet.of();
-    }
-    return uuids.stream()
-        .map(jobDataMap::get)
-        .filter(Objects::nonNull)
-        .map(j -> new Edge(origin, buildEdge(j)))
-        .collect(ImmutableSet.toImmutableSet());
-  }
-
-  private ImmutableSet<Edge> buildJobEdge(
-      Set<UUID> uuids, NodeId origin, Map<UUID, JobData> jobDataMap) {
-    if (uuids == null) {
-      return ImmutableSet.of();
-    }
-    return uuids.stream()
-        .map(jobDataMap::get)
-        .filter(Objects::nonNull)
-        .map(j -> new Edge(buildEdge(j), origin))
-        .collect(ImmutableSet.toImmutableSet());
-  }
-
-  private ImmutableSet<Edge> buildDatasetEdge(NodeId nodeId, Set<DatasetData> datasetData) {
-    if (datasetData == null) {
-      return ImmutableSet.of();
-    }
-    return datasetData.stream()
-        .map(ds -> new Edge(nodeId, buildEdge(ds)))
-        .collect(ImmutableSet.toImmutableSet());
-  }
-
-  private ImmutableSet<Edge> buildDatasetEdge(Set<DatasetData> datasetData, NodeId nodeId) {
-    if (datasetData == null) {
-      return ImmutableSet.of();
-    }
-    return datasetData.stream()
-        .map(ds -> new Edge(buildEdge(ds), nodeId))
-        .collect(ImmutableSet.toImmutableSet());
-  }
-
-  private NodeId buildEdge(DatasetData ds) {
-    return NodeId.of(new DatasetId(ds.getNamespace(), ds.getName()));
-  }
-
-  private NodeId buildEdge(JobData e) {
-    return NodeId.of(new JobId(e.getNamespace(), e.getName()));
+  private static ImmutableSortedSet<Edge> buildEdges(ImmutableSortedSet.Builder<Edge> edges) {
+    return edges == null ? ImmutableSortedSet.of() : edges.build();
   }
 
   public Optional<UUID> getJobUuid(NodeId nodeId) {

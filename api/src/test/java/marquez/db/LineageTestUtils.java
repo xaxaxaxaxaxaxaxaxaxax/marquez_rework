@@ -193,20 +193,6 @@ public class LineageTestUtils {
         jsonObject,
         event.getProducer());
 
-    if (status.equals("COMPLETE")) {
-      DatasetDao datasetDao = dao.createDatasetDao();
-      updateLineageRow
-          .getOutputs()
-          .ifPresent(
-              outs -> {
-                outs.forEach(
-                    out ->
-                        datasetDao.updateVersion(
-                            out.getDatasetRow().getUuid(),
-                            Instant.now(),
-                            out.getDatasetVersionRow().getUuid()));
-              });
-    }
     return updateLineageRow;
   }
 

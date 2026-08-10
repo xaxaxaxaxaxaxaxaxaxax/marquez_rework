@@ -11,6 +11,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.net.URL;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -44,6 +45,93 @@ import org.postgresql.util.PGobject;
 @RegisterRowMapper(JobDatasetMapper.class)
 @RegisterRowMapper(RunMapper.class)
 public interface JobDao extends BaseDao {
+
+  String FIND_ALL_SQL_PREFIX =
+      """
+        WITH jobs_view_page AS MATERIALIZED (
+          SELECT
+            j.*
+          FROM
+            jobs_view AS j
+          LEFT JOIN runs AS r
+            ON r.uuid = j.current_run_uuid
+          WHERE
+      """;
+
+  String FIND_ALL_GLOBAL_SCOPE = "            TRUE\n";
+
+  String FIND_ALL_NAMESPACE_SCOPE =
+      """
+            j.namespace_uuid = (
+              SELECT n.uuid
+              FROM namespaces AS n
+              WHERE n.name = :namespaceName
+            )
+      """;
+
+  String FIND_ALL_SQL_SUFFIX =
+      """
+          AND
+            (r.current_run_state IN (<lastRunStates>) OR r.uuid IS NULL)
+          ORDER BY
+            j.updated_at DESC,
+            j.uuid DESC
+          LIMIT :limit OFFSET :offset
+        ),
+        job_versions_temp AS (
+          SELECT
+            jv.uuid,
+            jv.latest_run_uuid
+          FROM
+            job_versions AS jv
+          INNER JOIN jobs_view_page AS j
+            ON j.current_version_uuid = jv.uuid
+        ),
+        facets_temp AS (
+          SELECT
+            jf.run_uuid,
+            JSON_AGG(jf.facet ORDER BY jf.lineage_event_time ASC) AS facets
+          FROM
+            job_facets_view AS jf
+          INNER JOIN job_versions_temp AS jv
+            ON jv.latest_run_uuid = jf.run_uuid
+          GROUP BY
+            jf.run_uuid
+        ),
+        job_tags AS (
+          SELECT
+            j.uuid,
+            ARRAY_AGG(t.name ORDER BY t.name) AS tags
+          FROM
+            jobs_view_page AS j
+          INNER JOIN jobs_tag_mapping AS jtm
+            ON jtm.job_uuid = j.uuid
+          INNER JOIN tags AS t
+            ON jtm.tag_uuid = t.uuid
+          GROUP BY
+            j.uuid
+        )
+        SELECT
+          j.*,
+          f.facets,
+          COALESCE(jt.tags, ARRAY[]::VARCHAR[]) AS tags
+        FROM
+          jobs_view_page AS j
+        LEFT OUTER JOIN job_versions_temp AS jv
+          ON jv.uuid = j.current_version_uuid
+        LEFT OUTER JOIN facets_temp AS f
+          ON f.run_uuid = jv.latest_run_uuid
+        LEFT OUTER JOIN job_tags AS jt
+          ON j.uuid = jt.uuid
+        ORDER BY
+          j.updated_at DESC,
+          j.uuid DESC
+      """;
+
+  String FIND_ALL_GLOBAL_SQL = FIND_ALL_SQL_PREFIX + FIND_ALL_GLOBAL_SCOPE + FIND_ALL_SQL_SUFFIX;
+
+  String FIND_ALL_NAMESPACE_SQL =
+      FIND_ALL_SQL_PREFIX + FIND_ALL_NAMESPACE_SCOPE + FIND_ALL_SQL_SUFFIX;
 
   @SqlQuery(
       """
@@ -170,88 +258,23 @@ public interface JobDao extends BaseDao {
       """)
   Optional<JobRow> findJobByNameAsRow(String namespaceName, String jobName);
 
-  @SqlQuery(
-      """
-        WITH jobs_view_page
-        AS (
-          SELECT
-            *
-          FROM
-            jobs_view AS j
-          WHERE
-            (:namespaceName IS NULL OR j.namespace_name = :namespaceName)
-        ),
-        job_versions_temp AS (
-          SELECT
-            *
-          FROM
-            job_versions AS j
-          WHERE
-            (:namespaceName IS NULL OR j.namespace_name = :namespaceName)
-        ),
-        facets_temp AS (
-        SELECT
-          run_uuid,
-            JSON_AGG(e.facet) AS facets
-        FROM (
-            SELECT
-              jf.run_uuid,
-                jf.facet
-            FROM
-              job_facets_view AS jf
-            INNER JOIN job_versions_temp jv2
-              ON jv2.latest_run_uuid = jf.run_uuid
-            INNER JOIN jobs_view_page j2
-              ON j2.current_version_uuid = jv2.uuid
-            ORDER BY
-              lineage_event_time ASC
-            ) e
-        GROUP BY e.run_uuid
-        ),
-        job_tags as (
-          SELECT
-              j.uuid
-          ,   ARRAY_AGG(t.name) as tags
-          FROM
-              jobs j
-          INNER JOIN
-              jobs_tag_mapping jtm
-          ON
-              jtm.job_uuid = j.uuid
-          AND
-              (:namespaceName IS NULL OR j.namespace_name = :namespaceName)
-          INNER JOIN
-              tags t
-          ON
-              jtm.tag_uuid = t.uuid
-          GROUP BY
-          j.uuid
-      )
-        SELECT
-          j.*,
-          f.facets,
-          COALESCE(jt.tags, ARRAY[]::VARCHAR[]) AS tags
-        FROM
-          jobs_view_page AS j
-        LEFT OUTER JOIN job_versions_temp AS jv
-          ON jv.uuid = j.current_version_uuid
-        LEFT OUTER JOIN facets_temp AS f
-          ON f.run_uuid = jv.latest_run_uuid
-        LEFT OUTER JOIN job_tags jt
-          ON j.uuid  = jt.uuid
-        LEFT JOIN runs r
-          ON r.uuid = j.current_run_uuid
-        WHERE
-         (r.current_run_state IN (<lastRunStates>) OR r.uuid IS NULL)
-        ORDER BY
-          j.updated_at DESC
-        LIMIT :limit OFFSET :offset
-      """)
-  List<Job> findAll(
+  @SqlQuery(FIND_ALL_GLOBAL_SQL)
+  List<Job> findAllGlobal(
+      @BindList("lastRunStates") List<RunState> lastRunStates, int limit, int offset);
+
+  @SqlQuery(FIND_ALL_NAMESPACE_SQL)
+  List<Job> findAllForNamespace(
       String namespaceName,
       @BindList("lastRunStates") List<RunState> lastRunStates,
       int limit,
       int offset);
+
+  default List<Job> findAll(
+      String namespaceName, List<RunState> lastRunStates, int limit, int offset) {
+    return namespaceName == null
+        ? findAllGlobal(lastRunStates, limit, offset)
+        : findAllForNamespace(namespaceName, lastRunStates, limit, offset);
+  }
 
   @SqlQuery("SELECT count(*) FROM jobs_view AS j WHERE symlink_target_uuid IS NULL")
   int count();
@@ -271,22 +294,43 @@ public interface JobDao extends BaseDao {
   int countJobRuns(String namespaceName, String job);
 
   @SqlQuery(
-      "SELECT count(*) FROM jobs_view AS j WHERE (:namespaceName IS NULL OR j.namespace_name = :namespaceName)\n"
-          + "AND symlink_target_uuid IS NULL")
-  int countFor(String namespaceName);
+      """
+      SELECT count(*)
+      FROM jobs_view AS j
+      WHERE j.namespace_uuid = (
+        SELECT n.uuid
+        FROM namespaces AS n
+        WHERE n.name = :namespaceName
+      )
+      AND j.symlink_target_uuid IS NULL
+      """)
+  int countForNamespace(String namespaceName);
+
+  default int countFor(String namespaceName) {
+    return namespaceName == null ? count() : countForNamespace(namespaceName);
+  }
 
   default List<Job> findAllWithRun(
       String namespaceName, List<RunState> lastRunStates, int limit, int offset) {
-    RunDao runDao = createRunDao();
-    return findAll(namespaceName, lastRunStates, limit, offset).stream()
-        .peek(
-            j -> {
-              List<Run> runs =
-                  runDao.findCurrentRunByJob(
-                      j.getNamespace().getValue(), j.getName().getValue(), 1, 0);
-              this.setJobData(runs, j);
-            })
-        .toList();
+    List<Job> jobs = findAll(namespaceName, lastRunStates, limit, offset);
+    Set<UUID> currentRunUuids =
+        jobs.stream()
+            .map(Job::getCurrentRunUuid)
+            .flatMap(Optional::stream)
+            .collect(Collectors.toSet());
+    if (currentRunUuids.isEmpty()) {
+      return jobs;
+    }
+
+    Map<UUID, Run> runsByUuid =
+        createRunDao().findRunsByUuids(currentRunUuids).stream()
+            .collect(Collectors.toMap(run -> run.getId().getValue(), run -> run));
+    jobs.forEach(
+        job ->
+            job.getCurrentRunUuid()
+                .map(runsByUuid::get)
+                .ifPresent(run -> setJobData(List.of(run), job)));
+    return jobs;
   }
 
   default void setJobDataset(List<JobDataset> datasets, Job j) {
@@ -319,22 +363,15 @@ public interface JobDao extends BaseDao {
     Run latestRun = runs.get(0);
     j.setLatestRun(latestRun);
     j.setLatestRuns(runs);
-    DatasetVersionDao datasetVersionDao = createDatasetVersionDao();
     j.setInputs(
-        datasetVersionDao.findInputDatasetVersionsFor(latestRun.getId().getValue()).stream()
-            .map(
-                ds ->
-                    new DatasetId(
-                        NamespaceName.of(ds.getNamespaceName()),
-                        DatasetName.of(ds.getDatasetName())))
+        latestRun.getInputDatasetVersions().stream()
+            .map(input -> input.getDatasetVersionId())
+            .map(version -> new DatasetId(version.getNamespace(), version.getName()))
             .collect(Collectors.toSet()));
     j.setOutputs(
-        datasetVersionDao.findOutputDatasetVersionsFor(latestRun.getId().getValue()).stream()
-            .map(
-                ds ->
-                    new DatasetId(
-                        NamespaceName.of(ds.getNamespaceName()),
-                        DatasetName.of(ds.getDatasetName())))
+        latestRun.getOutputDatasetVersions().stream()
+            .map(output -> output.getDatasetVersionId())
+            .map(version -> new DatasetId(version.getNamespace(), version.getName()))
             .collect(Collectors.toSet()));
   }
 

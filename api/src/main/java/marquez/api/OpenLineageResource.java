@@ -8,14 +8,13 @@ package marquez.api;
 import static javax.ws.rs.core.MediaType.APPLICATION_JSON;
 import static javax.ws.rs.core.Response.Status.BAD_REQUEST;
 import static javax.ws.rs.core.Response.Status.INTERNAL_SERVER_ERROR;
+import static javax.ws.rs.core.Response.Status.SERVICE_UNAVAILABLE;
 
 import com.codahale.metrics.annotation.ExceptionMetered;
 import com.codahale.metrics.annotation.ResponseMetered;
 import com.codahale.metrics.annotation.Timed;
 import com.fasterxml.jackson.annotation.JsonProperty;
-import com.fasterxml.jackson.core.JsonProcessingException;
 import io.dropwizard.jersey.jsr310.ZonedDateTimeParam;
-import java.sql.SQLException;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletionException;
@@ -38,6 +37,7 @@ import lombok.extern.slf4j.Slf4j;
 import marquez.api.models.SortDirection;
 import marquez.common.models.RunId;
 import marquez.db.OpenLineageDao;
+import marquez.service.IntakeOverloadedException;
 import marquez.service.ServiceFactory;
 import marquez.service.models.BaseEvent;
 import marquez.service.models.DatasetEvent;
@@ -49,6 +49,7 @@ import marquez.service.models.NodeId;
 @Path("/api/v1")
 public class OpenLineageResource extends BaseResource {
   private static final String DEFAULT_DEPTH = "20";
+  private static final int RETRY_AFTER_SECONDS = 1;
 
   private final OpenLineageDao openLineageDao;
 
@@ -65,12 +66,9 @@ public class OpenLineageResource extends BaseResource {
   @Consumes(APPLICATION_JSON)
   @Produces(APPLICATION_JSON)
   @Path("/lineage")
-  public void create(@Valid @NotNull BaseEvent event, @Suspended final AsyncResponse asyncResponse)
-      throws JsonProcessingException, SQLException {
+  public void create(
+      @Valid @NotNull BaseEvent event, @Suspended final AsyncResponse asyncResponse) {
     if (event instanceof LineageEvent) {
-      if (serviceFactory.getSearchService().isEnabled()) {
-        serviceFactory.getSearchService().indexEvent((LineageEvent) event);
-      }
       openLineageService
           .createAsync((LineageEvent) event)
           .whenComplete((result, err) -> onComplete(result, err, asyncResponse));
@@ -92,20 +90,35 @@ public class OpenLineageResource extends BaseResource {
 
   private void onComplete(Void result, Throwable err, AsyncResponse asyncResponse) {
     if (err != null) {
-      log.error("Unexpected error while processing request", err);
-      asyncResponse.resume(Response.status(determineStatusCode(err)).build());
+      Throwable failure = unwrap(err);
+      if (failure instanceof IntakeOverloadedException) {
+        log.warn("OpenLineage intake is at capacity");
+        asyncResponse.resume(
+            Response.status(SERVICE_UNAVAILABLE)
+                .header("Retry-After", RETRY_AFTER_SECONDS)
+                .build());
+      } else {
+        log.error("Unexpected error while processing request", failure);
+        asyncResponse.resume(Response.status(determineStatusCode(failure)).build());
+      }
     } else {
       asyncResponse.resume(Response.status(201).build());
     }
   }
 
   private int determineStatusCode(Throwable e) {
-    if (e instanceof CompletionException) {
-      return determineStatusCode(e.getCause());
-    } else if (e instanceof IllegalArgumentException) {
+    if (e instanceof IllegalArgumentException) {
       return BAD_REQUEST.getStatusCode();
     }
     return INTERNAL_SERVER_ERROR.getStatusCode();
+  }
+
+  private Throwable unwrap(Throwable error) {
+    Throwable unwrapped = error;
+    while (unwrapped instanceof CompletionException && unwrapped.getCause() != null) {
+      unwrapped = unwrapped.getCause();
+    }
+    return unwrapped;
   }
 
   @Timed

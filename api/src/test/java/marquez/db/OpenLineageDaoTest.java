@@ -58,6 +58,7 @@ class OpenLineageDaoTest {
   private static DatasetSymlinkDao symlinkDao;
   private static NamespaceDao namespaceDao;
   private static DatasetFieldDao datasetFieldDao;
+  private static ColumnLineageDao columnLineageDao;
   private static RunDao runDao;
   private final DatasetFacets datasetFacets =
       LineageTestUtils.newDatasetFacet(
@@ -69,6 +70,7 @@ class OpenLineageDaoTest {
     symlinkDao = jdbi.onDemand(DatasetSymlinkDao.class);
     namespaceDao = jdbi.onDemand(NamespaceDao.class);
     datasetFieldDao = jdbi.onDemand(DatasetFieldDao.class);
+    columnLineageDao = jdbi.onDemand(ColumnLineageDao.class);
     runDao = jdbi.onDemand(RunDao.class);
   }
 
@@ -99,6 +101,9 @@ class OpenLineageDaoTest {
     assertThat(readJob.getInputs()).isPresent().get().asList().size().isEqualTo(1);
     assertThat(readJob.getInputs().get().get(0).getDatasetVersionRow())
         .isEqualTo(writeJob.getOutputs().get().get(0).getDatasetVersionRow());
+    assertThat(writeJob.getRunIoSnapshot()).isNotNull();
+    assertThat(writeJob.getRunIoSnapshot().getInputs()).isEmpty();
+    assertThat(writeJob.getRunIoSnapshot().getOutputs()).hasSize(1);
 
     // ensure schema version has the right field associations
     UUID schemaVersionUuid =
@@ -221,19 +226,14 @@ class OpenLineageDaoTest {
     UUID inputDatasetVersion = writeJob.getInputs().get().get(0).getDatasetVersionRow().getUuid();
     UUID outputDatasetVersion = writeJob.getOutputs().get().get(0).getDatasetVersionRow().getUuid();
 
+    UUID outputDatasetField =
+        datasetFieldDao
+            .findUuid(writeJob.getOutputs().get().get(0).getDatasetRow().getUuid(), OUTPUT_COLUMN)
+            .orElseThrow();
+    assertThat(writeJob.getOutputs().get().get(0).getColumnLineageRows()).isEmpty();
     assertThat(
-            writeJob.getOutputs().get().stream().toList().stream()
-                .findAny()
-                .orElseThrow()
-                .getColumnLineageRows())
-        .size()
-        .isEqualTo(1);
-
-    assertThat(
-            writeJob.getOutputs().get().stream().toList().stream()
-                .findAny()
-                .orElseThrow()
-                .getColumnLineageRows())
+            columnLineageDao.findColumnLineageByDatasetVersionAndOutputDatasetFields(
+                outputDatasetVersion, List.of(outputDatasetField)))
         .extracting(
             (ds) -> ds.getInputDatasetFieldUuid(),
             (ds) -> ds.getInputDatasetVersionUuid(),
@@ -249,10 +249,7 @@ class OpenLineageDaoTest {
                         INPUT_FIELD_NAME)
                     .get(),
                 inputDatasetVersion,
-                datasetFieldDao
-                    .findUuid(
-                        writeJob.getOutputs().get().get(0).getDatasetRow().getUuid(), OUTPUT_COLUMN)
-                    .get(),
+                outputDatasetField,
                 outputDatasetVersion,
                 TRANSFORMATION_DESCRIPTION,
                 TRANSFORMATION_TYPE));
@@ -270,8 +267,15 @@ class OpenLineageDaoTest {
             Collections.emptyList(),
             Arrays.asList(getOutputDatasetWithColumnLineage()));
 
-    // make sure no column lineage was written
-    assertEquals(0, writeJob.getOutputs().get().get(0).getColumnLineageRows().size());
+    UUID outputDatasetVersion = writeJob.getOutputs().get().get(0).getDatasetVersionRow().getUuid();
+    UUID outputDatasetField =
+        datasetFieldDao
+            .findUuid(writeJob.getOutputs().get().get(0).getDatasetRow().getUuid(), OUTPUT_COLUMN)
+            .orElseThrow();
+    assertThat(
+            columnLineageDao.findColumnLineageByDatasetVersionAndOutputDatasetFields(
+                outputDatasetVersion, List.of(outputDatasetField)))
+        .isEmpty();
   }
 
   @Test
@@ -459,6 +463,9 @@ class OpenLineageDaoTest {
         .hasSize(1)
         .first()
         .matches(v -> v.getDatasetRow().getCurrentVersionUuid().isPresent());
+    assertThat(writeJob.getRunIoSnapshot()).isNotNull();
+    assertThat(writeJob.getRunIoSnapshot().getInputs()).hasSize(1);
+    assertThat(writeJob.getRunIoSnapshot().getOutputs()).isEmpty();
   }
 
   /**

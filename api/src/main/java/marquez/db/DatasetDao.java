@@ -11,10 +11,13 @@ import static org.jdbi.v3.sqlobject.customizer.BindList.EmptyHandling.NULL_STRIN
 import com.google.common.collect.ImmutableList;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import lombok.NonNull;
 import lombok.Value;
 import marquez.common.models.DatasetName;
 import marquez.common.models.DatasetType;
@@ -33,6 +36,7 @@ import marquez.service.models.Dataset;
 import marquez.service.models.DatasetMeta;
 import org.jdbi.v3.sqlobject.config.RegisterRowMapper;
 import org.jdbi.v3.sqlobject.customizer.BindBean;
+import org.jdbi.v3.sqlobject.customizer.BindBeanList;
 import org.jdbi.v3.sqlobject.customizer.BindList;
 import org.jdbi.v3.sqlobject.statement.SqlBatch;
 import org.jdbi.v3.sqlobject.statement.SqlQuery;
@@ -42,6 +46,8 @@ import org.jdbi.v3.sqlobject.transaction.Transaction;
 @RegisterRowMapper(DatasetRowMapper.class)
 @RegisterRowMapper(DatasetMapper.class)
 public interface DatasetDao extends BaseDao {
+  int MAX_DATASET_CURRENT_VERSION_UPDATES = 1000;
+
   @SqlQuery(
       "SELECT EXISTS ("
           + "SELECT 1 FROM datasets_view AS d "
@@ -68,6 +74,46 @@ public interface DatasetDao extends BaseDao {
           + "    current_version_uuid = :currentVersionUuid "
           + "WHERE uuid = :rowUuid")
   void updateVersion(UUID rowUuid, Instant updatedAt, UUID currentVersionUuid);
+
+  @Transaction
+  default int updateVersions(List<DatasetCurrentVersionUpdate> updates) {
+    if (updates.isEmpty()) {
+      return 0;
+    }
+
+    // A projection can encounter the same dataset more than once. Preserve the singleton path's
+    // encounter semantics while issuing each physical row update only once.
+    Map<UUID, DatasetCurrentVersionUpdate> lastUpdateByDataset = new LinkedHashMap<>();
+    for (DatasetCurrentVersionUpdate update : List.copyOf(updates)) {
+      lastUpdateByDataset.put(update.getRowUuid(), update);
+    }
+
+    List<DatasetCurrentVersionUpdate> writes = new ArrayList<>(lastUpdateByDataset.values());
+    writes.sort((left, right) -> left.getRowUuid().compareTo(right.getRowUuid()));
+
+    int updated = 0;
+    for (int start = 0; start < writes.size(); start += MAX_DATASET_CURRENT_VERSION_UPDATES) {
+      updated +=
+          updateVersionsChunk(
+              writes.subList(
+                  start, Math.min(start + MAX_DATASET_CURRENT_VERSION_UPDATES, writes.size())));
+    }
+    return updated;
+  }
+
+  @SqlUpdate(
+      """
+          UPDATE datasets AS d
+          SET updated_at = CAST(v.updated_at AS timestamptz),
+              current_version_uuid = CAST(v.current_version_uuid AS uuid)
+          FROM (VALUES <values>) AS v(row_uuid, updated_at, current_version_uuid)
+          WHERE d.uuid = CAST(v.row_uuid AS uuid)
+          """)
+  int updateVersionsChunk(
+      @BindBeanList(
+              value = "values",
+              propertyNames = {"rowUuid", "updatedAt", "currentVersionUuid"})
+          List<DatasetCurrentVersionUpdate> updates);
 
   @SqlQuery(
       """
@@ -422,5 +468,12 @@ public interface DatasetDao extends BaseDao {
     UUID rowUuid;
     UUID tagUuid;
     Instant taggedAt;
+  }
+
+  @Value
+  class DatasetCurrentVersionUpdate {
+    @NonNull UUID rowUuid;
+    @NonNull Instant updatedAt;
+    @NonNull UUID currentVersionUuid;
   }
 }

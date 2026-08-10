@@ -5,6 +5,7 @@
 
 package marquez.service.models;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
@@ -49,6 +50,7 @@ public final class Job {
   @Nullable private UUID currentVersion;
   @Getter @Nullable private ImmutableList<String> labels;
   @Getter @Nullable private final ImmutableSet<TagName> tags;
+  @EqualsAndHashCode.Exclude @ToString.Exclude @Nullable private UUID currentRunUuid;
 
   public Job(
       @NonNull final JobId id,
@@ -108,5 +110,18 @@ public final class Job {
 
   public Optional<UUID> getCurrentVersion() {
     return Optional.ofNullable(currentVersion);
+  }
+
+  /**
+   * Internal database projection used to resolve the current run without exposing it in the API.
+   */
+  @JsonIgnore
+  public Optional<UUID> getCurrentRunUuid() {
+    return Optional.ofNullable(currentRunUuid);
+  }
+
+  @JsonIgnore
+  public void setCurrentRunUuid(@Nullable UUID currentRunUuid) {
+    this.currentRunUuid = currentRunUuid;
   }
 }

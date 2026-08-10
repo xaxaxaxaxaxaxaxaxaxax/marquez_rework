@@ -9,6 +9,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -28,8 +29,11 @@ import org.opensearch.client.json.jackson.JacksonJsonpMapper;
 import org.opensearch.client.opensearch.OpenSearchClient;
 import org.opensearch.client.opensearch._types.query_dsl.Operator;
 import org.opensearch.client.opensearch._types.query_dsl.TextQueryType;
-import org.opensearch.client.opensearch.core.IndexRequest;
+import org.opensearch.client.opensearch.core.BulkRequest;
+import org.opensearch.client.opensearch.core.BulkResponse;
 import org.opensearch.client.opensearch.core.SearchResponse;
+import org.opensearch.client.opensearch.core.bulk.BulkOperation;
+import org.opensearch.client.opensearch.core.bulk.BulkResponseItem;
 import org.opensearch.client.opensearch.core.search.BuiltinHighlighterType;
 import org.opensearch.client.opensearch.core.search.HighlighterType;
 import org.opensearch.client.transport.OpenSearchTransport;
@@ -100,6 +104,11 @@ public class SearchService {
     }
   }
 
+  SearchService(SearchConfig searchConfig, OpenSearchClient openSearchClient) {
+    this.searchConfig = searchConfig;
+    this.openSearchClient = openSearchClient;
+  }
+
   public OpenSearchClient getClient() {
     return this.openSearchClient;
   }
@@ -165,15 +174,28 @@ public class SearchService {
       return;
     }
     UUID runUuid = runUuidFromEvent(event.getRun());
-    log.debug("Indexing event {}", event);
+    log.debug("Indexing event for run {}", runUuid);
 
+    int operationCount = 1;
     if (event.getInputs() != null) {
-      indexDatasets(event.getInputs(), runUuid, event);
+      operationCount += event.getInputs().size();
     }
     if (event.getOutputs() != null) {
-      indexDatasets(event.getOutputs(), runUuid, event);
+      operationCount += event.getOutputs().size();
     }
-    indexJob(runUuid, event);
+
+    List<BulkOperation> operations = new ArrayList<>(operationCount);
+    addDatasetOperations(operations, event.getInputs(), runUuid, event);
+    addDatasetOperations(operations, event.getOutputs(), runUuid, event);
+    operations.add(buildJobIndexOperation(runUuid, event));
+
+    try {
+      BulkResponse response = openSearchClient.bulk(BulkRequest.of(b -> b.operations(operations)));
+      throwIfBulkFailed(response);
+    } catch (IOException e) {
+      // Search is a best-effort side effect. Preserve intake when its transport is unavailable.
+      log.error("Failed to index event; OpenSearch is not available.", e);
+    }
   }
 
   private UUID runUuidFromEvent(LineageEvent.Run run) {
@@ -212,40 +234,60 @@ public class SearchService {
     return jsonMap;
   }
 
-  private void indexJob(UUID runUuid, LineageEvent event) {
-    index(
-        IndexRequest.of(
-            i ->
-                i.index("jobs")
-                    .id(
-                        String.format(
-                            "JOB:%s:%s", event.getJob().getNamespace(), event.getJob().getName()))
-                    .document(buildJobIndexRequest(runUuid, event))));
+  private BulkOperation buildJobIndexOperation(UUID runUuid, LineageEvent event) {
+    return BulkOperation.of(
+        operation ->
+            operation.index(
+                index ->
+                    index
+                        .index("jobs")
+                        .id(
+                            String.format(
+                                "JOB:%s:%s",
+                                event.getJob().getNamespace(), event.getJob().getName()))
+                        .document(buildJobIndexRequest(runUuid, event))));
   }
 
-  private void indexDatasets(
-      List<LineageEvent.Dataset> datasets, UUID runUuid, LineageEvent event) {
-    datasets.stream()
-        .map(dataset -> buildDatasetIndexRequest(runUuid, dataset, event))
-        .forEach(
-            jsonMap ->
-                index(
-                    IndexRequest.of(
-                        i ->
-                            i.index("datasets")
-                                .id(
-                                    String.format(
-                                        "DATASET:%s:%s",
-                                        jsonMap.get("namespace"), jsonMap.get("name")))
-                                .document(jsonMap))));
-  }
-
-  private void index(IndexRequest<Map<String, Object>> request) {
-    try {
-      this.openSearchClient.index(request);
-    } catch (IOException e) {
-      log.error("Failed to index event OpenSearch not available.", e);
+  private void addDatasetOperations(
+      List<BulkOperation> operations,
+      List<LineageEvent.Dataset> datasets,
+      UUID runUuid,
+      LineageEvent event) {
+    if (datasets == null) {
+      return;
     }
+    for (LineageEvent.Dataset dataset : datasets) {
+      Map<String, Object> document = buildDatasetIndexRequest(runUuid, dataset, event);
+      operations.add(
+          BulkOperation.of(
+              operation ->
+                  operation.index(
+                      index ->
+                          index
+                              .index("datasets")
+                              .id(
+                                  String.format(
+                                      "DATASET:%s:%s", dataset.getNamespace(), dataset.getName()))
+                              .document(document))));
+    }
+  }
+
+  private void throwIfBulkFailed(BulkResponse response) {
+    if (!response.errors()) {
+      return;
+    }
+
+    String failure =
+        response.items().stream()
+            .filter(item -> item.error() != null)
+            .findFirst()
+            .map(this::describeFailure)
+            .orElse("unknown bulk item");
+    throw new IllegalStateException("OpenSearch bulk indexing failed for " + failure);
+  }
+
+  private String describeFailure(BulkResponseItem item) {
+    return String.format("%s/%s: %s", item.index(), item.id(), item.error().reason());
   }
 
   public boolean isEnabled() {

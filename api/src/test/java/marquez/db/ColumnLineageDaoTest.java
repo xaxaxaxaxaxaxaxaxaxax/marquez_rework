@@ -13,17 +13,29 @@ import static marquez.db.LineageTestUtils.PRODUCER_URL;
 import static marquez.db.LineageTestUtils.SCHEMA_URL;
 import static marquez.db.OpenLineageDao.DEFAULT_NAMESPACE_OWNER;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.Mockito.CALLS_REAL_METHODS;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import marquez.common.models.DatasetType;
+import marquez.db.ColumnLineageDao.ColumnLineageDatasetWrite;
+import marquez.db.ColumnLineageDao.ColumnLineageWrite;
 import marquez.db.models.ColumnLineageNodeData;
 import marquez.db.models.ColumnLineageRow;
 import marquez.db.models.DatasetRow;
@@ -37,11 +49,13 @@ import marquez.service.models.LineageEvent;
 import marquez.service.models.LineageEvent.Dataset;
 import org.apache.commons.lang3.tuple.Pair;
 import org.jdbi.v3.core.Jdbi;
+import org.jdbi.v3.core.statement.PreparedBatch;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 
 @ExtendWith(MarquezJdbiExternalPostgresExtension.class)
 public class ColumnLineageDaoTest {
@@ -233,6 +247,172 @@ public class ColumnLineageDaoTest {
     assertEquals(1, rows.size());
     assertEquals(
         now.plusSeconds(1000).getEpochSecond(), rows.get(0).getUpdatedAt().getEpochSecond());
+  }
+
+  @Test
+  void testBulkUpsertReadsBackExistingEdgesWithOriginalCreatedAt() {
+    UUID existingInputFieldUuid = UUID.randomUUID();
+    UUID newInputFieldUuid = UUID.randomUUID();
+    fieldDao.upsert(
+        existingInputFieldUuid, now, "existing", "string", "desc", inputDatasetRow.getUuid());
+    fieldDao.upsert(newInputFieldUuid, now, "new", "string", "desc", inputDatasetRow.getUuid());
+
+    dao.upsertColumnLineageRow(
+        outputDatasetVersionRow.getUuid(),
+        outputDatasetFieldUuid,
+        Collections.singletonList(
+            Pair.of(inputDatasetVersionRow.getUuid(), existingInputFieldUuid)),
+        transformationDescription,
+        transformationType,
+        now);
+
+    List<ColumnLineageRow> rows =
+        dao.upsertColumnLineageRows(
+            outputDatasetVersionRow.getUuid(),
+            Collections.singletonList(
+                new ColumnLineageWrite(
+                    outputDatasetFieldUuid,
+                    Collections.singletonList(
+                        Pair.of(inputDatasetVersionRow.getUuid(), newInputFieldUuid)),
+                    "new-description",
+                    "new-type")),
+            now.plusSeconds(1000));
+
+    assertThat(rows)
+        .extracting(ColumnLineageRow::getInputDatasetFieldUuid)
+        .containsExactlyInAnyOrder(existingInputFieldUuid, newInputFieldUuid);
+    ColumnLineageRow existingRow =
+        rows.stream()
+            .filter(row -> row.getInputDatasetFieldUuid().equals(existingInputFieldUuid))
+            .findFirst()
+            .orElseThrow();
+    assertThat(existingRow.getCreatedAt().getEpochSecond()).isEqualTo(now.getEpochSecond());
+  }
+
+  @Test
+  @SuppressWarnings({"rawtypes", "unchecked"})
+  void testIntakeUpsertSkipsReadbackAndDeduplicatesPhysicalEdges() {
+    ColumnLineageDao intakeDao = mock(ColumnLineageDao.class, CALLS_REAL_METHODS);
+    UUID outputDatasetVersionUuid = UUID.randomUUID();
+    UUID outputDatasetFieldUuid = UUID.randomUUID();
+    Pair<UUID, UUID> input = Pair.of(UUID.randomUUID(), UUID.randomUUID());
+
+    intakeDao.upsertColumnLineageRowsForIntake(
+        List.of(
+            new ColumnLineageDatasetWrite(
+                outputDatasetVersionUuid,
+                List.of(
+                    new ColumnLineageWrite(
+                        outputDatasetFieldUuid, List.of(input), "first-description", "first-type"),
+                    new ColumnLineageWrite(
+                        outputDatasetFieldUuid, List.of(input), "last-description", "last-type")))),
+        now);
+
+    ArgumentCaptor<List<ColumnLineageRow>> rows = ArgumentCaptor.forClass(List.class);
+    verify(intakeDao).doUpsertColumnLineageRow(rows.capture());
+    assertThat(rows.getValue()).hasSize(1);
+    assertThat(rows.getValue().get(0).getTransformationDescription()).contains("last-description");
+    assertThat(rows.getValue().get(0).getTransformationType()).contains("last-type");
+    verify(intakeDao, never())
+        .findColumnLineageByDatasetVersionAndOutputDatasetFields(any(UUID.class), anyList());
+    verify(intakeDao, never())
+        .findColumnLineageByDatasetVersionColumnAndOutputDatasetField(
+            any(UUID.class), any(UUID.class));
+  }
+
+  @Test
+  @SuppressWarnings({"rawtypes", "unchecked"})
+  void testIntakeUpsertUsesBoundedDeterministicBatchesAcrossOutputDatasets() {
+    ColumnLineageDao intakeDao = mock(ColumnLineageDao.class, CALLS_REAL_METHODS);
+    UUID firstOutputVersionUuid = new UUID(0, 2);
+    UUID secondOutputVersionUuid = new UUID(0, 1);
+    List<Pair<UUID, UUID>> firstInputs = new ArrayList<>();
+    for (int i = ColumnLineageDao.MAX_ROWS_PER_UPSERT - 1; i > 0; i--) {
+      firstInputs.add(Pair.of(new UUID(0, 100), new UUID(0, i)));
+    }
+    List<Pair<UUID, UUID>> secondInputs =
+        List.of(
+            Pair.of(new UUID(0, 200), new UUID(0, 2)), Pair.of(new UUID(0, 200), new UUID(0, 1)));
+
+    intakeDao.upsertColumnLineageRowsForIntake(
+        List.of(
+            new ColumnLineageDatasetWrite(
+                firstOutputVersionUuid,
+                List.of(
+                    new ColumnLineageWrite(new UUID(0, 20), firstInputs, "description", "type"))),
+            new ColumnLineageDatasetWrite(
+                secondOutputVersionUuid,
+                List.of(
+                    new ColumnLineageWrite(new UUID(0, 10), secondInputs, "description", "type")))),
+        now);
+
+    ArgumentCaptor<List<ColumnLineageRow>> batches = ArgumentCaptor.forClass(List.class);
+    verify(intakeDao, times(2)).doUpsertColumnLineageRow(batches.capture());
+    assertThat(batches.getAllValues())
+        .extracting(List::size)
+        .containsExactly(ColumnLineageDao.MAX_ROWS_PER_UPSERT, 1);
+    Comparator<ColumnLineageRow> physicalEdgeOrder =
+        Comparator.comparing(ColumnLineageRow::getOutputDatasetVersionUuid)
+            .thenComparing(ColumnLineageRow::getOutputDatasetFieldUuid)
+            .thenComparing(ColumnLineageRow::getInputDatasetVersionUuid)
+            .thenComparing(ColumnLineageRow::getInputDatasetFieldUuid);
+    assertThat(batches.getAllValues().get(0)).isSortedAccordingTo(physicalEdgeOrder);
+    assertThat(batches.getAllValues().get(0))
+        .extracting(ColumnLineageRow::getOutputDatasetVersionUuid)
+        .contains(firstOutputVersionUuid, secondOutputVersionUuid);
+  }
+
+  @Test
+  void testBulkUpsertRollsBackEarlierChunksWhenLaterChunkFails(Jdbi jdbi) {
+    List<UUID> validInputFieldUuids = new ArrayList<>(ColumnLineageDao.MAX_ROWS_PER_UPSERT);
+    jdbi.useHandle(
+        handle -> {
+          PreparedBatch fields =
+              handle.prepareBatch(
+                  """
+                  INSERT INTO dataset_fields (
+                    uuid, type, created_at, updated_at, dataset_uuid, name, description
+                  ) VALUES (
+                    :uuid, :type, :now, :now, :datasetUuid, :name, :description
+                  )
+                  """);
+          for (int i = 0; i < ColumnLineageDao.MAX_ROWS_PER_UPSERT; i++) {
+            UUID fieldUuid = UUID.randomUUID();
+            validInputFieldUuids.add(fieldUuid);
+            fields
+                .bind("uuid", fieldUuid)
+                .bind("type", "string")
+                .bind("now", now)
+                .bind("datasetUuid", inputDatasetRow.getUuid())
+                .bind("name", "rollback-field-" + i)
+                .bind("description", "desc")
+                .add();
+          }
+          fields.execute();
+        });
+
+    List<Pair<UUID, UUID>> inputs = new ArrayList<>(ColumnLineageDao.MAX_ROWS_PER_UPSERT + 1);
+    for (UUID fieldUuid : validInputFieldUuids) {
+      inputs.add(Pair.of(inputDatasetVersionRow.getUuid(), fieldUuid));
+    }
+    inputs.add(Pair.of(UUID.randomUUID(), UUID.randomUUID()));
+
+    assertThatThrownBy(
+            () ->
+                dao.upsertColumnLineageRows(
+                    outputDatasetVersionRow.getUuid(),
+                    Collections.singletonList(
+                        new ColumnLineageWrite(
+                            outputDatasetFieldUuid,
+                            inputs,
+                            transformationDescription,
+                            transformationType)),
+                    now))
+        .isInstanceOf(RuntimeException.class);
+    assertThat(
+            dao.findColumnLineageByDatasetVersionColumnAndOutputDatasetField(
+                outputDatasetVersionRow.getUuid(), outputDatasetFieldUuid))
+        .isEmpty();
   }
 
   @Test
