@@ -11,12 +11,15 @@ import static org.jdbi.v3.sqlobject.customizer.BindList.EmptyHandling.NULL_STRIN
 import com.google.common.collect.ImmutableList;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 import lombok.NonNull;
 import lombok.Value;
 import marquez.common.models.DatasetName;
@@ -47,6 +50,7 @@ import org.jdbi.v3.sqlobject.transaction.Transaction;
 @RegisterRowMapper(DatasetMapper.class)
 public interface DatasetDao extends BaseDao {
   int MAX_DATASET_CURRENT_VERSION_UPDATES = 1000;
+  int MAX_DATASETS_PER_UPSERT = 1000;
 
   @SqlQuery(
       "SELECT EXISTS ("
@@ -283,6 +287,156 @@ public interface DatasetDao extends BaseDao {
       String description,
       boolean isDeleted);
 
+  /**
+   * Upserts datasets without opening a transaction. The caller must provide one outer transaction
+   * so every chunk is atomic with the rest of the projection.
+   */
+  default List<DatasetRow> upsertAllInTransaction(List<DatasetUpsert> datasets) {
+    if (datasets.isEmpty()) {
+      return Collections.emptyList();
+    }
+
+    List<DatasetUpsert> inputs = List.copyOf(datasets);
+    Map<UUID, DatasetUpsert> firstWriteByUuid = new LinkedHashMap<>();
+    boolean duplicateUuid = false;
+    for (DatasetUpsert dataset : inputs) {
+      duplicateUuid |= firstWriteByUuid.putIfAbsent(dataset.getUuid(), dataset) != null;
+    }
+
+    if (duplicateUuid) {
+      // A single PostgreSQL upsert cannot affect the same target row twice. More importantly,
+      // dataset updates are occurrence-sensitive, so preserve each returned intermediate state.
+      List<DatasetRow> ordered = new ArrayList<>(inputs.size());
+      for (DatasetUpsert dataset : inputs) {
+        ordered.add(
+            upsert(
+                dataset.getUuid(),
+                dataset.getType(),
+                dataset.getNow(),
+                dataset.getNamespaceUuid(),
+                dataset.getNamespaceName(),
+                dataset.getSourceUuid(),
+                dataset.getSourceName(),
+                dataset.getName(),
+                dataset.getPhysicalName(),
+                dataset.getDescription(),
+                dataset.isDeleted()));
+      }
+      return ordered;
+    }
+
+    List<DatasetUpsert> writes = new ArrayList<>(inputs);
+    writes.sort((left, right) -> compareUuidLikePostgres(left.getUuid(), right.getUuid()));
+
+    Map<UUID, DatasetRow> rowsByUuid = new HashMap<>();
+    for (int start = 0; start < writes.size(); start += MAX_DATASETS_PER_UPSERT) {
+      List<DatasetRow> returned =
+          upsertAllChunk(
+              writes.subList(start, Math.min(start + MAX_DATASETS_PER_UPSERT, writes.size())));
+      for (DatasetRow row : returned) {
+        rowsByUuid.put(row.getUuid(), row);
+      }
+    }
+
+    List<DatasetRow> ordered = new ArrayList<>(inputs.size());
+    for (DatasetUpsert input : inputs) {
+      DatasetRow row = rowsByUuid.get(input.getUuid());
+      if (row == null) {
+        throw new IllegalStateException(
+            "Dataset upsert did not return a row for "
+                + input.getNamespaceName()
+                + "/"
+                + input.getName());
+      }
+      ordered.add(row);
+    }
+    return ordered;
+  }
+
+  private static int compareUuidLikePostgres(UUID left, UUID right) {
+    int compared =
+        Long.compareUnsigned(left.getMostSignificantBits(), right.getMostSignificantBits());
+    return compared != 0
+        ? compared
+        : Long.compareUnsigned(left.getLeastSignificantBits(), right.getLeastSignificantBits());
+  }
+
+  @SqlQuery(
+      """
+          WITH requested(
+              uuid,
+              type,
+              created_at,
+              namespace_uuid,
+              namespace_name,
+              source_uuid,
+              source_name,
+              name,
+              physical_name,
+              description,
+              is_deleted
+          ) AS (
+              VALUES <values>
+          )
+          INSERT INTO datasets (
+              uuid,
+              type,
+              created_at,
+              updated_at,
+              namespace_uuid,
+              namespace_name,
+              source_uuid,
+              source_name,
+              name,
+              physical_name,
+              description,
+              is_deleted,
+              is_hidden
+          )
+          SELECT
+              CAST(requested.uuid AS uuid),
+              CAST(requested.type AS varchar),
+              CAST(requested.created_at AS timestamptz),
+              CAST(requested.created_at AS timestamptz),
+              CAST(requested.namespace_uuid AS uuid),
+              CAST(requested.namespace_name AS varchar),
+              CAST(requested.source_uuid AS uuid),
+              CAST(requested.source_name AS varchar),
+              CAST(requested.name AS varchar),
+              CAST(requested.physical_name AS varchar),
+              CAST(requested.description AS text),
+              CAST(requested.is_deleted AS boolean),
+              false
+          FROM requested
+          ORDER BY CAST(requested.uuid AS uuid)
+          ON CONFLICT (uuid)
+          DO UPDATE SET
+              type = EXCLUDED.type,
+              updated_at = EXCLUDED.updated_at,
+              physical_name = EXCLUDED.physical_name,
+              description = EXCLUDED.description,
+              is_deleted = EXCLUDED.is_deleted,
+              is_hidden = EXCLUDED.is_hidden
+          RETURNING *
+          """)
+  List<DatasetRow> upsertAllChunk(
+      @BindBeanList(
+              value = "values",
+              propertyNames = {
+                "uuid",
+                "type",
+                "now",
+                "namespaceUuid",
+                "namespaceName",
+                "sourceUuid",
+                "sourceName",
+                "name",
+                "physicalName",
+                "description",
+                "deleted"
+              })
+          List<DatasetUpsert> datasets);
+
   @SqlQuery(
       "INSERT INTO datasets ("
           + "uuid, "
@@ -480,5 +634,20 @@ public interface DatasetDao extends BaseDao {
     @NonNull UUID rowUuid;
     @NonNull Instant updatedAt;
     @NonNull UUID currentVersionUuid;
+  }
+
+  @Value
+  class DatasetUpsert {
+    @NonNull UUID uuid;
+    @NonNull DatasetType type;
+    @NonNull Instant now;
+    @NonNull UUID namespaceUuid;
+    @NonNull String namespaceName;
+    @NonNull UUID sourceUuid;
+    @NonNull String sourceName;
+    @NonNull String name;
+    @NonNull String physicalName;
+    @Nullable String description;
+    boolean deleted;
   }
 }

@@ -9,10 +9,8 @@ import static org.jdbi.v3.sqlobject.customizer.BindList.EmptyHandling.NULL_STRIN
 
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Collections;
-import java.util.Comparator;
-import java.util.LinkedHashMap;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -84,13 +82,24 @@ public interface ColumnLineageDao extends BaseDao {
    */
   default void upsertColumnLineageRowsForIntakeInTransaction(
       List<ColumnLineageDatasetWrite> datasetWrites, Instant now) {
+    writeBindBeanColumnLineageRows(normalizeColumnLineageRows(datasetWrites, now));
+  }
+
+  /**
+   * Normalizes a complete logical write before taking any database row locks. This both prevents a
+   * multi-row upsert from containing the same conflict key twice and makes chunk boundaries follow
+   * one global PostgreSQL UUID order. A later occurrence replaces an earlier occurrence's
+   * transformation metadata, matching sequential upsert semantics.
+   */
+  private List<ColumnLineageRow> normalizeColumnLineageRows(
+      List<ColumnLineageDatasetWrite> datasetWrites, Instant now) {
     record EdgeKey(
         UUID outputDatasetVersionUuid,
         UUID outputDatasetFieldUuid,
         UUID inputDatasetVersionUuid,
         UUID inputDatasetFieldUuid) {}
 
-    Map<EdgeKey, ColumnLineageRow> batch = new LinkedHashMap<>(MAX_ROWS_PER_UPSERT);
+    Map<EdgeKey, ColumnLineageRow> rowsByPhysicalKey = new HashMap<>();
     for (ColumnLineageDatasetWrite datasetWrite : datasetWrites) {
       for (ColumnLineageWrite write : datasetWrite.writes()) {
         for (Pair<UUID, UUID> input : write.inputs()) {
@@ -104,65 +113,76 @@ public interface ColumnLineageDao extends BaseDao {
                   write.transformationType(),
                   now,
                   now);
-          batch.put(
+          rowsByPhysicalKey.put(
               new EdgeKey(
                   row.getOutputDatasetVersionUuid(),
                   row.getOutputDatasetFieldUuid(),
                   row.getInputDatasetVersionUuid(),
                   row.getInputDatasetFieldUuid()),
               row);
-          if (batch.size() == MAX_ROWS_PER_UPSERT) {
-            writeIntakeColumnLineageBatch(batch.values());
-            batch = new LinkedHashMap<>(MAX_ROWS_PER_UPSERT);
-          }
         }
       }
     }
-    if (!batch.isEmpty()) {
-      writeIntakeColumnLineageBatch(batch.values());
+
+    List<ColumnLineageRow> rows = new ArrayList<>(rowsByPhysicalKey.values());
+    rows.sort(ColumnLineageDao::comparePhysicalEdgesInPostgresOrder);
+    return rows;
+  }
+
+  private void writeBindBeanColumnLineageRows(List<ColumnLineageRow> rows) {
+    for (int start = 0; start < rows.size(); start += MAX_ROWS_PER_UPSERT) {
+      doUpsertColumnLineageRow(
+          rows.subList(start, Math.min(start + MAX_ROWS_PER_UPSERT, rows.size())));
     }
   }
 
-  private void writeIntakeColumnLineageBatch(Collection<ColumnLineageRow> batch) {
-    List<ColumnLineageRow> rows = new ArrayList<>(batch);
-    rows.sort(
-        Comparator.comparing(ColumnLineageRow::getOutputDatasetVersionUuid)
-            .thenComparing(ColumnLineageRow::getOutputDatasetFieldUuid)
-            .thenComparing(ColumnLineageRow::getInputDatasetVersionUuid)
-            .thenComparing(ColumnLineageRow::getInputDatasetFieldUuid));
-    doUpsertColumnLineageRow(rows);
+  private static int comparePhysicalEdgesInPostgresOrder(
+      ColumnLineageRow left, ColumnLineageRow right) {
+    int compared =
+        compareUuidsInPostgresOrder(
+            left.getOutputDatasetVersionUuid(), right.getOutputDatasetVersionUuid());
+    if (compared != 0) {
+      return compared;
+    }
+    compared =
+        compareUuidsInPostgresOrder(
+            left.getOutputDatasetFieldUuid(), right.getOutputDatasetFieldUuid());
+    if (compared != 0) {
+      return compared;
+    }
+    compared =
+        compareUuidsInPostgresOrder(
+            left.getInputDatasetVersionUuid(), right.getInputDatasetVersionUuid());
+    return compared != 0
+        ? compared
+        : compareUuidsInPostgresOrder(
+            left.getInputDatasetFieldUuid(), right.getInputDatasetFieldUuid());
+  }
+
+  /** PostgreSQL compares UUIDs as sixteen unsigned bytes in network order. */
+  private static int compareUuidsInPostgresOrder(UUID left, UUID right) {
+    int compared =
+        Long.compareUnsigned(left.getMostSignificantBits(), right.getMostSignificantBits());
+    return compared != 0
+        ? compared
+        : Long.compareUnsigned(left.getLeastSignificantBits(), right.getLeastSignificantBits());
   }
 
   @Transaction
   default List<ColumnLineageRow> upsertColumnLineageRowsInTransaction(
       UUID outputDatasetVersionUuid, List<ColumnLineageWrite> writes, Instant now) {
     Set<UUID> outputDatasetFieldUuids = new LinkedHashSet<>();
-    List<ColumnLineageRow> batch = new ArrayList<>(MAX_ROWS_PER_UPSERT);
     for (ColumnLineageWrite write : writes) {
       if (write.inputs().isEmpty()) {
         continue;
       }
       outputDatasetFieldUuids.add(write.outputDatasetFieldUuid());
-      for (Pair<UUID, UUID> input : write.inputs()) {
-        batch.add(
-            new ColumnLineageRow(
-                outputDatasetVersionUuid,
-                write.outputDatasetFieldUuid(),
-                input.getLeft(), // input_dataset_version_uuid
-                input.getRight(), // input_dataset_field_uuid
-                write.transformationDescription(),
-                write.transformationType(),
-                now,
-                now));
-        if (batch.size() == MAX_ROWS_PER_UPSERT) {
-          doUpsertColumnLineageRow(batch);
-          batch = new ArrayList<>(MAX_ROWS_PER_UPSERT);
-        }
-      }
     }
-    if (!batch.isEmpty()) {
-      doUpsertColumnLineageRow(batch);
-    }
+    writeBindBeanColumnLineageRows(
+        normalizeColumnLineageRows(
+            Collections.singletonList(
+                new ColumnLineageDatasetWrite(outputDatasetVersionUuid, writes)),
+            now));
 
     List<UUID> outputFields = new ArrayList<>(outputDatasetFieldUuids);
     List<ColumnLineageRow> rows = new ArrayList<>();

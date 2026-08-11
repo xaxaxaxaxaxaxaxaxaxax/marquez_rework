@@ -25,6 +25,43 @@ public interface RunStateDao extends BaseDao {
           + "VALUES (:uuid, :now, :runUuid, :runStateType) RETURNING *")
   RunStateRow upsert(UUID uuid, Instant now, UUID runUuid, RunState runStateType);
 
+  /**
+   * Appends a run state and links a starting or terminal state to its run in one statement. Intake
+   * callers must project {@code current_run_state} and {@code transitioned_at} before this method.
+   */
+  @SqlQuery(
+      """
+      WITH inserted_state AS (
+        INSERT INTO run_states (uuid, transitioned_at, run_uuid, state)
+        VALUES (:uuid, :transitionedAt, :runUuid, :runStateType)
+        RETURNING *
+      ), linked_start AS (
+        UPDATE runs AS r
+        SET updated_at = :transitionedAt,
+            start_run_state_uuid = inserted_state.uuid,
+            started_at = :transitionedAt
+        FROM inserted_state
+        WHERE r.uuid = inserted_state.run_uuid
+          AND inserted_state.state = 'RUNNING'
+        RETURNING r.uuid
+      ), linked_end AS (
+        UPDATE runs AS r
+        SET updated_at = :transitionedAt,
+            end_run_state_uuid = inserted_state.uuid,
+            ended_at = :transitionedAt
+        FROM inserted_state
+        WHERE r.uuid = inserted_state.run_uuid
+          AND inserted_state.state IN ('COMPLETED', 'ABORTED', 'FAILED')
+        RETURNING r.uuid
+      )
+      SELECT inserted_state.*
+      FROM inserted_state
+      LEFT JOIN linked_start ON TRUE
+      LEFT JOIN linked_end ON TRUE
+      """)
+  RunStateRow insertAndLinkRunState(
+      UUID uuid, Instant transitionedAt, UUID runUuid, RunState runStateType);
+
   @Transaction
   default void updateRunStateFor(UUID runUuid, RunState runState, Instant transitionedAt) {
     RunDao runDao = createRunDao();

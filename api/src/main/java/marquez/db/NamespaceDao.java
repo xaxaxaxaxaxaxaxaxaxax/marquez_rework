@@ -90,8 +90,21 @@ public interface NamespaceDao extends BaseDao {
 
   default NamespaceRow upsertNamespaceRow(
       UUID uuid, Instant now, String name, String currentOwnerName) {
-    doUpsertNamespaceRow(uuid, now, name, currentOwnerName);
-    NamespaceRow namespaceRow = findNamespaceByName(name).orElseThrow();
+    NamespaceRow namespaceRow = findNamespaceByName(name).orElse(null);
+    if (namespaceRow == null) {
+      namespaceRow =
+          insertNamespaceIfAbsent(uuid, now, name, currentOwnerName)
+              // A concurrent transaction may have inserted the same name after the first read.
+              // Under READ COMMITTED, this statement runs after ON CONFLICT has waited for the
+              // winner and therefore observes its row.
+              .orElseGet(
+                  () ->
+                      findNamespaceByName(name)
+                          .orElseThrow(
+                              () ->
+                                  new IllegalStateException(
+                                      "Namespace disappeared after a concurrent insert: " + name)));
+    }
     if (namespaceRow.getIsHidden()) {
       namespaceRow = undelete(namespaceRow.getName());
     }
@@ -129,6 +142,26 @@ public interface NamespaceDao extends BaseDao {
       ON CONFLICT(name) DO NOTHING
   """)
   void doUpsertNamespaceRow(UUID uuid, Instant now, String name, String currentOwnerName);
+
+  @SqlQuery(
+      """
+    INSERT INTO namespaces (
+      uuid,
+      created_at,
+      updated_at,
+      name,
+      current_owner_name
+      ) VALUES (
+      :uuid,
+      :now,
+      :now,
+      :name,
+      :currentOwnerName)
+      ON CONFLICT(name) DO NOTHING
+      RETURNING *
+  """)
+  Optional<NamespaceRow> insertNamespaceIfAbsent(
+      UUID uuid, Instant now, String name, String currentOwnerName);
 
   @SqlQuery(
       """

@@ -185,6 +185,51 @@ that lookup cost about 0.4 ms per lineage event, while the logical resolver cost
 is why M3 SQL time remains effectively neutral despite 14.8% fewer executions, while p50, p95,
 and throughput improve and WAL remains flat.
 
+## Third-round intake transaction compaction
+
+The third comparison freezes `b0e32478` as the baseline and isolates the next intake-only change
+set at native P76. It used 24 fresh PostgreSQL 14 databases: four workloads, two variants, and
+three seed-paired trials per workload. All requests returned 201, every invariant passed, and all
+12 paired semantic-state SHA-256 digests matched. Absolute values below are medians of the three
+trials; percentages are medians of the paired candidate/baseline ratios.
+
+| Workload | Request p50 | Request p95 | Requests/s | SQL calls/request | SQL ms/request | LSN bytes/request |
+|---|---:|---:|---:|---:|---:|---:|
+| M0: required-only | 25.3 -> 24.9 ms (-0.5%) | 32.8 -> 32.6 ms (-1.7%) | 154.5 -> 156.5 (+1.3%) | 11.1 -> 9.1 (-18.3%) | 0.51 -> 0.56 (+10.5%) | 2,632 -> 2,627 (flat) |
+| M1: 6 datasets, 8 fields | 34.3 -> 34.2 ms (-6.9%) | 66.5 -> 62.0 ms (-5.3%) | 96.8 -> 105.8 (+7.0%) | 74.0 -> 61.5 (-16.9%) | 2.52 -> 2.44 (-3.4%) | 29,643 -> 29,929 (+1.0%) |
+| M3: 32 fields, 256 column edges | 40.9 -> 38.1 ms (-6.2%) | 114.6 -> 106.5 ms (-6.6%) | 64.1 -> 66.2 (+8.8%) | 638.2 -> 625.6 (-2.0%) | 9.76 -> 9.36 (-4.0%) | 178,902 -> 179,740 (+0.5%) |
+| HOT: identical COMPLETE replay | 65.7 -> 54.3 ms (-25.4%) | 319.5 -> 222.4 ms (-23.5%) | 35.0 -> 42.5 (+15.9%) | 83.0 -> 62.0 (-25.3%) | 133.86 -> 109.92 (-16.4%) | 29,721 -> 30,091 (+1.2%) |
+
+The changes compact existing transactional work rather than alter commit boundaries. A
+listener-free nonterminal event no longer materializes an unused run snapshot; appending a run
+state and linking its start/end pointer uses one statement; missing input and output mappings are
+invalidated together; and both-sided current job-version mappings share bounded invalidation and
+activation statements. Namespace lookup is read-first, while primary-symlink resolution and base
+dataset upserts use bounded, occurrence-reconstructing batches. Dataset facets reuse bounded list
+views and intake calls transaction-assuming DAO cores, avoiding redundant transaction wrappers.
+
+For `D` ordinary primary datasets on one side and `U` distinct physical column edges, the smallest
+useful statement model is:
+
+```text
+primary-symlink resolution calls per side: 2D -> ceil(D / 1000)
+base-dataset upsert calls per side:         D -> ceil(D / 1000)
+physical column writes:                    ceil(U / 1000)
+```
+
+The fast dataset path is deliberately conditional. Alias/symlink facets, repeated primary
+identities, or distinct names resolving to a repeated dataset UUID retain the sequential path so
+first-occurrence, intermediate-row, input-before-output, and rollback behavior remain compatible.
+Physical column edges are normalized once across the event, globally ordered by PostgreSQL's
+unsigned UUID order, and use last-occurrence transformation metadata before bounded writes.
+
+A fixed-shape six-array `unnest` writer for physical column edges was separately tested and
+rejected. Across the same three M3 seeds it reduced SQL execution time by 5.3%, but endpoint p50
+regressed 10.3%, p95 improved only 1.0%, and throughput changed by +0.1%. The final path therefore
+retains the bind-bean writer. No V77 schema change was made: the remaining candidate indexes lack
+leave-one-out evidence, serve read or foreign-key paths, and isolated drops would not restore HOT
+eligibility while other indexed run-state and timestamp columns remain.
+
 ## Caveats
 
 - Latencies are warm-cache, single-client medians from one machine, not confidence intervals over

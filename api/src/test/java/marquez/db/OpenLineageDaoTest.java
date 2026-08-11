@@ -14,6 +14,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -26,6 +27,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import marquez.common.Utils;
 import marquez.common.models.DatasetName;
 import marquez.common.models.DatasetVersionId;
 import marquez.common.models.NamespaceName;
@@ -137,6 +139,128 @@ class OpenLineageDaoTest {
     assertThat(datasetFieldDao.findByDatasetSchemaVersion(schemaVersionUuid))
         .extracting((ds) -> ds.getName().getValue())
         .containsExactlyInAnyOrder("name", "age");
+  }
+
+  @Test
+  void skipsUnneededStartSnapshotAndUsesCompactStateAndMissingIoWrites() {
+    UUID runUuid = UUID.randomUUID();
+    LineageEvent event =
+        newRunEvent(
+            "compact_start_" + runUuid,
+            runUuid,
+            "START",
+            JobFacet.builder().build(),
+            Collections.emptyList(),
+            Collections.emptyList());
+    List<String> executedSql = new ArrayList<>();
+
+    UpdateLineageRow projected = projectWithSqlCapture(event, false, executedSql);
+
+    assertThat(projected.getRunIoSnapshot()).isNull();
+    assertThat(projected.getInputs()).isEmpty();
+    assertThat(projected.getOutputs()).isEmpty();
+    assertThat(countSql(executedSql, "FROM runs_input_mapping rim")).isZero();
+    assertThat(countSql(executedSql, "WITH inserted_state AS")).isEqualTo(1);
+    assertThat(countSql(executedSql, "io_type IN ('INPUT', 'OUTPUT')")).isEqualTo(1);
+    assertThat(runDao.findRunByUuidAsRow(runUuid).orElseThrow().getStartRunStateUuid())
+        .contains(projected.getRunState().getUuid());
+  }
+
+  @Test
+  void terminalEventLoadsSnapshotWithoutListenerDemand() {
+    UUID runUuid = UUID.randomUUID();
+    LineageEvent event =
+        newRunEvent(
+            "terminal_snapshot_" + runUuid,
+            runUuid,
+            "COMPLETE",
+            JobFacet.builder().build(),
+            Collections.emptyList(),
+            Collections.emptyList());
+
+    UpdateLineageRow projected = dao.updateMarquezModel(event, Utils.getMapper(), false);
+
+    assertThat(projected.getRunIoSnapshot()).isNotNull();
+  }
+
+  @Test
+  void batchesPrimaryResolutionAndDatasetBasesOncePerSideInOccurrenceOrder() {
+    String suffix = UUID.randomUUID().toString();
+    String datasetNamespace = "base_batch_" + suffix;
+    DatasetFacets emptyFacets = DatasetFacets.builder().build();
+    List<Dataset> inputs =
+        List.of(
+            new Dataset(datasetNamespace, "input_a", emptyFacets),
+            new Dataset(datasetNamespace, "input_b", emptyFacets),
+            new Dataset(datasetNamespace, "input_c", emptyFacets),
+            new Dataset(datasetNamespace, "input_d", emptyFacets));
+    List<Dataset> outputs =
+        List.of(
+            new Dataset(datasetNamespace, "output_a", emptyFacets),
+            new Dataset(datasetNamespace, "output_b", emptyFacets));
+    LineageEvent event =
+        newRunEvent(
+            "base_batch_job_" + suffix,
+            UUID.randomUUID(),
+            "COMPLETE",
+            JobFacet.builder().build(),
+            inputs,
+            outputs);
+    List<String> executedSql = new ArrayList<>();
+
+    UpdateLineageRow projected = projectWithSqlCapture(event, false, executedSql);
+
+    assertThat(projected.getInputs().orElseThrow())
+        .extracting(record -> record.getDatasetRow().getName())
+        .containsExactly("input_a", "input_b", "input_c", "input_d");
+    assertThat(projected.getOutputs().orElseThrow())
+        .extracting(record -> record.getDatasetRow().getName())
+        .containsExactly("output_a", "output_b");
+    assertThat(
+            countSql(
+                executedSql,
+                "WITH requested(dataset_uuid, name, namespace_uuid, created_at)",
+                "INSERT INTO dataset_symlinks"))
+        .isEqualTo(2);
+    assertThat(countSql(executedSql, "WITH requested(", "INSERT INTO datasets")).isEqualTo(2);
+    assertThat(countSql(executedSql, "INSERT INTO dataset_facets")).isZero();
+  }
+
+  @Test
+  void symlinkFacetDisablesStagedBaseWritesForTheEntireSide() {
+    String suffix = UUID.randomUUID().toString();
+    String datasetNamespace = "alias_fallback_" + suffix;
+    Dataset datasetWithEmptySymlinkFacet =
+        new Dataset(
+            datasetNamespace,
+            "input_b",
+            DatasetFacets.builder()
+                .symlinks(
+                    new LineageEvent.DatasetSymlinkFacet(
+                        PRODUCER_URL, SCHEMA_URL, Collections.emptyList()))
+                .build());
+    LineageEvent event =
+        newRunEvent(
+            "alias_fallback_job_" + suffix,
+            UUID.randomUUID(),
+            "COMPLETE",
+            JobFacet.builder().build(),
+            List.of(new Dataset(datasetNamespace, "input_a", null), datasetWithEmptySymlinkFacet),
+            Collections.emptyList());
+    List<String> executedSql = new ArrayList<>();
+
+    UpdateLineageRow projected = projectWithSqlCapture(event, false, executedSql);
+
+    assertThat(projected.getInputs().orElseThrow())
+        .extracting(record -> record.getDatasetRow().getName())
+        .containsExactly("input_a", "input_b");
+    assertThat(
+            countSql(
+                executedSql,
+                "WITH requested(dataset_uuid, name, namespace_uuid, created_at)",
+                "INSERT INTO dataset_symlinks"))
+        .isZero();
+    assertThat(countSql(executedSql, "WITH requested(", "INSERT INTO datasets")).isZero();
   }
 
   @Test
@@ -309,6 +433,59 @@ class OpenLineageDaoTest {
         .containsExactly(
             projected.getInputs().orElseThrow().get(0).getDatasetVersionRow().getUuid(),
             projected.getInputs().orElseThrow().get(0).getDatasetVersionRow().getUuid());
+  }
+
+  @Test
+  void distinctPrimaryNamesResolvingToOneDatasetKeepSequentialOccurrenceSemantics() {
+    String suffix = UUID.randomUUID().toString();
+    String datasetNamespace = "resolved_alias_" + suffix;
+    String primaryName = "primary_" + suffix;
+    String aliasName = "alias_" + suffix;
+    Dataset primaryWithAlias =
+        new Dataset(
+            datasetNamespace,
+            primaryName,
+            DatasetFacets.builder()
+                .symlinks(
+                    new LineageEvent.DatasetSymlinkFacet(
+                        PRODUCER_URL,
+                        SCHEMA_URL,
+                        List.of(
+                            new LineageEvent.SymlinkIdentifier(
+                                datasetNamespace, aliasName, "alias"))))
+                .build());
+    UpdateLineageRow initial =
+        LineageTestUtils.createLineageRow(
+            dao,
+            "resolved_alias_seed_" + suffix,
+            "COMPLETE",
+            JobFacet.builder().build(),
+            Collections.emptyList(),
+            List.of(primaryWithAlias));
+    LineageEvent aliasRead =
+        newRunEvent(
+            "resolved_alias_read_" + suffix,
+            UUID.randomUUID(),
+            "COMPLETE",
+            JobFacet.builder().build(),
+            List.of(
+                new Dataset(datasetNamespace, primaryName, null),
+                new Dataset(datasetNamespace, aliasName, null)),
+            Collections.emptyList());
+    List<String> executedSql = new ArrayList<>();
+
+    UpdateLineageRow projected = projectWithSqlCapture(aliasRead, false, executedSql);
+
+    UUID datasetUuid = initial.getOutputs().orElseThrow().get(0).getDatasetRow().getUuid();
+    UUID datasetVersionUuid =
+        initial.getOutputs().orElseThrow().get(0).getDatasetVersionRow().getUuid();
+    assertThat(projected.getInputs().orElseThrow())
+        .extracting(record -> record.getDatasetRow().getUuid())
+        .containsExactly(datasetUuid, datasetUuid);
+    assertThat(projected.getInputs().orElseThrow())
+        .extracting(record -> record.getDatasetVersionRow().getUuid())
+        .containsExactly(datasetVersionUuid, datasetVersionUuid);
+    assertThat(countSql(executedSql, "WITH requested(", "INSERT INTO datasets")).isZero();
   }
 
   @Test
@@ -571,6 +748,52 @@ class OpenLineageDaoTest {
   @Test
   void testGetUrlOrNullReturnsEmptyString() {
     assertEquals("", dao.getUrlOrNull(null));
+  }
+
+  private UpdateLineageRow projectWithSqlCapture(
+      LineageEvent event, boolean listenerSnapshotRequired, List<String> executedSql) {
+    UpdateLineageRow[] projected = new UpdateLineageRow[1];
+    jdbi.useHandle(
+        handle -> {
+          handle
+              .getConfig(SqlStatements.class)
+              .setSqlLogger(
+                  new SqlLogger() {
+                    @Override
+                    public void logAfterExecution(StatementContext context) {
+                      executedSql.add(context.getRawSql());
+                    }
+                  });
+          projected[0] =
+              handle
+                  .attach(OpenLineageDao.class)
+                  .updateMarquezModel(event, Utils.getMapper(), listenerSnapshotRequired);
+        });
+    return projected[0];
+  }
+
+  private static LineageEvent newRunEvent(
+      String jobName,
+      UUID runUuid,
+      String eventType,
+      JobFacet jobFacet,
+      List<Dataset> inputs,
+      List<Dataset> outputs) {
+    return LineageEvent.builder()
+        .eventType(eventType)
+        .eventTime(Instant.now().atZone(LineageTestUtils.LOCAL_ZONE))
+        .run(new LineageEvent.Run(runUuid.toString(), null))
+        .job(new Job(NAMESPACE, jobName, jobFacet))
+        .inputs(inputs)
+        .outputs(outputs)
+        .producer(PRODUCER_URL.toString())
+        .build();
+  }
+
+  private static long countSql(List<String> executedSql, String... requiredFragments) {
+    return executedSql.stream()
+        .filter(sql -> Arrays.stream(requiredFragments).allMatch(sql::contains))
+        .count();
   }
 
   private static int findSqlIndexAfter(

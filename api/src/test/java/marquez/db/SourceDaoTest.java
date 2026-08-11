@@ -9,6 +9,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -20,6 +22,9 @@ import marquez.db.models.SourceRow;
 import marquez.jdbi.MarquezJdbiExternalPostgresExtension;
 import org.jdbi.v3.core.Handle;
 import org.jdbi.v3.core.Jdbi;
+import org.jdbi.v3.core.statement.SqlLogger;
+import org.jdbi.v3.core.statement.SqlStatements;
+import org.jdbi.v3.core.statement.StatementContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -101,6 +106,39 @@ class SourceDaoTest {
       assertThat(updated.getUpdatedAt()).isEqualTo(LATER);
       reader.rollback();
     }
+  }
+
+  @Test
+  void inTransactionCoreUsesTheCallersTransactionWithoutIsolationMetadata() {
+    String name = "source-core-" + UUID.randomUUID();
+    SourceRow stored =
+        sourceDao.upsert(
+            UUID.randomUUID(), "EXPLICIT", CREATED_AT, name, "connection", "description");
+    List<String> executedSql = new ArrayList<>();
+    SourceRow[] resolved = new SourceRow[1];
+
+    jdbi.useTransaction(
+        handle -> {
+          handle
+              .getConfig(SqlStatements.class)
+              .setSqlLogger(
+                  new SqlLogger() {
+                    @Override
+                    public void logAfterExecution(StatementContext context) {
+                      executedSql.add(context.getRawSql());
+                    }
+                  });
+          resolved[0] =
+              handle
+                  .attach(SourceDao.class)
+                  .upsertOrDefaultInTransaction(
+                      UUID.randomUUID(), "DEFAULT", LATER, name, "other-connection");
+        });
+
+    assertThat(resolved[0]).isEqualTo(stored);
+    assertThat(executedSql).hasSize(1);
+    assertThat(executedSql.get(0)).contains("SELECT * FROM sources WHERE name");
+    assertThat(executedSql).noneMatch(sql -> sql.contains("TRANSACTION ISOLATION"));
   }
 
   @Test

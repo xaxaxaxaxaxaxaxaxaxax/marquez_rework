@@ -8,6 +8,9 @@ package marquez.service;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
@@ -27,6 +30,8 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import marquez.db.BaseDao;
 import marquez.db.OpenLineageDao;
+import marquez.db.models.RunIoSnapshot;
+import marquez.db.models.RunRow;
 import marquez.db.models.UpdateLineageRow;
 import marquez.service.RunTransitionListener.JobInputUpdate;
 import marquez.service.RunTransitionListener.JobOutputUpdate;
@@ -53,7 +58,8 @@ class OpenLineageServiceTest {
     searchService = mock(SearchService.class);
     update = mock(UpdateLineageRow.class);
     when(baseDao.createOpenLineageDao()).thenReturn(openLineageDao);
-    when(openLineageDao.updateMarquezModel(any(LineageEvent.class), any(ObjectMapper.class)))
+    when(openLineageDao.updateMarquezModel(
+            any(LineageEvent.class), any(ObjectMapper.class), anyBoolean()))
         .thenReturn(update);
   }
 
@@ -78,7 +84,7 @@ class OpenLineageServiceTest {
         .createLineageEvent(any(), any(), any(), any(), any(), any(), any());
     order
         .verify(openLineageDao)
-        .updateMarquezModel(any(LineageEvent.class), any(ObjectMapper.class));
+        .updateMarquezModel(any(LineageEvent.class), any(ObjectMapper.class), eq(false));
   }
 
   @Test
@@ -93,7 +99,8 @@ class OpenLineageServiceTest {
         assertThrows(CompletionException.class, () -> service.createAsync(lineageEvent()).join());
 
     assertThat(thrown.getCause()).isSameAs(rawFailure);
-    verify(openLineageDao).updateMarquezModel(any(LineageEvent.class), any(ObjectMapper.class));
+    verify(openLineageDao)
+        .updateMarquezModel(any(LineageEvent.class), any(ObjectMapper.class), eq(false));
   }
 
   @Test
@@ -103,7 +110,8 @@ class OpenLineageServiceTest {
     doThrow(rawFailure)
         .when(openLineageDao)
         .createLineageEvent(any(), any(), any(), any(), any(), any(), any());
-    when(openLineageDao.updateMarquezModel(any(LineageEvent.class), any(ObjectMapper.class)))
+    when(openLineageDao.updateMarquezModel(
+            any(LineageEvent.class), any(ObjectMapper.class), anyBoolean()))
         .thenThrow(projectionFailure);
     OpenLineageService service = service(Runnable::run);
 
@@ -142,16 +150,46 @@ class OpenLineageServiceTest {
   }
 
   @Test
-  void skipsSnapshotAndListenerDtoWorkWhenNoListenersAreRegistered() {
+  void doesNotRequestListenerSnapshotForStartWhenNoListenersAreRegistered() {
     OpenLineageService service = service(Runnable::run);
+    LineageEvent event = lineageEvent("START");
 
-    service.createAsync(lineageEvent()).join();
+    service.createAsync(event).join();
 
     verify(runService).hasRunTransitionListeners();
+    verify(openLineageDao).updateMarquezModel(eq(event), any(ObjectMapper.class), eq(false));
     verify(update, never()).getRunIoSnapshot();
     verify(runService, never()).notify(any(JobInputUpdate.class));
     verify(runService, never()).notify(any(JobOutputUpdate.class));
     verify(runService, never()).notify(any(RunTransition.class));
+  }
+
+  @Test
+  void requestsListenerSnapshotAndUsesItForStartWhenListenersAreRegistered() {
+    when(runService.hasRunTransitionListeners()).thenReturn(true);
+    when(update.getRunIoSnapshot()).thenReturn(RunIoSnapshot.empty());
+    RunRow run = mock(RunRow.class);
+    when(run.getUuid()).thenReturn(RUN_ID);
+    when(update.getRun()).thenReturn(run);
+    OpenLineageService service = service(Runnable::run);
+    LineageEvent event = lineageEvent("START");
+
+    service.createAsync(event).join();
+
+    verify(openLineageDao).updateMarquezModel(eq(event), any(ObjectMapper.class), eq(true));
+    verify(update, atLeastOnce()).getRunIoSnapshot();
+  }
+
+  @Test
+  void nullEventTypeDoesNotRequestListenerSnapshot() {
+    OpenLineageService service = service(Runnable::run);
+    LineageEvent event = lineageEvent(null);
+
+    service.createAsync(event).join();
+
+    verify(runService, never()).hasRunTransitionListeners();
+    verify(openLineageDao).updateMarquezModel(eq(event), any(ObjectMapper.class), eq(false));
+    verify(update, never()).getRunIoSnapshot();
   }
 
   private OpenLineageService service(Executor executor) {
@@ -159,8 +197,12 @@ class OpenLineageServiceTest {
   }
 
   private LineageEvent lineageEvent() {
+    return lineageEvent("COMPLETE");
+  }
+
+  private LineageEvent lineageEvent(String eventType) {
     return LineageEvent.builder()
-        .eventType("COMPLETE")
+        .eventType(eventType)
         .eventTime(Instant.parse("2026-08-10T00:00:00Z").atZone(ZoneOffset.UTC))
         .run(new LineageEvent.Run(RUN_ID.toString(), null))
         .job(LineageEvent.Job.builder().namespace("job-namespace").name("job").build())

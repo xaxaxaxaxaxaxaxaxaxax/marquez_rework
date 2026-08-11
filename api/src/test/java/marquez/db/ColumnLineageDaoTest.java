@@ -352,10 +352,76 @@ public class ColumnLineageDaoTest {
 
   @Test
   @SuppressWarnings({"rawtypes", "unchecked"})
+  void testIntakeCoreDeduplicatesBeforeApplyingExactBatchBoundary() {
+    ColumnLineageDao intakeDao = mock(ColumnLineageDao.class, CALLS_REAL_METHODS);
+    UUID outputDatasetVersionUuid = UUID.randomUUID();
+    UUID outputFieldUuid = UUID.randomUUID();
+    List<Pair<UUID, UUID>> inputs = new ArrayList<>(ColumnLineageDao.MAX_ROWS_PER_UPSERT);
+    for (int index = 0; index < ColumnLineageDao.MAX_ROWS_PER_UPSERT; index++) {
+      inputs.add(Pair.of(new UUID(0, 100), new UUID(0, index + 1)));
+    }
+    Pair<UUID, UUID> repeatedInput = inputs.get(0);
+
+    intakeDao.upsertColumnLineageRowsForIntakeInTransaction(
+        List.of(
+            new ColumnLineageDatasetWrite(
+                outputDatasetVersionUuid,
+                List.of(
+                    new ColumnLineageWrite(
+                        outputFieldUuid, inputs, "first-description", "first-type"))),
+            new ColumnLineageDatasetWrite(
+                outputDatasetVersionUuid,
+                List.of(
+                    new ColumnLineageWrite(
+                        outputFieldUuid,
+                        List.of(repeatedInput),
+                        "last-description",
+                        "last-type")))),
+        now);
+
+    ArgumentCaptor<List<ColumnLineageRow>> rows = ArgumentCaptor.forClass(List.class);
+    verify(intakeDao).doUpsertColumnLineageRow(rows.capture());
+    assertThat(rows.getValue()).hasSize(ColumnLineageDao.MAX_ROWS_PER_UPSERT);
+    assertThat(rows.getValue())
+        .filteredOn(row -> row.getInputDatasetFieldUuid().equals(repeatedInput.getRight()))
+        .singleElement()
+        .satisfies(
+            row -> {
+              assertThat(row.getTransformationDescription()).contains("last-description");
+              assertThat(row.getTransformationType()).contains("last-type");
+            });
+  }
+
+  @Test
+  @SuppressWarnings({"rawtypes", "unchecked"})
+  void testCompatibilityBulkPathDeduplicatesPhysicalEdgesWithLastOccurrenceWinning() {
+    ColumnLineageDao bulkDao = mock(ColumnLineageDao.class, CALLS_REAL_METHODS);
+    UUID outputDatasetVersionUuid = UUID.randomUUID();
+    UUID outputFieldUuid = UUID.randomUUID();
+    Pair<UUID, UUID> input = Pair.of(UUID.randomUUID(), UUID.randomUUID());
+
+    bulkDao.upsertColumnLineageRowsInTransaction(
+        outputDatasetVersionUuid,
+        List.of(
+            new ColumnLineageWrite(
+                outputFieldUuid, List.of(input), "first-description", "first-type"),
+            new ColumnLineageWrite(
+                outputFieldUuid, List.of(input), "last-description", "last-type")),
+        now);
+
+    ArgumentCaptor<List<ColumnLineageRow>> rows = ArgumentCaptor.forClass(List.class);
+    verify(bulkDao).doUpsertColumnLineageRow(rows.capture());
+    assertThat(rows.getValue()).hasSize(1);
+    assertThat(rows.getValue().get(0).getTransformationDescription()).contains("last-description");
+    assertThat(rows.getValue().get(0).getTransformationType()).contains("last-type");
+  }
+
+  @Test
+  @SuppressWarnings({"rawtypes", "unchecked"})
   void testIntakeCoreUsesBoundedDeterministicBatchesAcrossOutputDatasets() {
     ColumnLineageDao intakeDao = mock(ColumnLineageDao.class, CALLS_REAL_METHODS);
-    UUID firstOutputVersionUuid = new UUID(0, 2);
-    UUID secondOutputVersionUuid = new UUID(0, 1);
+    UUID firstOutputVersionUuid = new UUID(Long.MIN_VALUE, 2);
+    UUID secondOutputVersionUuid = new UUID(Long.MAX_VALUE, 1);
     List<Pair<UUID, UUID>> firstInputs = new ArrayList<>();
     for (int i = ColumnLineageDao.MAX_ROWS_PER_UPSERT - 1; i > 0; i--) {
       firstInputs.add(Pair.of(new UUID(0, 100), new UUID(0, i)));
@@ -382,15 +448,44 @@ public class ColumnLineageDaoTest {
         .extracting(List::size)
         .containsExactly(ColumnLineageDao.MAX_ROWS_PER_UPSERT, 1);
     Comparator<ColumnLineageRow> physicalEdgeOrder =
-        Comparator.comparing(ColumnLineageRow::getOutputDatasetVersionUuid)
-            .thenComparing(ColumnLineageRow::getOutputDatasetFieldUuid)
-            .thenComparing(ColumnLineageRow::getInputDatasetVersionUuid)
-            .thenComparing(ColumnLineageRow::getInputDatasetFieldUuid);
-    assertThat(batches.getAllValues().get(0)).isSortedAccordingTo(physicalEdgeOrder);
-    assertThat(batches.getAllValues().get(1)).isSortedAccordingTo(physicalEdgeOrder);
+        ColumnLineageDaoTest::comparePhysicalEdgesInPostgresOrder;
+    List<ColumnLineageRow> allRows =
+        batches.getAllValues().stream().flatMap(List::stream).collect(Collectors.toList());
+    assertThat(allRows).isSortedAccordingTo(physicalEdgeOrder);
+    assertThat(allRows.get(0).getOutputDatasetVersionUuid()).isEqualTo(secondOutputVersionUuid);
+    assertThat(allRows.get(allRows.size() - 1).getOutputDatasetVersionUuid())
+        .isEqualTo(firstOutputVersionUuid);
     assertThat(batches.getAllValues().get(0))
         .extracting(ColumnLineageRow::getOutputDatasetVersionUuid)
         .contains(firstOutputVersionUuid, secondOutputVersionUuid);
+  }
+
+  @Test
+  @SuppressWarnings({"rawtypes", "unchecked"})
+  void testIntakeCoreUsesUnsignedUuidLeastSignificantBitsOrder() {
+    ColumnLineageDao intakeDao = mock(ColumnLineageDao.class, CALLS_REAL_METHODS);
+    UUID firstInPostgresOrder = new UUID(0, Long.MAX_VALUE);
+    UUID secondInPostgresOrder = new UUID(0, Long.MIN_VALUE);
+
+    intakeDao.upsertColumnLineageRowsForIntakeInTransaction(
+        List.of(
+            new ColumnLineageDatasetWrite(
+                UUID.randomUUID(),
+                List.of(
+                    new ColumnLineageWrite(
+                        UUID.randomUUID(),
+                        List.of(
+                            Pair.of(new UUID(0, 1), secondInPostgresOrder),
+                            Pair.of(new UUID(0, 1), firstInPostgresOrder)),
+                        "description",
+                        "type")))),
+        now);
+
+    ArgumentCaptor<List<ColumnLineageRow>> rows = ArgumentCaptor.forClass(List.class);
+    verify(intakeDao).doUpsertColumnLineageRow(rows.capture());
+    assertThat(rows.getValue())
+        .extracting(ColumnLineageRow::getInputDatasetFieldUuid)
+        .containsExactly(firstInPostgresOrder, secondInPostgresOrder);
   }
 
   @Test
@@ -841,6 +936,37 @@ public class ColumnLineageDaoTest {
             handle
                 .attach(ColumnLineageDao.class)
                 .upsertColumnLineageRowsForIntakeInTransaction(writes, now));
+  }
+
+  private static int comparePhysicalEdgesInPostgresOrder(
+      ColumnLineageRow left, ColumnLineageRow right) {
+    int compared =
+        compareUuidsInPostgresOrder(
+            left.getOutputDatasetVersionUuid(), right.getOutputDatasetVersionUuid());
+    if (compared != 0) {
+      return compared;
+    }
+    compared =
+        compareUuidsInPostgresOrder(
+            left.getOutputDatasetFieldUuid(), right.getOutputDatasetFieldUuid());
+    if (compared != 0) {
+      return compared;
+    }
+    compared =
+        compareUuidsInPostgresOrder(
+            left.getInputDatasetVersionUuid(), right.getInputDatasetVersionUuid());
+    return compared != 0
+        ? compared
+        : compareUuidsInPostgresOrder(
+            left.getInputDatasetFieldUuid(), right.getInputDatasetFieldUuid());
+  }
+
+  private static int compareUuidsInPostgresOrder(UUID left, UUID right) {
+    int compared =
+        Long.compareUnsigned(left.getMostSignificantBits(), right.getMostSignificantBits());
+    return compared != 0
+        ? compared
+        : Long.compareUnsigned(left.getLeastSignificantBits(), right.getLeastSignificantBits());
   }
 
   private Set<ColumnLineageNodeData> getColumnLineage(UpdateLineageRow lineageRow, String field) {

@@ -119,6 +119,12 @@ public interface SourceDao {
   @Transaction
   default SourceRow upsertOrDefault(
       UUID uuid, String defaultType, Instant now, String defaultName, String defaultConnectionUrl) {
+    return upsertOrDefaultInTransaction(uuid, defaultType, now, defaultName, defaultConnectionUrl);
+  }
+
+  /** Resolves a default source without opening a transaction; the caller owns atomicity. */
+  default SourceRow upsertOrDefaultInTransaction(
+      UUID uuid, String defaultType, Instant now, String defaultName, String defaultConnectionUrl) {
     Optional<SourceRow> existing = findRowByName(defaultName);
     if (existing.isPresent()) {
       return existing.get();

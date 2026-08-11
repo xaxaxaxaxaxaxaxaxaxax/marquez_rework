@@ -8,13 +8,18 @@ package marquez.db;
 import static marquez.db.LineageTestUtils.PRODUCER_URL;
 import static marquez.db.LineageTestUtils.SCHEMA_URL;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.same;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 import com.google.common.collect.ImmutableMap;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -28,6 +33,7 @@ import marquez.service.models.LineageEvent;
 import marquez.service.models.LineageEvent.Dataset;
 import marquez.service.models.LineageEvent.JobFacet;
 import org.jdbi.v3.core.Jdbi;
+import org.jdbi.v3.sqlobject.transaction.Transaction;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -437,6 +443,114 @@ public class DatasetFacetsDaoTest {
     assertThat(batches.getAllValues())
         .extracting(List::size)
         .containsExactly(DatasetFacetsDao.MAX_FACET_CONTAINERS_PER_INSERT, 1);
+  }
+
+  @Test
+  public void testInsertDatasetFacetWritesInTransactionDoesNotCopySingleNonEmptyBatch() {
+    DatasetFacetsDao batchingDao = mock(DatasetFacetsDao.class, CALLS_REAL_METHODS);
+    List<DatasetFacetWrite> writes = new ArrayList<>();
+    writes.add(nonEmptyFacetWrite(UUID.randomUUID(), UUID.randomUUID(), "description"));
+
+    batchingDao.insertDatasetFacetWritesInTransaction(writes);
+
+    verify(batchingDao).doInsertDatasetFacetWrites(same(writes));
+  }
+
+  @Test
+  public void testInsertDatasetFacetWritesInTransactionFiltersBeforeChunking() {
+    DatasetFacetsDao batchingDao = mock(DatasetFacetsDao.class, CALLS_REAL_METHODS);
+    DatasetFacetWrite nonEmptyWrite =
+        nonEmptyFacetWrite(UUID.randomUUID(), UUID.randomUUID(), "description");
+    DatasetFacetWrite emptyWrite =
+        DatasetFacetWrite.forDatasetFacets(
+            Instant.now(),
+            UUID.randomUUID(),
+            UUID.randomUUID(),
+            null,
+            lineageEventTime,
+            null,
+            LineageEvent.DatasetFacets.builder().build());
+    List<DatasetFacetWrite> writes =
+        new ArrayList<>(DatasetFacetsDao.MAX_FACET_CONTAINERS_PER_INSERT + 2);
+    writes.add(emptyWrite);
+    writes.addAll(
+        Collections.nCopies(DatasetFacetsDao.MAX_FACET_CONTAINERS_PER_INSERT + 1, nonEmptyWrite));
+    List<Integer> batchSizes = new ArrayList<>();
+    doAnswer(
+            invocation -> {
+              List<DatasetFacetWrite> batch = invocation.getArgument(0);
+              batchSizes.add(batch.size());
+              assertThat(batch)
+                  .allSatisfy(write -> assertThat(FacetUtils.isEmpty(write.getFacets())).isFalse());
+              return null;
+            })
+        .when(batchingDao)
+        .doInsertDatasetFacetWrites(anyList());
+
+    batchingDao.insertDatasetFacetWritesInTransaction(writes);
+
+    verify(batchingDao, times(2)).doInsertDatasetFacetWrites(anyList());
+    assertThat(batchSizes).containsExactly(DatasetFacetsDao.MAX_FACET_CONTAINERS_PER_INSERT, 1);
+  }
+
+  @Test
+  public void testInsertDatasetFacetWritesKeepsAllChunksAtomic() {
+    UpdateLineageRow lineageRow =
+        createLineageRowWithInputDataset(
+            LineageEvent.DatasetFacets.builder().description("existing-description"));
+    UpdateLineageRow.DatasetRecord datasetRecord = lineageRow.getInputs().orElseThrow().get(0);
+    String facetName = "rollback-" + UUID.randomUUID();
+    DatasetFacetWrite validWrite =
+        nonEmptyFacetWrite(
+            datasetRecord.getDatasetRow().getUuid(),
+            datasetRecord.getDatasetVersionRow().getUuid(),
+            facetName);
+    DatasetFacetWrite invalidWrite =
+        nonEmptyFacetWrite(
+            UUID.randomUUID(), datasetRecord.getDatasetVersionRow().getUuid(), facetName);
+    List<DatasetFacetWrite> writes =
+        new ArrayList<>(DatasetFacetsDao.MAX_FACET_CONTAINERS_PER_INSERT + 1);
+    writes.addAll(
+        Collections.nCopies(DatasetFacetsDao.MAX_FACET_CONTAINERS_PER_INSERT, validWrite));
+    writes.add(invalidWrite);
+
+    assertThatThrownBy(() -> datasetFacetsDao.insertDatasetFacetWrites(writes))
+        .isInstanceOf(RuntimeException.class);
+
+    long insertedRows =
+        jdbi.withHandle(
+            h ->
+                h.createQuery("SELECT count(*) FROM dataset_facets WHERE name = :facetName")
+                    .bind("facetName", facetName)
+                    .mapTo(Long.class)
+                    .one());
+    assertThat(insertedRows).isZero();
+  }
+
+  @Test
+  public void testOnlyPublicWrapperOpensTransaction() throws NoSuchMethodException {
+    assertThat(
+            DatasetFacetsDao.class
+                .getMethod("insertDatasetFacetWrites", List.class)
+                .getAnnotation(Transaction.class))
+        .isNotNull();
+    assertThat(
+            DatasetFacetsDao.class
+                .getMethod("insertDatasetFacetWritesInTransaction", List.class)
+                .getAnnotation(Transaction.class))
+        .isNull();
+  }
+
+  private DatasetFacetWrite nonEmptyFacetWrite(
+      UUID datasetUuid, UUID datasetVersionUuid, String facetName) {
+    return DatasetFacetWrite.forDatasetFacets(
+        Instant.now(),
+        datasetUuid,
+        datasetVersionUuid,
+        null,
+        lineageEventTime,
+        null,
+        LineageEvent.DatasetFacets.builder().additional(Map.of(facetName, "facet-value")).build());
   }
 
   private UpdateLineageRow createLineageRowWithInputDataset(

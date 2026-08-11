@@ -111,8 +111,17 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
                       event.getJob().getNamespace(),
                       createJsonArray(event, mapper),
                       event.getProducer()),
-              () -> notifyListeners(event, updateMarquezModel(event, mapper)));
+              () -> updateMarquezModelAndNotifyListeners(event));
         });
+  }
+
+  private void updateMarquezModelAndNotifyListeners(LineageEvent event) {
+    boolean listenerSnapshotRequired =
+        event.getEventType() != null && runService.hasRunTransitionListeners();
+    UpdateLineageRow update = updateMarquezModel(event, mapper, listenerSnapshotRequired);
+    if (listenerSnapshotRequired) {
+      notifyListeners(event, update);
+    }
   }
 
   private CompletableFuture<Void> submit(Runnable task) {
@@ -147,10 +156,6 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
   }
 
   private void notifyListeners(LineageEvent event, UpdateLineageRow update) {
-    if (event.getEventType() == null || !runService.hasRunTransitionListeners()) {
-      return;
-    }
-
     boolean isStreaming =
         Optional.ofNullable(event.getJob()).map(j -> j.isStreamingJob()).orElse(false);
     if (update.getRunIoSnapshot() != null) {

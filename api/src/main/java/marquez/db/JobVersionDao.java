@@ -219,6 +219,32 @@ public interface JobVersionDao extends BaseDao {
       @Bind("symlinkTargetJobUuid") UUID symlinkTargetJobUuid,
       @Bind("ioType") IoType ioType);
 
+  @SqlUpdate(
+      """
+    WITH requested AS (
+      SELECT 0 AS io_order, input.dataset_uuid, 'INPUT' AS io_type
+      FROM unnest(CAST(:inputDatasetUuids AS uuid[])) input(dataset_uuid)
+      UNION ALL
+      SELECT 1 AS io_order, output.dataset_uuid, 'OUTPUT' AS io_type
+      FROM unnest(CAST(:outputDatasetUuids AS uuid[])) output(dataset_uuid)
+    )
+    INSERT INTO job_versions_io_mapping (
+      job_version_uuid, dataset_uuid, io_type, job_uuid, job_symlink_target_uuid, is_current_job_version, made_current_at)
+    SELECT :jobVersionUuid, requested.dataset_uuid, requested.io_type, :jobUuid,
+      :symlinkTargetJobUuid, TRUE, NOW()
+    FROM requested
+    ORDER BY requested.io_order, requested.dataset_uuid
+    ON CONFLICT (job_version_uuid, dataset_uuid, io_type, job_uuid) DO UPDATE
+    SET is_current_job_version = TRUE
+    WHERE job_versions_io_mapping.is_current_job_version IS DISTINCT FROM TRUE
+  """)
+  void upsertCurrentInputAndOutputDatasetsChunk(
+      @Bind("jobVersionUuid") UUID jobVersionUuid,
+      @Bind("inputDatasetUuids") UUID[] inputDatasetUuids,
+      @Bind("outputDatasetUuids") UUID[] outputDatasetUuids,
+      @Bind("jobUuid") UUID jobUuid,
+      @Bind("symlinkTargetJobUuid") UUID symlinkTargetJobUuid);
+
   /** Compatibility entry point retaining the pre-batching public DAO contract. */
   @Transaction
   default void upsertCurrentInputOrOutputDatasetsFor(
@@ -262,10 +288,31 @@ public interface JobVersionDao extends BaseDao {
     UPDATE job_versions_io_mapping
     SET is_current_job_version = FALSE
     WHERE (job_uuid = :jobUuid OR job_symlink_target_uuid = :jobUuid)
+    AND job_version_uuid != :jobVersionUuid
+    AND io_type IN ('INPUT', 'OUTPUT')
+    AND is_current_job_version = TRUE;
+  """)
+  void markInputAndOutputDatasetsAsPreviousFor(UUID jobVersionUuid, UUID jobUuid);
+
+  @SqlUpdate(
+      """
+    UPDATE job_versions_io_mapping
+    SET is_current_job_version = FALSE
+    WHERE (job_uuid = :jobUuid OR job_symlink_target_uuid = :jobUuid)
     AND io_type = :ioType
     AND is_current_job_version = TRUE;
   """)
   void markInputOrOutputDatasetAsPreviousFor(UUID jobUuid, IoType ioType);
+
+  @SqlUpdate(
+      """
+    UPDATE job_versions_io_mapping
+    SET is_current_job_version = FALSE
+    WHERE (job_uuid = :jobUuid OR job_symlink_target_uuid = :jobUuid)
+    AND io_type IN ('INPUT', 'OUTPUT')
+    AND is_current_job_version = TRUE;
+  """)
+  void markInputAndOutputDatasetsAsPreviousFor(UUID jobUuid);
 
   /**
    * Used to link an input dataset to a given job version.
@@ -314,7 +361,10 @@ public interface JobVersionDao extends BaseDao {
    * surrounding transaction.
    */
   default void flushCurrentJobVersionIoInCurrentTransaction(CurrentJobVersionIoWrite write) {
-    if (!write.inputDatasetUuids().isEmpty()) {
+    if (!write.inputDatasetUuids().isEmpty() && !write.outputDatasetUuids().isEmpty()) {
+      markInputAndOutputDatasetsAsPreviousFor(write.jobVersionUuid(), write.jobUuid());
+      upsertCurrentInputAndOutputDatasetsInCurrentTransaction(write);
+    } else if (!write.inputDatasetUuids().isEmpty()) {
       markInputOrOutputDatasetAsPreviousFor(write.jobVersionUuid(), write.jobUuid(), IoType.INPUT);
       upsertCurrentInputOrOutputDatasetsInCurrentTransaction(
           write.jobVersionUuid(),
@@ -322,8 +372,7 @@ public interface JobVersionDao extends BaseDao {
           write.jobUuid(),
           write.symlinkTargetJobUuid(),
           IoType.INPUT);
-    }
-    if (!write.outputDatasetUuids().isEmpty()) {
+    } else if (!write.outputDatasetUuids().isEmpty()) {
       markInputOrOutputDatasetAsPreviousFor(write.jobVersionUuid(), write.jobUuid(), IoType.OUTPUT);
       upsertCurrentInputOrOutputDatasetsInCurrentTransaction(
           write.jobVersionUuid(),
@@ -331,6 +380,27 @@ public interface JobVersionDao extends BaseDao {
           write.jobUuid(),
           write.symlinkTargetJobUuid(),
           IoType.OUTPUT);
+    }
+  }
+
+  private void upsertCurrentInputAndOutputDatasetsInCurrentTransaction(
+      CurrentJobVersionIoWrite write) {
+    List<UUID> inputDatasetUuids = write.inputDatasetUuids().asList();
+    List<UUID> outputDatasetUuids = write.outputDatasetUuids().asList();
+    int inputFrom = 0;
+    int outputFrom = 0;
+    while (inputFrom < inputDatasetUuids.size() || outputFrom < outputDatasetUuids.size()) {
+      int inputTo = Math.min(inputFrom + JOB_VERSION_IO_BATCH_SIZE, inputDatasetUuids.size());
+      int remainingBatchCapacity = JOB_VERSION_IO_BATCH_SIZE - (inputTo - inputFrom);
+      int outputTo = Math.min(outputFrom + remainingBatchCapacity, outputDatasetUuids.size());
+      upsertCurrentInputAndOutputDatasetsChunk(
+          write.jobVersionUuid(),
+          inputDatasetUuids.subList(inputFrom, inputTo).toArray(UUID[]::new),
+          outputDatasetUuids.subList(outputFrom, outputTo).toArray(UUID[]::new),
+          write.jobUuid(),
+          write.symlinkTargetJobUuid());
+      inputFrom = inputTo;
+      outputFrom = outputTo;
     }
   }
 

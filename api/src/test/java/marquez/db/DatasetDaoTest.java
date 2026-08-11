@@ -14,6 +14,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.Mockito.CALLS_REAL_METHODS;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -36,6 +42,7 @@ import marquez.common.models.NamespaceName;
 import marquez.common.models.RunId;
 import marquez.common.models.SourceName;
 import marquez.db.DatasetDao.DatasetCurrentVersionUpdate;
+import marquez.db.DatasetDao.DatasetUpsert;
 import marquez.db.models.DatasetRow;
 import marquez.db.models.NamespaceRow;
 import marquez.db.models.SourceRow;
@@ -52,6 +59,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 
 @ExtendWith(MarquezJdbiExternalPostgresExtension.class)
 class DatasetDaoTest {
@@ -211,6 +219,208 @@ class DatasetDaoTest {
                       return true;
                     })
                 .one());
+  }
+
+  @Test
+  void testUpsertAllPreservesInputOrderAndSingletonConflictColumns() {
+    Instant createdAt = Instant.parse("2024-01-01T00:00:00Z");
+    Instant updatedAt = createdAt.plusSeconds(60);
+    NamespaceRow originalNamespace =
+        jdbi.onDemand(NamespaceDao.class)
+            .upsertNamespaceRow(
+                UUID.randomUUID(),
+                createdAt,
+                "dataset-bulk-original-namespace",
+                OpenLineageDao.DEFAULT_NAMESPACE_OWNER);
+    SourceRow originalSource =
+        jdbi.onDemand(SourceDao.class)
+            .upsertOrDefault(
+                UUID.randomUUID(), "POSTGRES", createdAt, "dataset-bulk-original-source", "");
+    NamespaceRow replacementNamespace =
+        jdbi.onDemand(NamespaceDao.class)
+            .upsertNamespaceRow(
+                UUID.randomUUID(),
+                createdAt,
+                "dataset-bulk-replacement-namespace",
+                OpenLineageDao.DEFAULT_NAMESPACE_OWNER);
+    SourceRow replacementSource =
+        jdbi.onDemand(SourceDao.class)
+            .upsertOrDefault(
+                UUID.randomUUID(), "POSTGRES", createdAt, "dataset-bulk-replacement-source", "");
+
+    UUID existingUuid = new UUID(0, 1);
+    UUID newUuid = new UUID(0, 2);
+    datasetDao.upsert(
+        existingUuid,
+        DatasetType.DB_TABLE,
+        createdAt,
+        originalNamespace.getUuid(),
+        originalNamespace.getName(),
+        originalSource.getUuid(),
+        originalSource.getName(),
+        "existing-dataset",
+        "existing-physical-name",
+        "existing description",
+        false);
+
+    DatasetUpsert newDataset =
+        newDatasetUpsert(
+            newUuid,
+            DatasetType.DB_TABLE,
+            updatedAt,
+            originalNamespace,
+            originalSource,
+            "new-dataset",
+            "new-physical-name",
+            null,
+            false);
+    DatasetUpsert existingDatasetUpdate =
+        newDatasetUpsert(
+            existingUuid,
+            DatasetType.STREAM,
+            updatedAt,
+            replacementNamespace,
+            replacementSource,
+            "replacement-dataset-name",
+            "updated-physical-name",
+            "updated description",
+            true);
+
+    List<DatasetRow> rows =
+        jdbi.inTransaction(
+            handle ->
+                handle
+                    .attach(DatasetDao.class)
+                    .upsertAllInTransaction(List.of(newDataset, existingDatasetUpdate)));
+
+    assertThat(rows)
+        .extracting(DatasetRow::getUuid)
+        .containsExactly(newDataset.getUuid(), existingDatasetUpdate.getUuid());
+    DatasetRow updated = rows.get(1);
+    assertThat(updated.getType()).isEqualTo(DatasetType.STREAM.name());
+    assertThat(updated.getUpdatedAt()).isEqualTo(updatedAt);
+    assertThat(updated.getNamespaceUuid()).isEqualTo(originalNamespace.getUuid());
+    assertThat(updated.getNamespaceName()).isEqualTo(originalNamespace.getName());
+    assertThat(updated.getSourceUuid()).isEqualTo(originalSource.getUuid());
+    assertThat(updated.getSourceName()).isEqualTo(originalSource.getName());
+    assertThat(updated.getName()).isEqualTo("existing-dataset");
+    assertThat(updated.getPhysicalName()).isEqualTo("updated-physical-name");
+    assertThat(updated.getDescription()).contains("updated description");
+    assertThat(updated.isDeleted()).isTrue();
+  }
+
+  @Test
+  void testUpsertAllFallsBackToSequentialWritesForDuplicateUuids() {
+    Instant now = Instant.parse("2024-01-01T00:00:00Z");
+    NamespaceRow namespace =
+        jdbi.onDemand(NamespaceDao.class)
+            .upsertNamespaceRow(
+                UUID.randomUUID(),
+                now,
+                "dataset-bulk-duplicate-namespace",
+                OpenLineageDao.DEFAULT_NAMESPACE_OWNER);
+    SourceRow source =
+        jdbi.onDemand(SourceDao.class)
+            .upsertOrDefault(
+                UUID.randomUUID(), "POSTGRES", now, "dataset-bulk-duplicate-source", "");
+    UUID duplicateUuid = UUID.randomUUID();
+    DatasetUpsert first =
+        newDatasetUpsert(
+            duplicateUuid,
+            DatasetType.DB_TABLE,
+            now,
+            namespace,
+            source,
+            "duplicate-dataset",
+            "first-physical-name",
+            "first description",
+            false);
+    DatasetUpsert second =
+        newDatasetUpsert(
+            duplicateUuid,
+            DatasetType.STREAM,
+            now.plusSeconds(60),
+            namespace,
+            source,
+            "duplicate-dataset",
+            "second-physical-name",
+            "second description",
+            true);
+
+    List<DatasetRow> rows =
+        jdbi.inTransaction(
+            handle ->
+                handle.attach(DatasetDao.class).upsertAllInTransaction(List.of(first, second)));
+
+    assertThat(rows).hasSize(2);
+    assertThat(rows.get(0).getDescription()).contains("first description");
+    assertThat(rows.get(0).getPhysicalName()).isEqualTo("first-physical-name");
+    assertThat(rows.get(0).isDeleted()).isFalse();
+    assertThat(rows.get(1).getDescription()).contains("second description");
+    assertThat(rows.get(1).getPhysicalName()).isEqualTo("second-physical-name");
+    assertThat(rows.get(1).isDeleted()).isTrue();
+
+    Map<String, Object> stored =
+        jdbi.withHandle(
+            handle ->
+                handle
+                    .createQuery(
+                        """
+                        SELECT type, physical_name, description, is_deleted
+                        FROM datasets
+                        WHERE uuid = :uuid
+                        """)
+                    .bind("uuid", duplicateUuid)
+                    .mapToMap()
+                    .one());
+    assertThat(stored.get("type")).isEqualTo(DatasetType.STREAM.name());
+    assertThat(stored.get("physical_name")).isEqualTo("second-physical-name");
+    assertThat(stored.get("description")).isEqualTo("second description");
+    assertThat(stored.get("is_deleted")).isEqualTo(true);
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  void testUpsertAllUsesBoundedGloballyOrderedChunksAndRestoresInputOrder() {
+    DatasetDao batchingDao = mock(DatasetDao.class, CALLS_REAL_METHODS);
+    Instant now = Instant.parse("2024-01-01T00:00:00Z");
+    UUID namespaceUuid = UUID.randomUUID();
+    UUID sourceUuid = UUID.randomUUID();
+    List<DatasetUpsert> inputs = new ArrayList<>();
+    for (int index = DatasetDao.MAX_DATASETS_PER_UPSERT; index >= 0; index--) {
+      inputs.add(
+          new DatasetUpsert(
+              new UUID(0, index),
+              DatasetType.DB_TABLE,
+              now,
+              namespaceUuid,
+              "bulk-namespace",
+              sourceUuid,
+              "bulk-source",
+              "dataset-" + index,
+              "dataset-" + index,
+              null,
+              false));
+    }
+    when(batchingDao.upsertAllChunk(anyList()))
+        .thenAnswer(
+            invocation ->
+                ((List<?>) invocation.getArgument(0))
+                    .stream()
+                        .map(DatasetUpsert.class::cast)
+                        .map(DatasetDaoTest::datasetRowFor)
+                        .toList());
+
+    List<DatasetRow> rows = batchingDao.upsertAllInTransaction(inputs);
+
+    ArgumentCaptor<List<DatasetUpsert>> chunks = ArgumentCaptor.forClass(List.class);
+    verify(batchingDao, times(2)).upsertAllChunk(chunks.capture());
+    assertThat(chunks.getAllValues()).extracting(List::size).containsExactly(1000, 1);
+    assertThat(chunks.getAllValues().stream().flatMap(List::stream).map(DatasetUpsert::getUuid))
+        .isSorted();
+    assertThat(rows)
+        .extracting(DatasetRow::getUuid)
+        .containsExactlyElementsOf(inputs.stream().map(DatasetUpsert::getUuid).toList());
   }
 
   @Test
@@ -789,6 +999,48 @@ class DatasetDaoTest {
         source.getName(),
         name,
         name);
+  }
+
+  private static DatasetUpsert newDatasetUpsert(
+      UUID uuid,
+      DatasetType type,
+      Instant now,
+      NamespaceRow namespace,
+      SourceRow source,
+      String name,
+      String physicalName,
+      String description,
+      boolean deleted) {
+    return new DatasetUpsert(
+        uuid,
+        type,
+        now,
+        namespace.getUuid(),
+        namespace.getName(),
+        source.getUuid(),
+        source.getName(),
+        name,
+        physicalName,
+        description,
+        deleted);
+  }
+
+  private static DatasetRow datasetRowFor(DatasetUpsert dataset) {
+    return new DatasetRow(
+        dataset.getUuid(),
+        dataset.getType().name(),
+        dataset.getNow(),
+        dataset.getNow(),
+        dataset.getNamespaceUuid(),
+        dataset.getNamespaceName(),
+        dataset.getSourceUuid(),
+        dataset.getSourceName(),
+        dataset.getName(),
+        dataset.getPhysicalName(),
+        null,
+        dataset.getDescription(),
+        null,
+        dataset.isDeleted());
   }
 
   @Getter

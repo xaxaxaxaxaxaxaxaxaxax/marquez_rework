@@ -133,28 +133,15 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
     ArgumentCaptor<UUID[]> inputUuids = ArgumentCaptor.forClass(UUID[].class);
     ArgumentCaptor<UUID[]> outputUuids = ArgumentCaptor.forClass(UUID[].class);
     InOrder writes = inOrder(batchingDao);
+    writes.verify(batchingDao).markInputAndOutputDatasetsAsPreviousFor(jobVersionUuid, jobUuid);
     writes
         .verify(batchingDao)
-        .markInputOrOutputDatasetAsPreviousFor(jobVersionUuid, jobUuid, INPUT);
-    writes
-        .verify(batchingDao)
-        .upsertCurrentInputOrOutputDatasetsChunk(
+        .upsertCurrentInputAndOutputDatasetsChunk(
             eq(jobVersionUuid),
             inputUuids.capture(),
-            eq(jobUuid),
-            eq(symlinkTargetJobUuid),
-            eq(INPUT));
-    writes
-        .verify(batchingDao)
-        .markInputOrOutputDatasetAsPreviousFor(jobVersionUuid, jobUuid, OUTPUT);
-    writes
-        .verify(batchingDao)
-        .upsertCurrentInputOrOutputDatasetsChunk(
-            eq(jobVersionUuid),
             outputUuids.capture(),
             eq(jobUuid),
-            eq(symlinkTargetJobUuid),
-            eq(OUTPUT));
+            eq(symlinkTargetJobUuid));
     assertThat(inputUuids.getValue()).containsExactly(firstInputUuid, secondInputUuid);
     assertThat(outputUuids.getValue()).containsExactly(firstOutputUuid, secondOutputUuid);
   }
@@ -179,6 +166,15 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
             any(UUID.class),
             any(UUID.class),
             any(JobVersionDao.IoType.class));
+    verify(batchingDao, never())
+        .markInputAndOutputDatasetsAsPreviousFor(any(UUID.class), any(UUID.class));
+    verify(batchingDao, never())
+        .upsertCurrentInputAndOutputDatasetsChunk(
+            any(UUID.class),
+            any(UUID[].class),
+            any(UUID[].class),
+            any(UUID.class),
+            any(UUID.class));
   }
 
   @Test
@@ -208,6 +204,165 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
                 .collect(Collectors.toList()));
     assertThat(chunks.getAllValues().get(1))
         .containsExactly(new UUID(0L, JobVersionDao.JOB_VERSION_IO_BATCH_SIZE + 1L));
+  }
+
+  @Test
+  public void testOutputOnlyIoWriteRetainsPerSideCompatibilityPath() {
+    JobVersionDao batchingDao = mock(JobVersionDao.class, CALLS_REAL_METHODS);
+    UUID jobVersionUuid = UUID.randomUUID();
+    UUID jobUuid = UUID.randomUUID();
+    UUID outputUuid = UUID.randomUUID();
+
+    batchingDao.flushCurrentJobVersionIoInCurrentTransaction(
+        JobVersionDao.CurrentJobVersionIoWrite.of(
+            jobVersionUuid, jobUuid, null, List.of(), List.of(outputUuid)));
+
+    verify(batchingDao).markInputOrOutputDatasetAsPreviousFor(jobVersionUuid, jobUuid, OUTPUT);
+    ArgumentCaptor<UUID[]> outputUuids = ArgumentCaptor.forClass(UUID[].class);
+    verify(batchingDao)
+        .upsertCurrentInputOrOutputDatasetsChunk(
+            eq(jobVersionUuid), outputUuids.capture(), eq(jobUuid), eq(null), eq(OUTPUT));
+    assertThat(outputUuids.getValue()).containsExactly(outputUuid);
+    verify(batchingDao, never())
+        .markInputAndOutputDatasetsAsPreviousFor(any(UUID.class), any(UUID.class));
+    verify(batchingDao, never())
+        .upsertCurrentInputAndOutputDatasetsChunk(
+            any(UUID.class),
+            any(UUID[].class),
+            any(UUID[].class),
+            any(UUID.class),
+            any(UUID.class));
+  }
+
+  @Test
+  public void testBothSidedIoWriteUsesTotalPairBatchLimitAndInputBeforeOutputOrder() {
+    JobVersionDao batchingDao = mock(JobVersionDao.class, CALLS_REAL_METHODS);
+    UUID jobVersionUuid = UUID.randomUUID();
+    UUID jobUuid = UUID.randomUUID();
+    List<UUID> descendingInputUuids = new ArrayList<>();
+    List<UUID> descendingOutputUuids = new ArrayList<>();
+    for (long value = 750; value > 0; value--) {
+      descendingInputUuids.add(new UUID(0L, value));
+    }
+    for (long value = 1750; value > 1000; value--) {
+      descendingOutputUuids.add(new UUID(0L, value));
+    }
+
+    batchingDao.flushCurrentJobVersionIoInCurrentTransaction(
+        JobVersionDao.CurrentJobVersionIoWrite.of(
+            jobVersionUuid, jobUuid, null, descendingInputUuids, descendingOutputUuids));
+
+    verify(batchingDao).markInputAndOutputDatasetsAsPreviousFor(jobVersionUuid, jobUuid);
+    ArgumentCaptor<UUID[]> inputChunks = ArgumentCaptor.forClass(UUID[].class);
+    ArgumentCaptor<UUID[]> outputChunks = ArgumentCaptor.forClass(UUID[].class);
+    verify(batchingDao, times(2))
+        .upsertCurrentInputAndOutputDatasetsChunk(
+            eq(jobVersionUuid),
+            inputChunks.capture(),
+            outputChunks.capture(),
+            eq(jobUuid),
+            eq(null));
+
+    assertThat(inputChunks.getAllValues().get(0))
+        .containsExactlyElementsOf(
+            java.util.stream.LongStream.rangeClosed(1, 750)
+                .mapToObj(value -> new UUID(0L, value))
+                .collect(Collectors.toList()));
+    assertThat(outputChunks.getAllValues().get(0))
+        .containsExactlyElementsOf(
+            java.util.stream.LongStream.rangeClosed(1001, 1250)
+                .mapToObj(value -> new UUID(0L, value))
+                .collect(Collectors.toList()));
+    assertThat(inputChunks.getAllValues().get(1)).isEmpty();
+    assertThat(outputChunks.getAllValues().get(1))
+        .containsExactlyElementsOf(
+            java.util.stream.LongStream.rangeClosed(1251, 1750)
+                .mapToObj(value -> new UUID(0L, value))
+                .collect(Collectors.toList()));
+    for (int index = 0; index < inputChunks.getAllValues().size(); index++) {
+      assertThat(
+              inputChunks.getAllValues().get(index).length
+                  + outputChunks.getAllValues().get(index).length)
+          .isLessThanOrEqualTo(JobVersionDao.JOB_VERSION_IO_BATCH_SIZE);
+    }
+  }
+
+  @Test
+  public void testCombinedIoWriteInvalidatesBothSidesAndPreservesMadeCurrentAt() {
+    JobRow combinedJob =
+        DbTestUtils.newJob(jdbiForTesting, namespaceRow.getName(), newJobName().getValue());
+    String inputName = "combined-input-" + UUID.randomUUID();
+    String outputName = "combined-output-" + UUID.randomUUID();
+    DbTestUtils.newDataset(jdbiForTesting, namespaceRow.getName(), inputName);
+    DbTestUtils.newDataset(jdbiForTesting, namespaceRow.getName(), outputName);
+    UUID inputUuid =
+        datasetDao.findDatasetAsRow(namespaceRow.getName(), inputName).orElseThrow().getUuid();
+    UUID outputUuid =
+        datasetDao.findDatasetAsRow(namespaceRow.getName(), outputName).orElseThrow().getUuid();
+    ExtendedJobVersionRow oldVersion =
+        DbTestUtils.newJobVersion(
+            jdbiForTesting,
+            combinedJob.getUuid(),
+            UUID.randomUUID(),
+            combinedJob.getName(),
+            namespaceRow.getUuid(),
+            namespaceRow.getName());
+    ExtendedJobVersionRow newVersion =
+        DbTestUtils.newJobVersion(
+            jdbiForTesting,
+            combinedJob.getUuid(),
+            UUID.randomUUID(),
+            combinedJob.getName(),
+            namespaceRow.getUuid(),
+            namespaceRow.getName());
+
+    flushCombinedIo(oldVersion, combinedJob, inputUuid, outputUuid);
+    flushCombinedIo(newVersion, combinedJob, inputUuid, outputUuid);
+
+    assertThat(countMappings(oldVersion.getUuid(), INPUT, false)).isEqualTo(1);
+    assertThat(countMappings(oldVersion.getUuid(), OUTPUT, false)).isEqualTo(1);
+    assertThat(countMappings(newVersion.getUuid(), INPUT, true)).isEqualTo(1);
+    assertThat(countMappings(newVersion.getUuid(), OUTPUT, true)).isEqualTo(1);
+
+    Instant sentinel = Instant.parse("2000-01-01T00:00:00Z");
+    jdbiForTesting.useHandle(
+        handle ->
+            handle
+                .createUpdate(
+                    """
+                    UPDATE job_versions_io_mapping
+                    SET made_current_at = :sentinel,
+                        is_current_job_version = FALSE
+                    WHERE job_version_uuid = :jobVersionUuid
+                    """)
+                .bind("sentinel", sentinel)
+                .bind("jobVersionUuid", newVersion.getUuid())
+                .execute());
+
+    flushCombinedIo(newVersion, combinedJob, inputUuid, outputUuid);
+
+    int currentMappingsWithSentinel =
+        jdbiForTesting.withHandle(
+            handle ->
+                handle
+                    .createQuery(
+                        """
+                        SELECT count(*)
+                        FROM job_versions_io_mapping
+                        WHERE job_version_uuid = :jobVersionUuid
+                          AND io_type IN ('INPUT', 'OUTPUT')
+                          AND is_current_job_version = TRUE
+                          AND made_current_at = :sentinel
+                        """)
+                    .bind("jobVersionUuid", newVersion.getUuid())
+                    .bind("sentinel", sentinel)
+                    .mapTo(Integer.class)
+                    .one());
+    assertThat(currentMappingsWithSentinel).isEqualTo(2);
+
+    jobVersionDao.markInputAndOutputDatasetsAsPreviousFor(combinedJob.getUuid());
+    assertThat(countMappings(newVersion.getUuid(), INPUT, false)).isEqualTo(1);
+    assertThat(countMappings(newVersion.getUuid(), OUTPUT, false)).isEqualTo(1);
   }
 
   @Test
@@ -979,6 +1134,21 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
                             .one())
                 .intValue())
         .isEqualTo(2);
+  }
+
+  private void flushCombinedIo(
+      ExtendedJobVersionRow jobVersion, JobRow job, UUID inputUuid, UUID outputUuid) {
+    jdbiForTesting.useTransaction(
+        handle ->
+            handle
+                .attach(JobVersionDao.class)
+                .flushCurrentJobVersionIoInCurrentTransaction(
+                    JobVersionDao.CurrentJobVersionIoWrite.of(
+                        jobVersion.getUuid(),
+                        job.getUuid(),
+                        job.getSymlinkTargetId(),
+                        List.of(inputUuid),
+                        List.of(outputUuid))));
   }
 
   private int countMappings(UUID jobVersionUuid, JobVersionDao.IoType ioType, boolean current) {

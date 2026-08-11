@@ -199,7 +199,40 @@ public interface DatasetFacetsDao {
    */
   @Transaction
   default void insertDatasetFacetWrites(@NonNull List<DatasetFacetWrite> writes) {
-    List<DatasetFacetWrite> batch = new ArrayList<>(MAX_FACET_CONTAINERS_PER_INSERT);
+    insertDatasetFacetWritesInTransaction(writes);
+  }
+
+  /**
+   * Flushes serialized facet containers without opening a transaction. Callers must already own the
+   * transaction when multiple chunks need to commit atomically.
+   */
+  default void insertDatasetFacetWritesInTransaction(@NonNull List<DatasetFacetWrite> writes) {
+    int nonEmptyWrites = 0;
+    for (DatasetFacetWrite write : writes) {
+      if (!FacetUtils.isEmpty(write.getFacets())) {
+        nonEmptyWrites++;
+      }
+    }
+
+    if (nonEmptyWrites == 0) {
+      return;
+    }
+
+    // When no filtering is needed, pass the list (or bounded views of it) directly to Jdbi
+    // instead of copying every reference into another pre-sized list.
+    if (nonEmptyWrites == writes.size()) {
+      for (int start = 0; start < writes.size(); start += MAX_FACET_CONTAINERS_PER_INSERT) {
+        int end = Math.min(start + MAX_FACET_CONTAINERS_PER_INSERT, writes.size());
+        doInsertDatasetFacetWrites(
+            start == 0 && end == writes.size() ? writes : writes.subList(start, end));
+      }
+      return;
+    }
+
+    // Allocate one right-sized filter buffer only when callers supply empty containers, and reuse
+    // it after each synchronous Jdbi write.
+    List<DatasetFacetWrite> batch =
+        new ArrayList<>(Math.min(nonEmptyWrites, MAX_FACET_CONTAINERS_PER_INSERT));
     for (DatasetFacetWrite write : writes) {
       if (FacetUtils.isEmpty(write.getFacets())) {
         continue;
@@ -207,7 +240,7 @@ public interface DatasetFacetsDao {
       batch.add(write);
       if (batch.size() == MAX_FACET_CONTAINERS_PER_INSERT) {
         doInsertDatasetFacetWrites(batch);
-        batch = new ArrayList<>(MAX_FACET_CONTAINERS_PER_INSERT);
+        batch.clear();
       }
     }
     if (!batch.isEmpty()) {
