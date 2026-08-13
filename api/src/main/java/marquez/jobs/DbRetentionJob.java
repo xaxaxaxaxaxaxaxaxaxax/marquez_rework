@@ -19,17 +19,26 @@ import org.jdbi.v3.core.Jdbi;
  * Marquez. Use {@code frequencyMins} in {@link DbRetentionConfig} to override the default job run
  * frequency interval of {@code 15} mins. You can also use {@code retentionDays} to override the
  * default retention policy of {@code 7} days; metadata with a collection date {@code >
- * retentionDays} will be deleted. To limit the number of metadata purged per retention execution
- * and reduce impact on the database, we recommend adjusting {@code numberOfRowsPerBatch}.
+ * retentionDays} will be deleted. Each legacy metadata delete is limited to {@code
+ * numberOfRowsPerBatch}, but one retention invocation may execute multiple such chunks; this value
+ * is not a total metadata-row limit per invocation. Each invocation that reaches dead-letter
+ * retention removes at most one such batch of queued OpenLineage dead letters older than {@code
+ * retentionDays}; live queued events are never removed by age. If this job is not configured,
+ * queued dead letters are retained indefinitely unless retention is invoked manually.
  */
 @Slf4j
 public class DbRetentionJob extends AbstractScheduledService implements Managed {
   private static final Duration NO_DELAY = Duration.ofMinutes(0);
 
+  @FunctionalInterface
+  interface RetentionIteration {
+    void run(Jdbi jdbi, int numberOfRowsPerBatch, int retentionDays) throws DbRetentionException;
+  }
+
   /* The retention policy frequency. */
   private final int frequencyMins;
 
-  /* The number of rows deleted per batch. */
+  /* The legacy metadata delete chunk size and per-invocation dead-letter limit. */
   private final int numberOfRowsPerBatch;
 
   /* The retention days. */
@@ -37,20 +46,29 @@ public class DbRetentionJob extends AbstractScheduledService implements Managed 
 
   private final Scheduler fixedRateScheduler;
   private final Jdbi jdbi;
+  private final RetentionIteration retentionIteration;
 
   /**
-   * Constructs a {@code DbRetentionJob} with a run frequency {@code frequencyMins}, chunk size of
-   * {@code numberOfRowsPerBatch} that can be deleted per retention job execution and retention days
-   * of {@code retentionDays}.
+   * Constructs a {@code DbRetentionJob} with run frequency {@code frequencyMins}, legacy metadata
+   * delete chunk size and per-invocation dead-letter limit {@code numberOfRowsPerBatch}, and
+   * retention period {@code retentionDays}.
    */
   public DbRetentionJob(
       @NonNull final Jdbi jdbi, @NonNull final DbRetentionConfig dbRetentionConfig) {
+    this(jdbi, dbRetentionConfig, DbRetention::retentionOnDbOrError);
+  }
+
+  DbRetentionJob(
+      @NonNull final Jdbi jdbi,
+      @NonNull final DbRetentionConfig dbRetentionConfig,
+      @NonNull final RetentionIteration retentionIteration) {
     this.frequencyMins = dbRetentionConfig.getFrequencyMins();
     this.numberOfRowsPerBatch = dbRetentionConfig.getNumberOfRowsPerBatch();
     this.retentionDays = dbRetentionConfig.getRetentionDays();
 
     // Connection to database retention policy will be applied.
     this.jdbi = jdbi;
+    this.retentionIteration = retentionIteration;
 
     // Define fixed schedule with no delay.
     this.fixedRateScheduler =
@@ -76,12 +94,13 @@ public class DbRetentionJob extends AbstractScheduledService implements Managed 
   @Override
   protected void runOneIteration() {
     try {
-      // Attempt to apply a database retention policy. An exception is thrown on failed retention
-      // policy attempts requiring we handle the throwable and log the error.
-      DbRetention.retentionOnDbOrError(jdbi, numberOfRowsPerBatch, retentionDays);
-    } catch (DbRetentionException errorOnDbRetention) {
+      // Keep the scheduled service running after retention or database failures so the next
+      // iteration can retry.
+      retentionIteration.run(jdbi, numberOfRowsPerBatch, retentionDays);
+    } catch (DbRetentionException | RuntimeException errorOnDbRetention) {
       log.error(
-          "Failed to apply retention policy of '{}' days to database!",
+          "Failed to apply retention policy of '{}' days to database; "
+              + "retrying on the next scheduled run.",
           retentionDays,
           errorOnDbRetention);
     }

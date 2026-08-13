@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -42,6 +43,7 @@ import marquez.service.models.JobMeta;
 import marquez.service.models.LineageEvent.SchemaField;
 import marquez.service.models.Run;
 import marquez.service.models.RunMeta;
+import org.jdbi.v3.sqlobject.config.RegisterConstructorMapper;
 import org.jdbi.v3.sqlobject.config.RegisterRowMapper;
 import org.jdbi.v3.sqlobject.customizer.Bind;
 import org.jdbi.v3.sqlobject.statement.SqlQuery;
@@ -171,6 +173,292 @@ public interface RunDao extends BaseDao {
 """)
   Optional<JobRow> findJobRowByRunUuid(UUID uuid);
 
+  /** Inserts an identity-only parent placeholder without ever updating an existing real run. */
+  @SqlUpdate(
+      """
+      INSERT INTO runs (
+          uuid, created_at, updated_at, external_id, job_uuid, run_args_uuid,
+          namespace_name, job_name, open_lineage_parent_placeholder)
+      VALUES (
+          :runUuid, :neutralTime, :neutralTime, :externalId, :jobUuid, :runArgsUuid,
+          :namespaceName, :jobName, TRUE)
+      ON CONFLICT (uuid) DO NOTHING
+      """)
+  int insertSyntheticParentRunIfAbsent(
+      UUID runUuid,
+      Instant neutralTime,
+      String externalId,
+      UUID jobUuid,
+      UUID runArgsUuid,
+      String namespaceName,
+      String jobName);
+
+  /** Locks every existing candidate in PostgreSQL UUID order and reports its canonical owner. */
+  @SqlQuery(
+      """
+      SELECT r.uuid,
+             canonical.uuid AS canonical_job_uuid,
+             r.external_id,
+             r.open_lineage_parent_placeholder AS parent_placeholder
+      FROM runs AS r
+      JOIN jobs AS owner ON owner.uuid = r.job_uuid
+      JOIN jobs AS canonical
+        ON canonical.uuid = COALESCE(owner.symlink_target_uuid, owner.uuid)
+      WHERE r.uuid = ANY(CAST(:runUuids AS uuid[]))
+      ORDER BY r.uuid
+      FOR UPDATE OF r
+      """)
+  @RegisterConstructorMapper(OpenLineageRunCandidate.class)
+  List<OpenLineageRunCandidate> lockOpenLineageRunCandidates(@Bind("runUuids") UUID[] runUuids);
+
+  /** Inserts a real OpenLineage run directly; a conflict is inspected by the bounded resolver. */
+  @SqlQuery(
+      """
+      INSERT INTO runs (
+          uuid, parent_run_uuid, external_id, created_at, updated_at, job_uuid,
+          job_version_uuid, run_args_uuid, nominal_start_time, nominal_end_time,
+          current_run_state, transitioned_at, namespace_name, job_name, location,
+          open_lineage_parent_placeholder)
+      VALUES (
+          :runUuid, :parentRunUuid, :externalId, :now, :now, :jobUuid,
+          :jobVersionUuid, :runArgsUuid, :nominalStartTime, :nominalEndTime,
+          :runStateType, :runStateTime, :namespaceName, :jobName, :location, NULL)
+      ON CONFLICT (uuid) DO NOTHING
+      RETURNING *
+      """)
+  Optional<RunRow> insertOpenLineageRunIfAbsent(
+      UUID runUuid,
+      UUID parentRunUuid,
+      String externalId,
+      Instant now,
+      UUID jobUuid,
+      UUID jobVersionUuid,
+      UUID runArgsUuid,
+      Instant nominalStartTime,
+      Instant nominalEndTime,
+      RunState runStateType,
+      Instant runStateTime,
+      String namespaceName,
+      String jobName,
+      String location);
+
+  /** Updates only a candidate whose identity was locked and rechecked by the resolver. */
+  @SqlQuery(
+      """
+      UPDATE runs AS r
+      SET parent_run_uuid = COALESCE(r.parent_run_uuid, :parentRunUuid),
+          updated_at = :now,
+          current_run_state = CASE WHEN :hasRunState
+              THEN CAST(:runStateType AS varchar) ELSE r.current_run_state END,
+          transitioned_at = CASE WHEN :hasRunState
+              THEN :runStateTime ELSE r.transitioned_at END,
+          nominal_start_time = COALESCE(:nominalStartTime, r.nominal_start_time),
+          nominal_end_time = COALESCE(:nominalEndTime, r.nominal_end_time),
+          location = :location,
+          created_at = CASE WHEN r.open_lineage_parent_placeholder IS TRUE
+              THEN :now ELSE r.created_at END,
+          run_args_uuid = CASE WHEN r.open_lineage_parent_placeholder IS TRUE
+              THEN :runArgsUuid ELSE r.run_args_uuid END,
+          open_lineage_parent_placeholder = NULL
+      FROM jobs AS owner
+      WHERE r.uuid = :runUuid
+        AND owner.uuid = r.job_uuid
+        AND COALESCE(owner.symlink_target_uuid, owner.uuid) = :jobUuid
+        AND r.external_id IS NOT DISTINCT FROM :lockedExternalId
+      RETURNING r.*
+      """)
+  Optional<RunRow> updateLockedOpenLineageRun(
+      UUID runUuid,
+      String lockedExternalId,
+      UUID parentRunUuid,
+      Instant now,
+      UUID jobUuid,
+      UUID runArgsUuid,
+      Instant nominalStartTime,
+      Instant nominalEndTime,
+      boolean hasRunState,
+      RunState runStateType,
+      Instant runStateTime,
+      String location);
+
+  /**
+   * Resolves a neutral parent over the normal and legacy job-scoped identities and one repair of
+   * each. The caller must already hold the canonical parent-job lock.
+   */
+  default RunRow getOrCreateSyntheticParentRun(
+      UUID requestedRunUuid,
+      String externalId,
+      UUID parentJobUuid,
+      UUID runArgsUuid,
+      String parentNamespaceName,
+      String parentJobName) {
+    Objects.requireNonNull(requestedRunUuid, "requestedRunUuid");
+    requireOpenLineageRunIdentity(externalId, parentJobUuid, parentNamespaceName, parentJobName);
+    List<UUID> candidates =
+        openLineageRunCandidates(externalId, parentNamespaceName, parentJobName, requestedRunUuid);
+    Optional<OpenLineageRunCandidate> match =
+        uniqueMatchingOpenLineageRun(candidates, parentJobUuid, externalId);
+    if (match.isPresent()) {
+      return findRunByUuidAsRow(match.get().uuid()).orElseThrow();
+    }
+    for (UUID candidate : candidates) {
+      if (insertSyntheticParentRunIfAbsent(
+              candidate,
+              Instant.EPOCH,
+              externalId,
+              parentJobUuid,
+              Objects.requireNonNull(runArgsUuid, "runArgsUuid"),
+              parentNamespaceName,
+              parentJobName)
+          == 1) {
+        return findRunByUuidAsRow(candidate).orElseThrow();
+      }
+      match = uniqueMatchingOpenLineageRun(candidates, parentJobUuid, externalId);
+      if (match.isPresent()) {
+        return findRunByUuidAsRow(match.get().uuid()).orElseThrow();
+      }
+    }
+    throw new IllegalStateException(
+        "No bounded OpenLineage parent-run identity is available for " + externalId);
+  }
+
+  /**
+   * Inserts or promotes an observed OpenLineage run and returns its effective UUID. The caller must
+   * already hold the canonical job lock and must use the returned row for every dependent write.
+   */
+  default RunRow upsertOpenLineageRun(RunUpsert runUpsert) {
+    Objects.requireNonNull(runUpsert, "runUpsert");
+    requireOpenLineageRunIdentity(
+        runUpsert.externalId(),
+        runUpsert.jobUuid(),
+        runUpsert.namespaceName(),
+        runUpsert.jobName());
+    UUID normal = Utils.openLineageRunUuid(runUpsert.externalId());
+    List<UUID> candidates =
+        openLineageRunCandidates(
+            runUpsert.externalId(), runUpsert.namespaceName(), runUpsert.jobName(), normal);
+    Optional<OpenLineageRunCandidate> match =
+        uniqueMatchingOpenLineageRun(candidates, runUpsert.jobUuid(), runUpsert.externalId());
+    if (match.isPresent()) {
+      return updateMatchedOpenLineageRun(match.get(), runUpsert);
+    }
+    for (UUID candidate : candidates) {
+      Optional<RunRow> inserted = insertOpenLineageRunIfAbsent(candidate, runUpsert);
+      if (inserted.isPresent()) {
+        return inserted.get();
+      }
+      match = uniqueMatchingOpenLineageRun(candidates, runUpsert.jobUuid(), runUpsert.externalId());
+      if (match.isPresent()) {
+        return updateMatchedOpenLineageRun(match.get(), runUpsert);
+      }
+    }
+    throw new IllegalStateException(
+        "No bounded OpenLineage run identity is available for " + runUpsert.externalId());
+  }
+
+  private Optional<RunRow> insertOpenLineageRunIfAbsent(UUID candidate, RunUpsert runUpsert) {
+    return insertOpenLineageRunIfAbsent(
+        candidate,
+        runUpsert.parentRunUuid(),
+        runUpsert.externalId(),
+        Objects.requireNonNull(runUpsert.now(), "now"),
+        runUpsert.jobUuid(),
+        runUpsert.jobVersionUuid(),
+        Objects.requireNonNull(runUpsert.runArgsUuid(), "runArgsUuid"),
+        runUpsert.nominalStartTime(),
+        runUpsert.nominalEndTime(),
+        runUpsert.runStateType(),
+        runUpsert.runStateTime(),
+        runUpsert.namespaceName(),
+        runUpsert.jobName(),
+        runUpsert.location());
+  }
+
+  private RunRow updateMatchedOpenLineageRun(
+      OpenLineageRunCandidate candidate, RunUpsert runUpsert) {
+    return updateLockedOpenLineageRun(
+            candidate.uuid(),
+            candidate.externalId(),
+            runUpsert.parentRunUuid(),
+            Objects.requireNonNull(runUpsert.now(), "now"),
+            runUpsert.jobUuid(),
+            Objects.requireNonNull(runUpsert.runArgsUuid(), "runArgsUuid"),
+            runUpsert.nominalStartTime(),
+            runUpsert.nominalEndTime(),
+            runUpsert.runStateType() != null,
+            runUpsert.runStateType(),
+            runUpsert.runStateTime(),
+            runUpsert.location())
+        .orElseThrow(
+            () ->
+                new IllegalStateException(
+                    "Locked OpenLineage run changed identity: " + candidate.uuid()));
+  }
+
+  private Optional<OpenLineageRunCandidate> uniqueMatchingOpenLineageRun(
+      List<UUID> candidates, UUID canonicalJobUuid, String externalId) {
+    String normalizedExternalId = normalizeOpenLineageExternalId(externalId);
+    List<OpenLineageRunCandidate> matches =
+        lockOpenLineageRunCandidates(candidates.toArray(UUID[]::new)).stream()
+            .filter(candidate -> canonicalJobUuid.equals(candidate.canonicalJobUuid()))
+            .filter(
+                candidate ->
+                    candidate.externalId() != null
+                        && normalizedExternalId.equals(
+                            normalizeOpenLineageExternalId(candidate.externalId())))
+            .toList();
+    if (matches.size() > 1) {
+      throw new IllegalStateException(
+          "Multiple OpenLineage runs match canonical job "
+              + canonicalJobUuid
+              + " and external ID "
+              + externalId
+              + ": "
+              + matches.stream().map(OpenLineageRunCandidate::uuid).toList());
+    }
+    return matches.stream().findFirst();
+  }
+
+  private static List<UUID> openLineageRunCandidates(
+      String externalId, String namespaceName, String jobName, UUID preferred) {
+    String normalizedExternalId = normalizeOpenLineageExternalId(externalId);
+    UUID normal = Utils.openLineageRunUuid(normalizedExternalId);
+    UUID legacy = Utils.toNameBasedUuid(namespaceName, jobName, normalizedExternalId);
+    if (!preferred.equals(normal) && !preferred.equals(legacy)) {
+      throw new IllegalArgumentException(
+          "preferred OpenLineage run UUID is neither the normal nor legacy identity");
+    }
+    List<UUID> bases = preferred.equals(normal) ? List.of(normal, legacy) : List.of(legacy, normal);
+    LinkedHashSet<UUID> bounded = new LinkedHashSet<>();
+    for (UUID base : bases) {
+      bounded.add(base);
+      bounded.add(Utils.toNameBasedUuid(namespaceName, jobName, base.toString()));
+    }
+    if (bounded.size() > 4) {
+      throw new IllegalStateException("OpenLineage run candidate set exceeded its bound");
+    }
+    return List.copyOf(bounded);
+  }
+
+  private static void requireOpenLineageRunIdentity(
+      String externalId, UUID jobUuid, String namespaceName, String jobName) {
+    Utils.requireOpenLineageIdentity(externalId, "run external ID");
+    Objects.requireNonNull(jobUuid, "jobUuid");
+    Utils.requireOpenLineageIdentity(namespaceName, "run namespace");
+    Utils.requireOpenLineageIdentity(jobName, "run job name");
+  }
+
+  private static String normalizeOpenLineageExternalId(String externalId) {
+    try {
+      return UUID.fromString(externalId).toString();
+    } catch (IllegalArgumentException ignored) {
+      return externalId;
+    }
+  }
+
+  record OpenLineageRunCandidate(
+      UUID uuid, UUID canonicalJobUuid, String externalId, Boolean parentPlaceholder) {}
+
   @SqlQuery(
       """
           WITH filtered_jobs AS (
@@ -230,6 +518,7 @@ public interface RunDao extends BaseDao {
           + ":location "
           + ") ON CONFLICT(uuid) DO "
           + "UPDATE SET "
+          + "parent_run_uuid = COALESCE(runs.parent_run_uuid, EXCLUDED.parent_run_uuid), "
           + "external_id = EXCLUDED.external_id, "
           + "updated_at = EXCLUDED.updated_at, "
           + "current_run_state = EXCLUDED.current_run_state, "
@@ -285,6 +574,7 @@ public interface RunDao extends BaseDao {
           + ":location "
           + ") ON CONFLICT(uuid) DO "
           + "UPDATE SET "
+          + "parent_run_uuid = COALESCE(runs.parent_run_uuid, EXCLUDED.parent_run_uuid), "
           + "external_id = EXCLUDED.external_id, "
           + "updated_at = EXCLUDED.updated_at, "
           + "nominal_start_time = COALESCE(EXCLUDED.nominal_start_time, runs.nominal_start_time), "

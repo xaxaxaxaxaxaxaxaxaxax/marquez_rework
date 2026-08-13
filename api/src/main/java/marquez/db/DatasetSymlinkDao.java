@@ -208,6 +208,22 @@ public interface DatasetSymlinkDao extends BaseDao {
   void doUpsertDatasetSymlinkRow(
       UUID uuid, String name, UUID namespaceUuid, boolean isPrimary, String type, Instant now);
 
+  /** Raw OpenLineage namespace alias whose canonical target is the sanitized primary identity. */
+  @SqlUpdate(
+      """
+          INSERT INTO dataset_symlinks (
+              dataset_uuid, name, namespace_uuid, is_primary, type, created_at, updated_at)
+          VALUES (:datasetUuid, :name, :namespaceUuid, false, NULL, :now, :now)
+          ON CONFLICT (name, namespace_uuid) DO UPDATE
+          SET dataset_uuid = EXCLUDED.dataset_uuid,
+              is_primary = false,
+              type = NULL,
+              updated_at = GREATEST(dataset_symlinks.updated_at, EXCLUDED.updated_at)
+          WHERE dataset_symlinks.dataset_uuid = EXCLUDED.dataset_uuid
+             OR dataset_symlinks.is_primary IS NOT TRUE
+          """)
+  int upsertOpenLineageRawAlias(UUID datasetUuid, String name, UUID namespaceUuid, Instant now);
+
   @Value
   class PrimaryDatasetSymlinkUpsert {
     @NonNull UUID uuid;

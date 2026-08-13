@@ -32,6 +32,7 @@ import marquez.db.models.DatasetRow;
 import marquez.db.models.DatasetSymlinkRow;
 import marquez.db.models.DatasetVersionRow;
 import marquez.db.models.NamespaceRow;
+import marquez.db.models.ProjectionOrder;
 import marquez.db.models.SourceRow;
 import marquez.db.models.TagRow;
 import marquez.service.DatasetService;
@@ -66,7 +67,7 @@ public interface DatasetDao extends BaseDao {
 
   @SqlUpdate(
       "UPDATE datasets "
-          + "SET updated_at = :lastModifiedAt, "
+          + "SET updated_at = GREATEST(updated_at, :lastModifiedAt), "
           + "    last_modified_at = :lastModifiedAt "
           + "WHERE uuid IN (<rowUuids>)")
   void updateLastModifiedAt(
@@ -74,8 +75,10 @@ public interface DatasetDao extends BaseDao {
 
   @SqlUpdate(
       "UPDATE datasets "
-          + "SET updated_at = :updatedAt, "
-          + "    current_version_uuid = :currentVersionUuid "
+          + "SET updated_at = GREATEST(updated_at, :updatedAt), "
+          + "    current_version_uuid = :currentVersionUuid, "
+          + "    open_lineage_current_version_time = NULL, "
+          + "    open_lineage_current_version_key = NULL "
           + "WHERE uuid = :rowUuid")
   void updateVersion(UUID rowUuid, Instant updatedAt, UUID currentVersionUuid);
 
@@ -86,6 +89,11 @@ public interface DatasetDao extends BaseDao {
 
   /** Updates current versions without opening a transaction; the caller owns chunk atomicity. */
   default int updateVersionsInTransaction(List<DatasetCurrentVersionUpdate> updates) {
+    return updateVersionsInTransaction(updates, null);
+  }
+
+  default int updateVersionsInTransaction(
+      List<DatasetCurrentVersionUpdate> updates, @Nullable ProjectionOrder order) {
     if (updates.isEmpty()) {
       return 0;
     }
@@ -103,9 +111,15 @@ public interface DatasetDao extends BaseDao {
     int updated = 0;
     for (int start = 0; start < writes.size(); start += MAX_DATASET_CURRENT_VERSION_UPDATES) {
       updated +=
-          updateVersionsChunk(
-              writes.subList(
-                  start, Math.min(start + MAX_DATASET_CURRENT_VERSION_UPDATES, writes.size())));
+          order == null
+              ? updateVersionsChunk(
+                  writes.subList(
+                      start, Math.min(start + MAX_DATASET_CURRENT_VERSION_UPDATES, writes.size())))
+              : updateVersionsOrderedChunk(
+                  writes.subList(
+                      start, Math.min(start + MAX_DATASET_CURRENT_VERSION_UPDATES, writes.size())),
+                  order.getEventTime(),
+                  order.getEventKey());
     }
     return updated;
   }
@@ -113,8 +127,10 @@ public interface DatasetDao extends BaseDao {
   @SqlUpdate(
       """
           UPDATE datasets AS d
-          SET updated_at = CAST(v.updated_at AS timestamptz),
-              current_version_uuid = CAST(v.current_version_uuid AS uuid)
+          SET updated_at = GREATEST(d.updated_at, CAST(v.updated_at AS timestamptz)),
+              current_version_uuid = CAST(v.current_version_uuid AS uuid),
+              open_lineage_current_version_time = NULL,
+              open_lineage_current_version_key = NULL
           FROM (VALUES <values>) AS v(row_uuid, updated_at, current_version_uuid)
           WHERE d.uuid = CAST(v.row_uuid AS uuid)
           """)
@@ -123,6 +139,37 @@ public interface DatasetDao extends BaseDao {
               value = "values",
               propertyNames = {"rowUuid", "updatedAt", "currentVersionUuid"})
           List<DatasetCurrentVersionUpdate> updates);
+
+  @SqlUpdate(
+      """
+          UPDATE datasets AS d
+          SET updated_at = GREATEST(d.updated_at, CAST(v.updated_at AS timestamptz)),
+              current_version_uuid = CAST(v.current_version_uuid AS uuid),
+              open_lineage_current_version_time = :projectionTime,
+              open_lineage_current_version_key = :projectionKey
+          FROM (VALUES <values>) AS v(row_uuid, updated_at, current_version_uuid)
+          WHERE d.uuid = CAST(v.row_uuid AS uuid)
+            AND d.is_hidden IS FALSE
+            AND ROW(:projectionTime, :projectionKey) >= ROW(
+                COALESCE(
+                    d.open_lineage_current_version_time,
+                    GREATEST(
+                        d.updated_at,
+                        (SELECT dv.created_at
+                         FROM dataset_versions AS dv
+                         WHERE dv.uuid = d.current_version_uuid)),
+                    '-infinity'::timestamptz),
+                CASE WHEN d.open_lineage_current_version_time IS NULL
+                     THEN decode(repeat('00', 32), 'hex')
+                     ELSE d.open_lineage_current_version_key END)
+          """)
+  int updateVersionsOrderedChunk(
+      @BindBeanList(
+              value = "values",
+              propertyNames = {"rowUuid", "updatedAt", "currentVersionUuid"})
+          List<DatasetCurrentVersionUpdate> updates,
+      Instant projectionTime,
+      byte[] projectionKey);
 
   @SqlQuery(
       """
@@ -267,11 +314,13 @@ public interface DatasetDao extends BaseDao {
           ) ON CONFLICT (uuid)
           DO UPDATE SET
           type = EXCLUDED.type,
-          updated_at = EXCLUDED.updated_at,
+          updated_at = GREATEST(datasets.updated_at, EXCLUDED.updated_at),
           physical_name = EXCLUDED.physical_name,
           description = EXCLUDED.description,
           is_deleted = EXCLUDED.is_deleted,
-          is_hidden = EXCLUDED.is_hidden
+          is_hidden = EXCLUDED.is_hidden,
+          open_lineage_snapshot_time = NULL,
+          open_lineage_snapshot_key = NULL
           RETURNING *
     """)
   DatasetRow upsert(
@@ -292,20 +341,29 @@ public interface DatasetDao extends BaseDao {
    * so every chunk is atomic with the rest of the projection.
    */
   default List<DatasetRow> upsertAllInTransaction(List<DatasetUpsert> datasets) {
+    return upsertAllInTransaction(datasets, null);
+  }
+
+  default List<DatasetRow> upsertAllInTransaction(
+      List<DatasetUpsert> datasets, @Nullable ProjectionOrder order) {
     if (datasets.isEmpty()) {
       return Collections.emptyList();
     }
 
     List<DatasetUpsert> inputs = List.copyOf(datasets);
-    Map<UUID, DatasetUpsert> firstWriteByUuid = new LinkedHashMap<>();
+    Map<UUID, DatasetUpsert> selectedWriteByUuid = new LinkedHashMap<>();
     boolean duplicateUuid = false;
     for (DatasetUpsert dataset : inputs) {
-      duplicateUuid |= firstWriteByUuid.putIfAbsent(dataset.getUuid(), dataset) != null;
+      if (order == null) {
+        duplicateUuid |= selectedWriteByUuid.putIfAbsent(dataset.getUuid(), dataset) != null;
+      } else {
+        duplicateUuid |= selectedWriteByUuid.put(dataset.getUuid(), dataset) != null;
+      }
     }
 
-    if (duplicateUuid) {
+    if (duplicateUuid && order == null) {
       // A single PostgreSQL upsert cannot affect the same target row twice. More importantly,
-      // dataset updates are occurrence-sensitive, so preserve each returned intermediate state.
+      // legacy dataset updates are occurrence-sensitive, so preserve each intermediate state.
       List<DatasetRow> ordered = new ArrayList<>(inputs.size());
       for (DatasetUpsert dataset : inputs) {
         ordered.add(
@@ -325,14 +383,22 @@ public interface DatasetDao extends BaseDao {
       return ordered;
     }
 
-    List<DatasetUpsert> writes = new ArrayList<>(inputs);
+    // One ordered event owns one persisted tuple. Collapse aliases of the same canonical dataset
+    // to their last occurrence on this I/O side. The ordered upsert accepts the same tuple again so
+    // the later output side can deterministically replace an earlier input-side occurrence.
+    List<DatasetUpsert> writes = new ArrayList<>(selectedWriteByUuid.values());
     writes.sort((left, right) -> compareUuidLikePostgres(left.getUuid(), right.getUuid()));
 
     Map<UUID, DatasetRow> rowsByUuid = new HashMap<>();
     for (int start = 0; start < writes.size(); start += MAX_DATASETS_PER_UPSERT) {
       List<DatasetRow> returned =
-          upsertAllChunk(
-              writes.subList(start, Math.min(start + MAX_DATASETS_PER_UPSERT, writes.size())));
+          order == null
+              ? upsertAllChunk(
+                  writes.subList(start, Math.min(start + MAX_DATASETS_PER_UPSERT, writes.size())))
+              : upsertAllOpenLineageChunk(
+                  writes.subList(start, Math.min(start + MAX_DATASETS_PER_UPSERT, writes.size())),
+                  order.getEventTime(),
+                  order.getEventKey());
       for (DatasetRow row : returned) {
         rowsByUuid.put(row.getUuid(), row);
       }
@@ -412,11 +478,13 @@ public interface DatasetDao extends BaseDao {
           ON CONFLICT (uuid)
           DO UPDATE SET
               type = EXCLUDED.type,
-              updated_at = EXCLUDED.updated_at,
+              updated_at = GREATEST(datasets.updated_at, EXCLUDED.updated_at),
               physical_name = EXCLUDED.physical_name,
               description = EXCLUDED.description,
               is_deleted = EXCLUDED.is_deleted,
-              is_hidden = EXCLUDED.is_hidden
+              is_hidden = EXCLUDED.is_hidden,
+              open_lineage_snapshot_time = NULL,
+              open_lineage_snapshot_key = NULL
           RETURNING *
           """)
   List<DatasetRow> upsertAllChunk(
@@ -436,6 +504,116 @@ public interface DatasetDao extends BaseDao {
                 "deleted"
               })
           List<DatasetUpsert> datasets);
+
+  @SqlQuery(
+      """
+          WITH requested(
+              uuid, type, created_at, namespace_uuid, namespace_name, source_uuid, source_name,
+              name, physical_name, description, is_deleted
+          ) AS (VALUES <values>)
+          INSERT INTO datasets (
+              uuid, type, created_at, updated_at, namespace_uuid, namespace_name, source_uuid,
+              source_name, name, physical_name, description, is_deleted, is_hidden,
+              open_lineage_snapshot_time, open_lineage_snapshot_key)
+          SELECT
+              CAST(requested.uuid AS uuid),
+              CAST(requested.type AS varchar),
+              CAST(requested.created_at AS timestamptz),
+              CAST(requested.created_at AS timestamptz),
+              CAST(requested.namespace_uuid AS uuid),
+              CAST(requested.namespace_name AS varchar),
+              CAST(requested.source_uuid AS uuid),
+              CAST(requested.source_name AS varchar),
+              CAST(requested.name AS varchar),
+              CAST(requested.physical_name AS varchar),
+              CAST(requested.description AS text),
+              CAST(requested.is_deleted AS boolean),
+              false,
+              :projectionTime,
+              :projectionKey
+          FROM requested
+          ORDER BY CAST(requested.uuid AS uuid)
+          ON CONFLICT (uuid) DO UPDATE SET
+              type = CASE WHEN ROW(EXCLUDED.open_lineage_snapshot_time,
+                                        EXCLUDED.open_lineage_snapshot_key) >=
+                                   ROW(COALESCE(datasets.open_lineage_snapshot_time,
+                                                datasets.updated_at),
+                                       COALESCE(datasets.open_lineage_snapshot_key,
+                                                decode(repeat('00', 32), 'hex')))
+                          THEN EXCLUDED.type ELSE datasets.type END,
+              updated_at = CASE WHEN ROW(EXCLUDED.open_lineage_snapshot_time,
+                                              EXCLUDED.open_lineage_snapshot_key) >=
+                                         ROW(COALESCE(datasets.open_lineage_snapshot_time,
+                                                      datasets.updated_at),
+                                             COALESCE(datasets.open_lineage_snapshot_key,
+                                                      decode(repeat('00', 32), 'hex')))
+                                THEN GREATEST(datasets.updated_at, EXCLUDED.updated_at)
+                                ELSE datasets.updated_at END,
+              physical_name = CASE WHEN ROW(EXCLUDED.open_lineage_snapshot_time,
+                                                 EXCLUDED.open_lineage_snapshot_key) >=
+                                            ROW(COALESCE(datasets.open_lineage_snapshot_time,
+                                                         datasets.updated_at),
+                                                COALESCE(datasets.open_lineage_snapshot_key,
+                                                         decode(repeat('00', 32), 'hex')))
+                                   THEN EXCLUDED.physical_name ELSE datasets.physical_name END,
+              description = CASE WHEN ROW(EXCLUDED.open_lineage_snapshot_time,
+                                               EXCLUDED.open_lineage_snapshot_key) >=
+                                          ROW(COALESCE(datasets.open_lineage_snapshot_time,
+                                                       datasets.updated_at),
+                                              COALESCE(datasets.open_lineage_snapshot_key,
+                                                       decode(repeat('00', 32), 'hex')))
+                                 THEN EXCLUDED.description ELSE datasets.description END,
+              is_deleted = CASE WHEN ROW(EXCLUDED.open_lineage_snapshot_time,
+                                              EXCLUDED.open_lineage_snapshot_key) >=
+                                         ROW(COALESCE(datasets.open_lineage_snapshot_time,
+                                                      datasets.updated_at),
+                                             COALESCE(datasets.open_lineage_snapshot_key,
+                                                      decode(repeat('00', 32), 'hex')))
+                                THEN EXCLUDED.is_deleted ELSE datasets.is_deleted END,
+              is_hidden = CASE WHEN ROW(EXCLUDED.open_lineage_snapshot_time,
+                                             EXCLUDED.open_lineage_snapshot_key) >=
+                                        ROW(COALESCE(datasets.open_lineage_snapshot_time,
+                                                     datasets.updated_at),
+                                            COALESCE(datasets.open_lineage_snapshot_key,
+                                                     decode(repeat('00', 32), 'hex')))
+                               THEN EXCLUDED.is_hidden ELSE datasets.is_hidden END,
+              open_lineage_snapshot_time = CASE
+                  WHEN ROW(EXCLUDED.open_lineage_snapshot_time,
+                           EXCLUDED.open_lineage_snapshot_key) >=
+                       ROW(COALESCE(datasets.open_lineage_snapshot_time, datasets.updated_at),
+                           COALESCE(datasets.open_lineage_snapshot_key,
+                                    decode(repeat('00', 32), 'hex')))
+                    THEN EXCLUDED.open_lineage_snapshot_time
+                  ELSE datasets.open_lineage_snapshot_time END,
+              open_lineage_snapshot_key = CASE
+                  WHEN ROW(EXCLUDED.open_lineage_snapshot_time,
+                           EXCLUDED.open_lineage_snapshot_key) >=
+                       ROW(COALESCE(datasets.open_lineage_snapshot_time, datasets.updated_at),
+                           COALESCE(datasets.open_lineage_snapshot_key,
+                                    decode(repeat('00', 32), 'hex')))
+                    THEN EXCLUDED.open_lineage_snapshot_key
+                  ELSE datasets.open_lineage_snapshot_key END
+          RETURNING *
+          """)
+  List<DatasetRow> upsertAllOpenLineageChunk(
+      @BindBeanList(
+              value = "values",
+              propertyNames = {
+                "uuid",
+                "type",
+                "now",
+                "namespaceUuid",
+                "namespaceName",
+                "sourceUuid",
+                "sourceName",
+                "name",
+                "physicalName",
+                "description",
+                "deleted"
+              })
+          List<DatasetUpsert> datasets,
+      Instant projectionTime,
+      byte[] projectionKey);
 
   @SqlQuery(
       "INSERT INTO datasets ("
@@ -463,8 +641,10 @@ public interface DatasetDao extends BaseDao {
           + "ON CONFLICT (uuid) "
           + "DO UPDATE SET "
           + "type = EXCLUDED.type, "
-          + "updated_at = EXCLUDED.updated_at, "
-          + "physical_name = EXCLUDED.physical_name "
+          + "updated_at = GREATEST(datasets.updated_at, EXCLUDED.updated_at), "
+          + "physical_name = EXCLUDED.physical_name, "
+          + "open_lineage_snapshot_time = NULL, "
+          + "open_lineage_snapshot_key = NULL "
           + "RETURNING *")
   DatasetRow upsert(
       UUID uuid,
@@ -480,7 +660,10 @@ public interface DatasetDao extends BaseDao {
   @SqlUpdate(
       """
         UPDATE datasets d
-        SET is_hidden = true
+        SET is_hidden = true,
+            updated_at = GREATEST(d.updated_at, statement_timestamp()),
+            open_lineage_snapshot_time = NULL,
+            open_lineage_snapshot_key = NULL
         FROM namespaces n
         WHERE n.uuid=d.namespace_uuid
         AND n.name=:namespaceName
@@ -490,7 +673,10 @@ public interface DatasetDao extends BaseDao {
   @SqlQuery(
       """
         UPDATE datasets d
-        SET is_hidden = true
+        SET is_hidden = true,
+            updated_at = GREATEST(d.updated_at, statement_timestamp()),
+            open_lineage_snapshot_time = NULL,
+            open_lineage_snapshot_key = NULL
         FROM namespaces n
         WHERE n.uuid = d.namespace_uuid
         AND n.name=:namespaceName AND d.name=:name

@@ -49,6 +49,18 @@ class HotPathIndexesTest {
   private static final Map<String, ExpectedIndex> EXPECTED_INDEXES =
       Map.ofEntries(
           Map.entry(
+              "open_lineage_queue_pkey",
+              new ExpectedIndex(List.of("ordering_key", "id"), List.of(), null, List.of(0, 0))),
+          Map.entry(
+              "open_lineage_queue_heads_pkey",
+              new ExpectedIndex(List.of("ordering_key"), List.of(), null, List.of(0))),
+          Map.entry(
+              "open_lineage_queue_heads_due_idx",
+              new ExpectedIndex(List.of("available_at"), List.of(), null, List.of(0))),
+          Map.entry(
+              "open_lineage_dead_letters_pkey",
+              new ExpectedIndex(List.of("dead_at", "id"), List.of(), null, List.of(0, 0))),
+          Map.entry(
               "job_versions_io_mapping_current_job_idx",
               new ExpectedIndex(
                   List.of("job_uuid", "io_type"),
@@ -117,6 +129,90 @@ class HotPathIndexesTest {
   @BeforeAll
   static void setUpOnce(Jdbi jdbi) {
     HotPathIndexesTest.jdbi = jdbi;
+  }
+
+  @Test
+  void queueHeadDueClockHasExpectedTypePrecisionAndNullability() {
+    Map<String, ClockColumn> columns =
+        jdbi.withHandle(
+            handle ->
+                handle
+                    .createQuery(
+                        """
+                        SELECT column_name,
+                               data_type,
+                               datetime_precision,
+                               is_nullable
+                        FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                          AND table_name = 'open_lineage_queue_heads'
+                          AND column_name = 'available_at'
+                        """)
+                    .map(
+                        (resultSet, context) ->
+                            Map.entry(
+                                resultSet.getString("column_name"),
+                                new ClockColumn(
+                                    resultSet.getString("data_type"),
+                                    resultSet.getInt("datetime_precision"),
+                                    resultSet.getString("is_nullable").equals("YES"))))
+                    .list()
+                    .stream()
+                    .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue)));
+
+    assertThat(columns)
+        .containsExactlyInAnyOrderEntriesOf(
+            Map.of("available_at", new ClockColumn("timestamp with time zone", 3, false)));
+  }
+
+  @Test
+  void queueHeadIndexesKeepMutableTransitionStateHotEligible() {
+    List<QueueHeadIndex> indexes =
+        jdbi.withHandle(
+            handle ->
+                handle
+                    .createQuery(
+                        """
+                        SELECT index_class.relname AS index_name,
+                               access_method.amname AS access_method,
+                               index_metadata.indnkeyatts,
+                               pg_get_expr(
+                                   index_metadata.indpred,
+                                   index_metadata.indrelid) AS predicate,
+                               ARRAY(
+                                 SELECT attribute.attname
+                                 FROM unnest(index_metadata.indkey::smallint[]) WITH ORDINALITY
+                                      AS index_column(attribute_number, position_number)
+                                 INNER JOIN pg_attribute AS attribute
+                                   ON attribute.attrelid = index_metadata.indrelid
+                                  AND attribute.attnum = index_column.attribute_number
+                                 ORDER BY index_column.position_number
+                               )::text[] AS columns
+                        FROM pg_index AS index_metadata
+                        INNER JOIN pg_class AS index_class
+                          ON index_class.oid = index_metadata.indexrelid
+                        INNER JOIN pg_am AS access_method
+                          ON access_method.oid = index_class.relam
+                        WHERE index_metadata.indrelid =
+                              'open_lineage_queue_heads'::regclass
+                        ORDER BY index_class.relname
+                        """)
+                    .map(
+                        (resultSet, context) ->
+                            new QueueHeadIndex(
+                                resultSet.getString("index_name"),
+                                resultSet.getString("access_method"),
+                                resultSet.getInt("indnkeyatts"),
+                                readStringArray(resultSet, "columns"),
+                                normalizePredicate(resultSet.getString("predicate"))))
+                    .list());
+
+    assertThat(indexes)
+        .containsExactlyInAnyOrder(
+            new QueueHeadIndex(
+                "open_lineage_queue_heads_pkey", "btree", 1, List.of("ordering_key"), null),
+            new QueueHeadIndex(
+                "open_lineage_queue_heads_due_idx", "btree", 1, List.of("available_at"), null));
   }
 
   @Test
@@ -228,6 +324,15 @@ class HotPathIndexesTest {
       List<String> includedColumns,
       String predicate,
       List<Integer> orderingOptions) {}
+
+  private record ClockColumn(String dataType, int precision, boolean nullable) {}
+
+  private record QueueHeadIndex(
+      String name,
+      String accessMethod,
+      int keyColumnCount,
+      List<String> columns,
+      String predicate) {}
 
   private record IndexMetadata(
       String name,

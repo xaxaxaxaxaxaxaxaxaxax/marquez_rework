@@ -3,10 +3,13 @@
 Helm Chart for [Marquez](https://github.com/MarquezProject/marquez).
 
 ## TL;DR;
-Run all commands within the "chart" folder, with default configurations.
+Run all commands within the "chart" folder. This snapshot chart deliberately has no default API
+image tag: supply a tag for an image built from the current source, which includes the durable
+OpenLineage queue migrations and worker.
 
 ```bash
-helm install marquez . --dependency-update
+helm install marquez . --dependency-update \
+  --set marquez.image.tag=YOUR_CURRENT_SOURCE_IMAGE_TAG
 ```
 
 ## Prerequisites
@@ -19,8 +22,14 @@ helm install marquez . --dependency-update
 To install the chart with the release name `marquez` using a fresh Postgres instance.
 
 ```bash
-helm install marquez . --dependency-update --set postgresql.enabled=true
+helm install marquez . --dependency-update \
+  --set postgresql.enabled=true \
+  --set marquez.image.tag=YOUR_CURRENT_SOURCE_IMAGE_TAG
 ```
+
+The released `0.51.1` API image is not compatible with this snapshot chart's durable-intake
+configuration. The release chart must not acquire a default API tag until the corresponding image
+has been published and verified.
 
 > **Note:** For a list of parameters that can be overridden during installation, see the [configuration](#configuration) section.
 
@@ -51,7 +60,7 @@ helm delete marquez
 | `marquez.replicaCount`       | Number of desired replicas                                                    | `1`                      |
 | `marquez.image.registry`     | Marquez image registry                                                        | `docker.io`              |
 | `marquez.image.repository`   | Marquez image repository                                                      | `marquezproject/marquez` |
-| `marquez.image.tag`          | Marquez image tag                                                             | `0.15.0`                 |
+| `marquez.image.tag`          | Required tag for an API image built from the current durable-intake source     | `""` (required)         |
 | `marquez.image.pullPolicy`   | Image pull policy                                                             | `IfNotPresent`           |
 | `marquez.existingSecretName` | Name of an existing secret containing db password ('marquez-db-password' key) | `nil`                    |
 | `marquez.db.host`            | PostgreSQL host                                                               | `localhost`              |
@@ -59,18 +68,62 @@ helm delete marquez
 | `marquez.db.name`            | PostgreSQL database                                                           | `marquez`                |
 | `marquez.db.user`            | PostgreSQL user                                                               | `buendia`                |
 | `marquez.db.password`        | PostgreSQL password                                                           | `macondo`                |
-| `marquez.dbRetention.enabled`| Enables retention policy                                                      | `false`                  |
+| `marquez.db.autoCommentsEnabled` | Add automatic DAO.method comments to SQL statements                       | `false`                  |
+| `marquez.dbRetention.enabled`| Enables scheduled metadata/dead-letter retention; disabled leaves dead letters until a one-off purge | `false`                  |
 | `marquez.dbRetention.frequencyMins`| Apply retention policy at a frequency of every 'X' minutes              | `15`                     |
-| `marquez.dbRetention.numberOfRowsPerBatch`| Maximum number of rows deleted per batch                         | `1000`                   |
-| `marquez.dbRetention.retentionDays`| Maximum retention days                                                  | `7`                      |
+| `marquez.dbRetention.numberOfRowsPerBatch`| Metadata deletion batch size and maximum dead letters per completed invocation | `1000`                   |
+| `marquez.dbRetention.retentionDays`| Metadata/dead-letter age threshold; live queue is never age-purged        | `7`                      |
 | `marquez.migrateOnStartup`   | Execute Flyway migration                                                      | `true`                   |
 | `marquez.hostname`           | Marquez hostname                                                              | `localhost`              |
 | `marquez.port`               | API host port                                                                 | `5000`                   |
 | `marquez.adminPort`          | Heath/Liveness host port                                                      | `5001`                   |
+| `marquez.openLineage.workerThreads` | Concurrent OpenLineage event processors per Marquez replica            | `8`                      |
+| `marquez.openLineage.pollIntervalMillis` | Delay between database polls when no due work is found              | `1000`                   |
+| `marquez.openLineage.maxAttempts` | Maximum committed caught-failure count; the failure reaching it is dead-lettered | `10`              |
+| `marquez.openLineage.retryInitialDelayMillis` | Initial retry-backoff bound for processing failures             | `1000`                   |
+| `marquez.openLineage.retryMaxDelayMillis` | Maximum retry-backoff bound for processing failures                   | `60000`                  |
+| `marquez.openLineage.shutdownGracePeriodMillis` | Duration limit for each of the two worker executor waits; synchronous JDBC abort between them has no application deadline | `30000` |
+| `marquez.terminationGracePeriodSeconds` | Kubernetes pod termination grace; should exceed both worker wait intervals plus lifecycle overhead | `90` |
 | `marquez.resources.limits`   | K8s resource limit overrides                                                  | `nil`                    |
 | `marquez.resources.requests` | K8s resource requests overrides                                               | `nil`                    |
-| `marquez.podAnnotations`     | Additional pod annotations for Marquez                                        | `{}`                     |
+| `marquez.podAnnotations`     | Additional annotations on Marquez Pods                                        | `{}`                     |
 | `marquez.extraContainers`    | Additional container definitions to include inside Marquez Pod                | `[]`                     |
+
+With `marquez.db.autoCommentsEnabled: false`, SQL statements no longer include automatic
+`/* DAO.method */` prefixes in PostgreSQL logs and `pg_stat_statements` query text. Set it to `true`
+when those prefixes are operationally required; SQL behavior is otherwise unchanged.
+
+Set `marquez.terminationGracePeriodSeconds` to more than twice
+`marquez.openLineage.shutdownGracePeriodMillis` (after converting milliseconds to seconds),
+with additional time for the remaining application lifecycle to stop. The defaults reserve 90 seconds
+for two 30-second worker shutdown windows plus lifecycle overhead.
+After the first window, Marquez interrupts remaining tasks and synchronously aborts their registered
+JDBC connections before waiting for the second window. The two executor waits have deadlines, but
+the synchronous driver abort calls between them do not; Kubernetes termination grace is the
+external bound if a driver call blocks. A completed abort rolls back its open projection transaction
+and releases its row lock; a connection loss before commit or a database crash that aborts the
+transaction does not consume `maxAttempts`. A lost commit response is indeterminate and may mean
+projection plus acknowledgement already committed.
+Monitor the `open-lineage-worker` health check and the `forced_shutdown` and `shutdown_incomplete`
+worker meters. The health check is unhealthy after a fatal task or coordinator failure, or after
+three consecutive poll failures; a successful poll clears the persistent-poll condition, while a
+committed retry or dead letter remains a healthy worker outcome.
+The chart uses Dropwizard's aggregate `/healthcheck` endpoint for both readiness and liveness, so an
+unhealthy worker removes the Pod from service and, after Kubernetes probe thresholds are exceeded,
+restarts it. Durable queued events survive that restart, but the API is briefly unavailable and
+otherwise healthy admission is not kept online independently of a failed projector.
+
+The former `marquez.openLineage.leaseDurationMillis` setting has been removed and is not a
+transaction-timeout setting. Remove it from custom application YAML before upgrading. Marquez
+explicitly rejects this removed property so it cannot be silently ignored; this is not a general
+unknown-property rejection policy.
+
+The Marquez Deployment uses the `Recreate` strategy so a chart upgrade does not overlap old and new
+lineage projector replicas. Kubernetes terminates the old Pods before creating the replacement
+Pods, so brief API unavailability is expected during a rollout. The Pod template includes a
+checksum of the rendered Marquez ConfigMap. Changes to `marquez.openLineage` or other rendered
+application settings therefore trigger replacement; `marquez.podAnnotations` are also applied
+directly to the Pod template.
 
 ### [Marquez Web UI](https://github.com/MarquezProject/marquez-web) **parameters**
 
@@ -79,10 +132,10 @@ helm delete marquez
 | `web.enabled`            | Enables creation of Web UI      | `true`         |
 | `web.replicaCount`       | Number of desired replicas      | `1`            |
 | `web.image.registry`     | Marquez Web UI image registry   | `docker.io`    |
-| `web.image.repository`   | Marquez Web UI image repository | `marquez-web`  |
-| `web.image.tag`          | Marquez Web UI image tag        | `0.15.0`       |
+| `web.image.repository`   | Marquez Web UI image repository | `marquezproject/marquez-web` |
+| `web.image.tag`          | Marquez Web UI image tag        | `0.51.1`       |
 | `web.image.pullPolicy`   | Image pull policy               | `IfNotPresent` |
-| `web.port`               | Marquez Web host port           | `5000`         |
+| `web.port`               | Marquez Web host port           | `3000`         |
 | `web.resources.limits`   | K8s resource limit overrides    | `nil`          |
 | `web.resources.requests` | K8s resource requests overrides | `nil`          |
 
@@ -132,7 +185,9 @@ helm delete marquez
 The quickest way to install Marquez via Kubernetes is to create a local Postgres instance.
 
 ```bash
-helm install marquez . --dependency-update --set postgresql.enabled=true
+helm install marquez . --dependency-update \
+  --set postgresql.enabled=true \
+  --set marquez.image.tag=YOUR_CURRENT_SOURCE_IMAGE_TAG
 ```
 
 ### Docker Postgres
@@ -158,7 +213,9 @@ the `values.yaml` file or within the Helm CLI command. Again, remove the
 pesky markdown escape character before running this command.
 
 ```bash
-helm install marquez . --dependency-update --set marquez.db.host=$marquez_db_ip
+helm install marquez . --dependency-update \
+  --set marquez.db.host="${marquez_db_ip}" \
+  --set marquez.image.tag=YOUR_CURRENT_SOURCE_IMAGE_TAG
 ```
 
 ### Validation

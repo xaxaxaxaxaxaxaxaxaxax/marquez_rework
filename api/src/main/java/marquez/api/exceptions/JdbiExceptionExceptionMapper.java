@@ -22,7 +22,9 @@ public class JdbiExceptionExceptionMapper implements ExceptionMapper<JdbiExcepti
     log.error("Failed to execute statement", e);
     return Response.serverError()
         .type(APPLICATION_JSON_TYPE)
-        .entity(new ErrorMessage(INTERNAL_SERVER_ERROR.getStatusCode(), e.getMessage()))
+        .entity(
+            new ErrorMessage(
+                INTERNAL_SERVER_ERROR.getStatusCode(), INTERNAL_SERVER_ERROR.getReasonPhrase()))
         .build();
   }
 }

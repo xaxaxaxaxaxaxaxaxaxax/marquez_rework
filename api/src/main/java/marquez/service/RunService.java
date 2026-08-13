@@ -158,25 +158,28 @@ public class RunService extends DelegatingDaos.DelegatingRunDao {
         .build();
   }
 
-  void notify(JobInputUpdate update) {
-    notify(RunTransitionListener::notify, update);
+  int notify(JobInputUpdate update) {
+    return notify(RunTransitionListener::notify, update);
   }
 
-  void notify(JobOutputUpdate update) {
-    notify(RunTransitionListener::notify, update);
+  int notify(JobOutputUpdate update) {
+    return notify(RunTransitionListener::notify, update);
   }
 
-  void notify(RunTransition transition) {
-    notify(RunTransitionListener::notify, transition);
+  int notify(RunTransition transition) {
+    return notify(RunTransitionListener::notify, transition);
   }
 
-  private <T> void notify(BiConsumer<RunTransitionListener, T> f, T param) {
+  private <T> int notify(BiConsumer<RunTransitionListener, T> f, T param) {
+    int failures = 0;
     for (RunTransitionListener runTransitionListener : runTransitionListeners) {
       try {
         f.accept(runTransitionListener, param);
       } catch (Exception e) {
+        failures++;
         log.error("Exception from listener " + runTransitionListener, e);
       }
     }
+    return failures;
   }
 }

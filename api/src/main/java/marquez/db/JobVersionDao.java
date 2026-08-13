@@ -38,6 +38,7 @@ import marquez.db.models.ExtendedJobVersionRow;
 import marquez.db.models.JobRow;
 import marquez.db.models.JobVersionRow;
 import marquez.db.models.NamespaceRow;
+import marquez.db.models.ProjectionOrder;
 import marquez.db.models.RunIoRow;
 import marquez.db.models.RunIoSnapshot;
 import marquez.db.models.UpdateLineageRow.DatasetRecord;
@@ -191,6 +192,29 @@ public interface JobVersionDao extends BaseDao {
     RETURNING *
   """)
   ExtendedJobVersionRow upsertJobVersion(
+      UUID jobVersionUuid,
+      Instant now,
+      UUID jobUuid,
+      String jobLocation,
+      UUID version,
+      String jobName,
+      UUID namespaceUuid,
+      String namespaceName);
+
+  /** Ordered intake variant that preserves a meaningful legacy timestamp fallback. */
+  @SqlQuery(
+      """
+    INSERT INTO job_versions (
+      uuid, created_at, updated_at, job_uuid, location, version, job_name,
+      namespace_uuid, namespace_name
+    ) VALUES (
+      :jobVersionUuid, :now, :now, :jobUuid, :jobLocation, :version, :jobName,
+      :namespaceUuid, :namespaceName)
+    ON CONFLICT(version) DO
+    UPDATE SET updated_at = GREATEST(job_versions.updated_at, EXCLUDED.updated_at)
+    RETURNING *
+  """)
+  ExtendedJobVersionRow upsertOpenLineageJobVersion(
       UUID jobVersionUuid,
       Instant now,
       UUID jobUuid,
@@ -383,6 +407,32 @@ public interface JobVersionDao extends BaseDao {
     }
   }
 
+  /**
+   * Replaces the complete current-I/O snapshot for an ordered OpenLineage winner. The caller must
+   * hold the job-row lock acquired by the ordered current-version pointer update.
+   */
+  default void replaceOpenLineageCurrentJobVersionIoInCurrentTransaction(
+      CurrentJobVersionIoWrite write) {
+    markInputAndOutputDatasetsAsPreviousFor(write.jobUuid());
+    if (!write.inputDatasetUuids().isEmpty() && !write.outputDatasetUuids().isEmpty()) {
+      upsertCurrentInputAndOutputDatasetsInCurrentTransaction(write);
+    } else if (!write.inputDatasetUuids().isEmpty()) {
+      upsertCurrentInputOrOutputDatasetsInCurrentTransaction(
+          write.jobVersionUuid(),
+          write.inputDatasetUuids(),
+          write.jobUuid(),
+          write.symlinkTargetJobUuid(),
+          IoType.INPUT);
+    } else if (!write.outputDatasetUuids().isEmpty()) {
+      upsertCurrentInputOrOutputDatasetsInCurrentTransaction(
+          write.jobVersionUuid(),
+          write.outputDatasetUuids(),
+          write.jobUuid(),
+          write.symlinkTargetJobUuid(),
+          IoType.OUTPUT);
+    }
+  }
+
   private void upsertCurrentInputAndOutputDatasetsInCurrentTransaction(
       CurrentJobVersionIoWrite write) {
     List<UUID> inputDatasetUuids = write.inputDatasetUuids().asList();
@@ -527,13 +577,47 @@ public interface JobVersionDao extends BaseDao {
   @SqlUpdate(
       """
     UPDATE job_versions
-    SET updated_at = :updatedAt,
-      latest_run_uuid = :latestRunUuid
+    SET updated_at = GREATEST(
+          COALESCE(job_versions.updated_at, '-infinity'::timestamptz),
+          COALESCE(:updatedAt, statement_timestamp())),
+      latest_run_uuid = :latestRunUuid,
+      open_lineage_latest_run_time = NULL,
+      open_lineage_latest_run_key = NULL
     WHERE uuid = :jobVersionUuid
       AND (latest_run_uuid IS DISTINCT FROM :latestRunUuid
-        OR updated_at IS DISTINCT FROM :updatedAt)
+        OR updated_at IS DISTINCT FROM :updatedAt
+        OR open_lineage_latest_run_time IS NOT NULL)
   """)
   void updateLatestRunFor(UUID jobVersionUuid, Instant updatedAt, UUID latestRunUuid);
+
+  default boolean updateLatestRunFor(
+      UUID jobVersionUuid, UUID latestRunUuid, ProjectionOrder order) {
+    return updateLatestRunForOrdered(
+            jobVersionUuid, latestRunUuid, order.getEventTime(), order.getEventKey())
+        == 1;
+  }
+
+  @SqlUpdate(
+      """
+    UPDATE job_versions AS jv
+    SET updated_at = GREATEST(jv.updated_at, :projectionTime),
+      latest_run_uuid = :latestRunUuid,
+      open_lineage_latest_run_time = :projectionTime,
+      open_lineage_latest_run_key = :projectionKey
+    WHERE jv.uuid = :jobVersionUuid
+      AND ROW(:projectionTime, :projectionKey) > ROW(
+          COALESCE(
+              jv.open_lineage_latest_run_time,
+              (SELECT COALESCE(r.transitioned_at, r.created_at)
+               FROM runs AS r
+               WHERE r.uuid = jv.latest_run_uuid),
+              '-infinity'::timestamptz),
+          CASE WHEN jv.open_lineage_latest_run_time IS NULL
+               THEN decode(repeat('00', 32), 'hex')
+               ELSE jv.open_lineage_latest_run_key END)
+  """)
+  int updateLatestRunForOrdered(
+      UUID jobVersionUuid, UUID latestRunUuid, Instant projectionTime, byte[] projectionKey);
 
   /** Returns the unique ID of the latest {@link Run} for a given job version. */
   @SqlQuery("SELECT latest_run_uuid FROM job_versions WHERE uuid = :jobVersionUuid")
@@ -596,6 +680,43 @@ public interface JobVersionDao extends BaseDao {
       @NonNull NamespaceRow namespaceRow,
       List<DatasetRecord> inputs,
       List<DatasetRecord> outputs) {
+    return upsertRunlessJobVersionInTransaction(jobRow, namespaceRow, inputs, outputs, null);
+  }
+
+  /** Ordered queue variant; current-version I/O is published only by the pointer winner. */
+  default BagOfJobVersionInfo upsertRunlessJobVersionInTransaction(
+      @NonNull JobRow jobRow,
+      @NonNull NamespaceRow namespaceRow,
+      List<DatasetRecord> inputs,
+      List<DatasetRecord> outputs,
+      @Nullable ProjectionOrder order) {
+    boolean projectCurrentIo =
+        order == null || createJobDao().canProjectCurrentIo(jobRow.getUuid(), order);
+    return upsertRunlessJobVersionInTransaction(
+        jobRow, namespaceRow, inputs, outputs, order, projectCurrentIo);
+  }
+
+  /** Ordered core accepting the event-level winner selected by the job snapshot write. */
+  default BagOfJobVersionInfo upsertRunlessJobVersionInTransaction(
+      @NonNull JobRow jobRow,
+      @NonNull NamespaceRow namespaceRow,
+      List<DatasetRecord> inputs,
+      List<DatasetRecord> outputs,
+      @Nullable ProjectionOrder order,
+      boolean projectCurrentIo) {
+    return upsertRunlessJobVersionInTransaction(
+        jobRow, namespaceRow, inputs, outputs, order, projectCurrentIo, jobRow.getLocation());
+  }
+
+  /** Ordered core whose immutable identity uses the location carried by this exact event. */
+  default BagOfJobVersionInfo upsertRunlessJobVersionInTransaction(
+      @NonNull JobRow jobRow,
+      @NonNull NamespaceRow namespaceRow,
+      List<DatasetRecord> inputs,
+      List<DatasetRecord> outputs,
+      @Nullable ProjectionOrder order,
+      boolean projectCurrentIo,
+      @Nullable String eventJobLocation) {
     validateNamespace(jobRow, namespaceRow);
 
     // Get the job.
@@ -613,23 +734,32 @@ public interface JobVersionDao extends BaseDao {
                 inputs.stream().map(i -> i.getDatasetVersionRow()).collect(Collectors.toList())),
             toDatasetIds(
                 outputs.stream().map(i -> i.getDatasetVersionRow()).collect(Collectors.toList())),
-            jobRow.getLocation());
+            eventJobLocation);
 
     // Add the job version.
     final JobVersionDao jobVersionDao = createJobVersionDao();
     final JobVersionRow jobVersionRow =
-        jobVersionDao.upsertJobVersion(
-            UUID.randomUUID(),
-            jobRow.getCreatedAt(),
-            jobRow.getUuid(),
-            jobRow.getLocation(),
-            jobVersion.getValue(),
-            jobRow.getName(),
-            namespaceRow.getUuid(),
-            jobRow.getNamespaceName());
+        order == null
+            ? jobVersionDao.upsertJobVersion(
+                UUID.randomUUID(),
+                jobRow.getCreatedAt(),
+                jobRow.getUuid(),
+                eventJobLocation,
+                jobVersion.getValue(),
+                jobRow.getName(),
+                namespaceRow.getUuid(),
+                jobRow.getNamespaceName())
+            : jobVersionDao.upsertOpenLineageJobVersion(
+                UUID.randomUUID(),
+                order.getEventTime(),
+                jobRow.getUuid(),
+                eventJobLocation,
+                jobVersion.getValue(),
+                jobRow.getName(),
+                namespaceRow.getUuid(),
+                jobRow.getNamespaceName());
 
-    // Link the input and output datasets inside the caller's event transaction.
-    jobVersionDao.flushCurrentJobVersionIoInCurrentTransaction(
+    CurrentJobVersionIoWrite ioWrite =
         CurrentJobVersionIoWrite.of(
             jobVersionRow.getUuid(),
             jobVersionRow.getJobUuid(),
@@ -639,9 +769,16 @@ public interface JobVersionDao extends BaseDao {
                 .collect(Collectors.toList()),
             outputs.stream()
                 .map(output -> output.getDatasetVersionRow().getDatasetUuid())
-                .collect(Collectors.toList())));
+                .collect(Collectors.toList()));
 
-    jobDao.updateVersionFor(jobRow.getUuid(), jobRow.getCreatedAt(), jobVersionRow.getUuid());
+    if (order == null) {
+      jobVersionDao.flushCurrentJobVersionIoInCurrentTransaction(ioWrite);
+      jobDao.updateVersionFor(jobRow.getUuid(), jobRow.getCreatedAt(), jobVersionRow.getUuid());
+    } else if (projectCurrentIo
+        && jobDao.updateVersionFor(jobRow.getUuid(), jobVersionRow.getUuid(), order)) {
+      // This runs under the job-row lock acquired by the pointer CAS.
+      jobVersionDao.replaceOpenLineageCurrentJobVersionIoInCurrentTransaction(ioWrite);
+    }
 
     return new BagOfJobVersionInfo(
         jobRow,
@@ -695,25 +832,66 @@ public interface JobVersionDao extends BaseDao {
       @NonNull RunState runState,
       @NonNull Instant transitionedAt,
       boolean linkJobToJobVersion) {
+    return upsertJobVersionOnRunTransitionInTransaction(
+        jobRowRunDetails, runState, transitionedAt, linkJobToJobVersion, null);
+  }
+
+  /** Ordered queue variant; run-local writes stay FIFO and shared pointers use LWW. */
+  default BagOfJobVersionInfo upsertJobVersionOnRunTransitionInTransaction(
+      @NonNull JobRowRunDetails jobRowRunDetails,
+      @NonNull RunState runState,
+      @NonNull Instant transitionedAt,
+      boolean linkJobToJobVersion,
+      @Nullable ProjectionOrder order) {
+    boolean projectCurrentIo =
+        order == null
+            || createJobDao().canProjectCurrentIo(jobRowRunDetails.jobRow.getUuid(), order);
+    return upsertJobVersionOnRunTransitionInTransaction(
+        jobRowRunDetails, runState, transitionedAt, linkJobToJobVersion, order, projectCurrentIo);
+  }
+
+  /** Ordered core accepting the event-level winner already used for missing-side invalidation. */
+  default BagOfJobVersionInfo upsertJobVersionOnRunTransitionInTransaction(
+      @NonNull JobRowRunDetails jobRowRunDetails,
+      @NonNull RunState runState,
+      @NonNull Instant transitionedAt,
+      boolean linkJobToJobVersion,
+      @Nullable ProjectionOrder order,
+      boolean projectCurrentIo) {
     // Get the job.
     final JobDao jobDao = createJobDao();
+    JobRow jobRow = jobRowRunDetails.jobRow;
+    UUID canonicalJobUuid =
+        jobRow.getSymlinkTargetId() == null ? jobRow.getUuid() : jobRow.getSymlinkTargetId();
+    // OpenLineage projection already holds this canonical job before locking its run. Take the same
+    // gate before touching a job version or run so a direct transition cannot hold either first.
+    jobDao.lockJobBeforeRunMutation(canonicalJobUuid);
 
     // Add the job version.
     final JobVersionDao jobVersionDao = createJobVersionDao();
 
     final JobVersionRow jobVersionRow =
-        jobVersionDao.upsertJobVersion(
-            UUID.randomUUID(),
-            transitionedAt, // Use the timestamp of when the run state transitioned.
-            jobRowRunDetails.jobRow.getUuid(),
-            jobRowRunDetails.jobRow.getLocation(),
-            jobRowRunDetails.jobVersion.getValue(),
-            jobRowRunDetails.jobRow.getName(),
-            jobRowRunDetails.namespaceRow.getUuid(),
-            jobRowRunDetails.jobRow.getNamespaceName());
+        order == null
+            ? jobVersionDao.upsertJobVersion(
+                UUID.randomUUID(),
+                transitionedAt,
+                jobRowRunDetails.jobRow.getUuid(),
+                jobRowRunDetails.jobLocation,
+                jobRowRunDetails.jobVersion.getValue(),
+                jobRowRunDetails.jobRow.getName(),
+                jobRowRunDetails.namespaceRow.getUuid(),
+                jobRowRunDetails.jobRow.getNamespaceName())
+            : jobVersionDao.upsertOpenLineageJobVersion(
+                UUID.randomUUID(),
+                order.getEventTime(),
+                jobRowRunDetails.jobRow.getUuid(),
+                jobRowRunDetails.jobLocation,
+                jobRowRunDetails.jobVersion.getValue(),
+                jobRowRunDetails.jobRow.getName(),
+                jobRowRunDetails.namespaceRow.getUuid(),
+                jobRowRunDetails.jobRow.getNamespaceName());
 
-    // Link the input and output datasets inside the caller's event transaction.
-    jobVersionDao.flushCurrentJobVersionIoInCurrentTransaction(
+    CurrentJobVersionIoWrite ioWrite =
         CurrentJobVersionIoWrite.of(
             jobVersionRow.getUuid(),
             jobVersionRow.getJobUuid(),
@@ -723,21 +901,35 @@ public interface JobVersionDao extends BaseDao {
                 .collect(Collectors.toList()),
             jobRowRunDetails.jobVersionOutputs.stream()
                 .map(ExtendedDatasetVersionRow::getDatasetUuid)
-                .collect(Collectors.toList())));
+                .collect(Collectors.toList()));
+
+    if (order == null) {
+      jobVersionDao.flushCurrentJobVersionIoInCurrentTransaction(ioWrite);
+    }
 
     // Link the job version to the run.
     createRunDao().updateJobVersion(jobRowRunDetails.runUuid, jobVersionRow.getUuid());
 
     // Link the run to the job version; multiple run instances may be linked to a job version.
-    jobVersionDao.updateLatestRunFor(
-        jobVersionRow.getUuid(), transitionedAt, jobRowRunDetails.runUuid);
+    if (order == null) {
+      jobVersionDao.updateLatestRunFor(
+          jobVersionRow.getUuid(), transitionedAt, jobRowRunDetails.runUuid);
+    } else {
+      jobVersionDao.updateLatestRunFor(jobVersionRow.getUuid(), jobRowRunDetails.runUuid, order);
+    }
 
     // Link the job facets to this job version
     jobVersionDao.linkJobFacetsToJobVersion(jobRowRunDetails.runUuid, jobVersionRow.getUuid());
 
     if (linkJobToJobVersion) {
-      jobDao.updateVersionFor(
-          jobRowRunDetails.jobRow.getUuid(), transitionedAt, jobVersionRow.getUuid());
+      if (order == null) {
+        jobDao.updateVersionFor(
+            jobRowRunDetails.jobRow.getUuid(), transitionedAt, jobVersionRow.getUuid());
+      } else if (projectCurrentIo
+          && jobDao.updateVersionFor(
+              jobRowRunDetails.jobRow.getUuid(), jobVersionRow.getUuid(), order)) {
+        jobVersionDao.replaceOpenLineageCurrentJobVersionIoInCurrentTransaction(ioWrite);
+      }
     }
 
     return new BagOfJobVersionInfo(
@@ -763,11 +955,18 @@ public interface JobVersionDao extends BaseDao {
   }
 
   default JobRowRunDetails loadJobRowRunDetails(JobRow jobRow, UUID runUuid) {
+    return loadJobRowRunDetails(jobRow, runUuid, jobRow.getLocation());
+  }
+
+  /** Compatibility lookup with an event-scoped immutable-version location. */
+  default JobRowRunDetails loadJobRowRunDetails(
+      JobRow jobRow, UUID runUuid, @Nullable String eventJobLocation) {
     // Get the namespace for the job.
     final NamespaceRow namespaceRow =
         createNamespaceDao().findNamespaceByName(jobRow.getNamespaceName()).get();
 
-    return loadJobRowRunDetails(jobRow, namespaceRow, runUuid, findRunIoSnapshot(runUuid));
+    return loadJobRowRunDetails(
+        jobRow, namespaceRow, runUuid, findRunIoSnapshot(runUuid), eventJobLocation);
   }
 
   /**
@@ -778,6 +977,16 @@ public interface JobVersionDao extends BaseDao {
       @NonNull NamespaceRow namespaceRow,
       UUID runUuid,
       @NonNull RunIoSnapshot runIoSnapshot) {
+    return loadJobRowRunDetails(jobRow, namespaceRow, runUuid, runIoSnapshot, jobRow.getLocation());
+  }
+
+  /** Intake variant whose immutable version identity uses the exact event's location. */
+  default JobRowRunDetails loadJobRowRunDetails(
+      @NonNull JobRow jobRow,
+      @NonNull NamespaceRow namespaceRow,
+      UUID runUuid,
+      @NonNull RunIoSnapshot runIoSnapshot,
+      @Nullable String eventJobLocation) {
     validateNamespace(jobRow, namespaceRow);
 
     // Generate the version for the job; the version may already exist.
@@ -796,7 +1005,7 @@ public interface JobVersionDao extends BaseDao {
                 runIoSnapshot.getOutputs().stream()
                     .map(o -> (DatasetVersionRow) o)
                     .collect(Collectors.toList())),
-            jobRow.getLocation());
+            eventJobLocation);
 
     return new JobRowRunDetails(
         jobRow,
@@ -804,7 +1013,8 @@ public interface JobVersionDao extends BaseDao {
         namespaceRow,
         runIoSnapshot.getInputs(),
         runIoSnapshot.getOutputs(),
-        jobVersion);
+        jobVersion,
+        eventJobLocation);
   }
 
   private static void validateNamespace(JobRow jobRow, NamespaceRow namespaceRow) {
@@ -855,7 +1065,8 @@ public interface JobVersionDao extends BaseDao {
       NamespaceRow namespaceRow,
       List<ExtendedDatasetVersionRow> jobVersionInputs,
       List<ExtendedDatasetVersionRow> jobVersionOutputs,
-      Version jobVersion) {}
+      Version jobVersion,
+      @Nullable String jobLocation) {}
 
   class JobDatasetMapper implements RowMapper<JobDataset> {
     @Override

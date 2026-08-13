@@ -33,8 +33,10 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpRequest.BodyPublishers;
 import java.net.http.HttpResponse;
 import java.net.http.HttpResponse.BodyHandlers;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import marquez.client.MarquezClient;
 import marquez.client.Utils;
 import marquez.client.models.DatasetId;
@@ -48,6 +50,8 @@ import marquez.client.models.SourceMeta;
 import marquez.client.models.StreamMeta;
 import marquez.client.models.Tag;
 import marquez.common.models.SourceType;
+import org.jdbi.v3.core.Handle;
+import org.jdbi.v3.core.Jdbi;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
@@ -57,6 +61,8 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 
 @Testcontainers
 public abstract class BaseIntegrationTest {
+  private static final long OPEN_LINEAGE_PROJECTION_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(20);
+
   protected static final String CONFIG_FILE = "config.test.yml";
   protected static final String CONFIG_FILE_PATH = ResourceHelpers.resourceFilePath(CONFIG_FILE);
 
@@ -213,6 +219,95 @@ public abstract class BaseIntegrationTest {
     return http2.sendAsync(request, BodyHandlers.ofString());
   }
 
+  /**
+   * Waits until every admitted OpenLineage event has committed its relational projection.
+   *
+   * <p>A successful worker transaction projects the event and removes its queue head atomically, so
+   * an empty head table is the integration-test barrier for projection visibility. This
+   * deliberately reads at most one head and one dead letter per poll: a test backlog may contain
+   * millions of immutable payload rows. HTTP helpers stay admission-only; tests that read projected
+   * state must invoke this method explicitly.
+   */
+  protected void awaitOpenLineageProjection() {
+    awaitOpenLineageProjection(
+        Jdbi.create(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword()));
+  }
+
+  protected void awaitOpenLineageProjection(Jdbi jdbi) {
+    long deadline = System.nanoTime() + OPEN_LINEAGE_PROJECTION_TIMEOUT_NANOS;
+    try (Handle handle = jdbi.open()) {
+      while (true) {
+        Optional<OpenLineageQueueHead> pending =
+            handle
+                .createQuery(
+                    """
+                    SELECT ordering_key::text,
+                           event_id,
+                           attempt_count,
+                           available_at::text,
+                           refresh_due_on_advance,
+                           last_error
+                    FROM open_lineage_queue_heads
+                    LIMIT 1
+                    """)
+                .map(
+                    (resultSet, context) ->
+                        new OpenLineageQueueHead(
+                            resultSet.getString("ordering_key"),
+                            resultSet.getLong("event_id"),
+                            resultSet.getInt("attempt_count"),
+                            resultSet.getString("available_at"),
+                            resultSet.getBoolean("refresh_due_on_advance"),
+                            resultSet.getString("last_error")))
+                .findOne();
+
+        Optional<OpenLineageDeadLetter> deadLetter =
+            handle
+                .createQuery(
+                    """
+                    SELECT id,
+                           ordering_key::text,
+                           enqueued_at::text,
+                           dead_at::text,
+                           attempt_count,
+                           last_error
+                    FROM open_lineage_dead_letters
+                    ORDER BY dead_at, id
+                    LIMIT 1
+                    """)
+                .map(
+                    (resultSet, context) ->
+                        new OpenLineageDeadLetter(
+                            resultSet.getLong("id"),
+                            resultSet.getString("ordering_key"),
+                            resultSet.getString("enqueued_at"),
+                            resultSet.getString("dead_at"),
+                            resultSet.getInt("attempt_count"),
+                            resultSet.getString("last_error")))
+                .findOne();
+
+        if (deadLetter.isPresent()) {
+          throw new AssertionError("OpenLineage event was dead-lettered: " + deadLetter.get());
+        }
+        if (pending.isEmpty()) {
+          return;
+        }
+        if (System.nanoTime() >= deadline) {
+          throw new AssertionError(
+              "Timed out waiting for OpenLineage projection: " + pending.get());
+        }
+
+        try {
+          TimeUnit.MILLISECONDS.sleep(25);
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          throw new AssertionError(
+              "Interrupted while waiting for OpenLineage projection", interrupted);
+        }
+      }
+    }
+  }
+
   protected CompletableFuture<HttpResponse<String>> getMetrics() {
     HttpRequest request =
         HttpRequest.newBuilder().uri(URI.create(baseUrl + "/metrics")).GET().build();
@@ -289,4 +384,20 @@ public abstract class BaseIntegrationTest {
               }
             });
   }
+
+  private record OpenLineageQueueHead(
+      String orderingKey,
+      long eventId,
+      int attemptCount,
+      String availableAt,
+      boolean refreshDueOnAdvance,
+      String lastError) {}
+
+  private record OpenLineageDeadLetter(
+      long id,
+      String orderingKey,
+      String enqueuedAt,
+      String deadAt,
+      int attemptCount,
+      String lastError) {}
 }

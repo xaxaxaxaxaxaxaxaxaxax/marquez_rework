@@ -1,4 +1,11 @@
 ## These value overrides are used within the GitHub Actions CI validation.
 ##
+marquez:
+  image:
+    registry: docker.io
+    repository: marquezproject/marquez
+    tag: chart-test
+    pullPolicy: Never
+
 postgresql:
   enabled: true

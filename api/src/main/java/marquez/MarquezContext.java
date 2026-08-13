@@ -5,14 +5,14 @@
 
 package marquez;
 
+import com.codahale.metrics.MetricRegistry;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import graphql.kickstart.servlet.GraphQLHttpServlet;
+import io.dropwizard.jersey.jackson.JsonProcessingExceptionMapper;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.Executor;
-import java.util.concurrent.ForkJoinPool;
 import lombok.Getter;
 import lombok.NonNull;
 import marquez.api.ColumnLineageResource;
@@ -25,7 +25,6 @@ import marquez.api.SourceResource;
 import marquez.api.StatsResource;
 import marquez.api.TagResource;
 import marquez.api.exceptions.JdbiExceptionExceptionMapper;
-import marquez.api.exceptions.JsonProcessingExceptionMapper;
 import marquez.db.BaseDao;
 import marquez.db.ColumnLineageDao;
 import marquez.db.DatasetDao;
@@ -37,6 +36,7 @@ import marquez.db.JobVersionDao;
 import marquez.db.LineageDao;
 import marquez.db.NamespaceDao;
 import marquez.db.OpenLineageDao;
+import marquez.db.OpenLineageQueueDao;
 import marquez.db.RunArgsDao;
 import marquez.db.RunDao;
 import marquez.db.RunFacetsDao;
@@ -55,7 +55,10 @@ import marquez.service.DatasetVersionService;
 import marquez.service.JobService;
 import marquez.service.LineageService;
 import marquez.service.NamespaceService;
+import marquez.service.OpenLineageConfig;
+import marquez.service.OpenLineageIntake;
 import marquez.service.OpenLineageService;
+import marquez.service.OpenLineageWorker;
 import marquez.service.RunService;
 import marquez.service.RunTransitionListener;
 import marquez.service.SearchService;
@@ -82,6 +85,7 @@ public final class MarquezContext {
   @Getter private final RunStateDao runStateDao;
   @Getter private final TagDao tagDao;
   @Getter private final OpenLineageDao openLineageDao;
+  @Getter private final OpenLineageQueueDao openLineageQueueDao;
   @Getter private final LineageDao lineageDao;
   @Getter private final ColumnLineageDao columnLineageDao;
   @Getter private final SearchDao searchDao;
@@ -95,6 +99,8 @@ public final class MarquezContext {
   @Getter private final TagService tagService;
   @Getter private final RunService runService;
   @Getter private final OpenLineageService openLineageService;
+  @Getter private final OpenLineageIntake openLineageIntake;
+  @Getter private final OpenLineageWorker openLineageWorker;
   @Getter private final LineageService lineageService;
   @Getter private final ColumnLineageService columnLineageService;
   @Getter private final SearchService searchService;
@@ -118,9 +124,10 @@ public final class MarquezContext {
   private MarquezContext(
       @NonNull final Jdbi jdbi,
       @NonNull final SearchConfig searchConfig,
+      @NonNull final OpenLineageConfig openLineageConfig,
+      @NonNull final MetricRegistry metricRegistry,
       @NonNull final ImmutableSet<Tag> tags,
-      List<RunTransitionListener> runTransitionListeners,
-      @NonNull Executor openLineageExecutor) {
+      List<RunTransitionListener> runTransitionListeners) {
     if (runTransitionListeners == null) {
       runTransitionListeners = new ArrayList<>();
     }
@@ -141,6 +148,7 @@ public final class MarquezContext {
     this.runStateDao = jdbi.onDemand(RunStateDao.class);
     this.tagDao = jdbi.onDemand(TagDao.class);
     this.openLineageDao = jdbi.onDemand(OpenLineageDao.class);
+    this.openLineageQueueDao = jdbi.onDemand(OpenLineageQueueDao.class);
     this.lineageDao = jdbi.onDemand(LineageDao.class);
     this.columnLineageDao = jdbi.onDemand(ColumnLineageDao.class);
     this.searchDao = jdbi.onDemand(SearchDao.class);
@@ -156,13 +164,16 @@ public final class MarquezContext {
     this.tagService = new TagService(baseDao);
     this.tagService.init(tags);
     this.searchService = new SearchService(searchConfig);
-    this.openLineageService =
-        new OpenLineageService(baseDao, runService, searchService, openLineageExecutor);
+    this.openLineageService = new OpenLineageService(baseDao, runService, searchService);
+    this.openLineageWorker =
+        new OpenLineageWorker(
+            jdbi, openLineageQueueDao, openLineageService, openLineageConfig, metricRegistry);
+    this.openLineageIntake = new OpenLineageIntake(openLineageQueueDao, openLineageWorker::wakeUp);
     this.lineageService = new LineageService(lineageDao, jobDao, runDao);
     this.columnLineageService = new ColumnLineageService(columnLineageDao, datasetFieldDao);
     this.statsService = new StatsService(statsDao);
     this.jdbiException = new JdbiExceptionExceptionMapper();
-    this.jsonException = new JsonProcessingExceptionMapper();
+    this.jsonException = new JsonProcessingExceptionMapper(false);
     final ServiceFactory serviceFactory =
         ServiceFactory.builder()
             .datasetService(datasetService)
@@ -185,7 +196,8 @@ public final class MarquezContext {
     this.columnLineageResource = new ColumnLineageResource(serviceFactory);
     this.jobResource = new JobResource(serviceFactory, jobVersionDao, jobFacetsDao, runFacetsDao);
     this.tagResource = new TagResource(serviceFactory);
-    this.openLineageResource = new OpenLineageResource(serviceFactory, openLineageDao);
+    this.openLineageResource =
+        new OpenLineageResource(serviceFactory, openLineageDao, openLineageIntake);
     this.searchResource = new SearchResource(searchDao);
     this.opsResource = new StatsResource(serviceFactory);
     this.v2BetasearchResource = new marquez.api.v2beta.SearchResource(serviceFactory);
@@ -217,14 +229,16 @@ public final class MarquezContext {
 
     private Jdbi jdbi;
     private SearchConfig searchConfig;
+    private OpenLineageConfig openLineageConfig;
+    private MetricRegistry metricRegistry;
     private ImmutableSet<Tag> tags;
     private List<RunTransitionListener> runTransitionListeners;
-    private Executor openLineageExecutor;
 
     Builder() {
+      this.openLineageConfig = new OpenLineageConfig();
+      this.metricRegistry = new MetricRegistry();
       this.tags = ImmutableSet.of();
       this.runTransitionListeners = new ArrayList<>();
-      this.openLineageExecutor = ForkJoinPool.commonPool();
     }
 
     public Builder jdbi(@NonNull Jdbi jdbi) {
@@ -234,6 +248,16 @@ public final class MarquezContext {
 
     public Builder searchConfig(@NonNull SearchConfig searchConfig) {
       this.searchConfig = searchConfig;
+      return this;
+    }
+
+    public Builder openLineageConfig(@NonNull OpenLineageConfig openLineageConfig) {
+      this.openLineageConfig = openLineageConfig;
+      return this;
+    }
+
+    public Builder metricRegistry(@NonNull MetricRegistry metricRegistry) {
+      this.metricRegistry = metricRegistry;
       return this;
     }
 
@@ -252,14 +276,9 @@ public final class MarquezContext {
       return this;
     }
 
-    public Builder openLineageExecutor(@NonNull Executor openLineageExecutor) {
-      this.openLineageExecutor = openLineageExecutor;
-      return this;
-    }
-
     public MarquezContext build() {
       return new MarquezContext(
-          jdbi, searchConfig, tags, runTransitionListeners, openLineageExecutor);
+          jdbi, searchConfig, openLineageConfig, metricRegistry, tags, runTransitionListeners);
     }
   }
 }

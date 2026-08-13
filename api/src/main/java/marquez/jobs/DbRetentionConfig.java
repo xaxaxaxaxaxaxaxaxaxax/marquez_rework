@@ -15,7 +15,12 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Value;
 
-/** Configuration for {@link DbRetentionJob}. */
+/**
+ * Configuration for {@link DbRetentionJob}. The retention age and batch size also apply to queued
+ * OpenLineage dead letters. Live queued events are never age-purged, and dead letters are retained
+ * indefinitely when scheduled database retention is not configured and no one-off retention command
+ * is invoked.
+ */
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor

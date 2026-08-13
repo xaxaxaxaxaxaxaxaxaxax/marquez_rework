@@ -35,6 +35,7 @@ import java.util.Optional;
 import java.util.UUID;
 import lombok.Getter;
 import marquez.api.JdbiUtils;
+import marquez.common.Utils;
 import marquez.common.models.DatasetName;
 import marquez.common.models.DatasetType;
 import marquez.common.models.Field;
@@ -45,6 +46,7 @@ import marquez.db.DatasetDao.DatasetCurrentVersionUpdate;
 import marquez.db.DatasetDao.DatasetUpsert;
 import marquez.db.models.DatasetRow;
 import marquez.db.models.NamespaceRow;
+import marquez.db.models.ProjectionOrder;
 import marquez.db.models.SourceRow;
 import marquez.jdbi.MarquezJdbiExternalPostgresExtension;
 import marquez.service.models.DatasetVersion;
@@ -380,6 +382,116 @@ class DatasetDaoTest {
   }
 
   @Test
+  void legacyDatasetWritesResetOnlyTheirLaneAndEstablishMonotonicBaselines() {
+    Instant t0 = Instant.parse("2026-08-01T00:00:00Z");
+    Instant t1 = t0.plusSeconds(10);
+    Instant t2 = t0.plusSeconds(20);
+    Instant t3 = t0.plusSeconds(30);
+    Instant t4 = t0.plusSeconds(40);
+    NamespaceRow namespace =
+        jdbi.onDemand(NamespaceDao.class)
+            .upsertNamespaceRow(
+                UUID.randomUUID(),
+                t0,
+                "legacy-watermark-ns",
+                OpenLineageDao.DEFAULT_NAMESPACE_OWNER);
+    SourceRow source =
+        jdbi.onDemand(SourceDao.class)
+            .upsertOrDefault(UUID.randomUUID(), "POSTGRES", t0, "legacy-watermark-source", "");
+
+    DatasetRow snapshotRow = newDatasetRow(namespace, source, t0, "legacy-snapshot");
+    DatasetUpsert orderedSnapshot =
+        newDatasetUpsert(
+            snapshotRow.getUuid(),
+            DatasetType.DB_TABLE,
+            t1,
+            namespace,
+            source,
+            snapshotRow.getName(),
+            "ordered-t1",
+            "ordered-t1",
+            false);
+    datasetDao.upsertAllInTransaction(
+        List.of(orderedSnapshot), new ProjectionOrder(t1, Utils.sha256Utf8("snapshot-t1")));
+    datasetDao.upsert(
+        snapshotRow.getUuid(),
+        DatasetType.STREAM,
+        t3,
+        namespace.getUuid(),
+        namespace.getName(),
+        source.getUuid(),
+        source.getName(),
+        snapshotRow.getName(),
+        "legacy-t3",
+        "legacy-t3",
+        false);
+
+    DatasetUpsert staleSnapshot =
+        newDatasetUpsert(
+            snapshotRow.getUuid(),
+            DatasetType.DB_TABLE,
+            t2,
+            namespace,
+            source,
+            snapshotRow.getName(),
+            "stale-t2",
+            "stale-t2",
+            false);
+    datasetDao.upsertAllInTransaction(
+        List.of(staleSnapshot), new ProjectionOrder(t2, Utils.sha256Utf8("snapshot-t2")));
+    Map<String, Object> snapshotState = rawProjectionState(snapshotRow.getUuid());
+    assertThat(snapshotState.get("description")).isEqualTo("legacy-t3");
+    assertThat(snapshotState.get("open_lineage_snapshot_time")).isNull();
+    assertThat(((java.sql.Timestamp) snapshotState.get("updated_at")).toInstant()).isEqualTo(t3);
+
+    DatasetRow pointerRow = newDatasetRow(namespace, source, t0, "legacy-pointer");
+    UUID orderedVersion = UUID.randomUUID();
+    UUID legacyVersion = UUID.randomUUID();
+    UUID staleVersion = UUID.randomUUID();
+    assertThat(
+            datasetDao.updateVersionsInTransaction(
+                List.of(new DatasetCurrentVersionUpdate(pointerRow.getUuid(), t1, orderedVersion)),
+                new ProjectionOrder(t1, Utils.sha256Utf8("pointer-t1"))))
+        .isEqualTo(1);
+    datasetDao.updateVersion(pointerRow.getUuid(), t3, legacyVersion);
+    assertThat(
+            datasetDao.updateVersionsInTransaction(
+                List.of(new DatasetCurrentVersionUpdate(pointerRow.getUuid(), t2, staleVersion)),
+                new ProjectionOrder(t2, Utils.sha256Utf8("pointer-t2"))))
+        .isZero();
+    Map<String, Object> pointerState = rawProjectionState(pointerRow.getUuid());
+    assertThat(pointerState.get("current_version_uuid")).isEqualTo(legacyVersion);
+    assertThat(pointerState.get("open_lineage_current_version_time")).isNull();
+    assertThat(((java.sql.Timestamp) pointerState.get("updated_at")).toInstant()).isEqualTo(t3);
+
+    datasetDao.delete(namespace.getName(), pointerRow.getName()).orElseThrow();
+    assertThat(
+            datasetDao.updateVersionsInTransaction(
+                List.of(
+                    new DatasetCurrentVersionUpdate(pointerRow.getUuid(), t4, UUID.randomUUID())),
+                new ProjectionOrder(t4, Utils.sha256Utf8("pointer-t4"))))
+        .isZero();
+    assertThat(rawProjectionState(pointerRow.getUuid()).get("current_version_uuid"))
+        .isEqualTo(legacyVersion);
+  }
+
+  private static Map<String, Object> rawProjectionState(UUID datasetUuid) {
+    return jdbi.withHandle(
+        handle ->
+            handle
+                .createQuery(
+                    """
+                    SELECT updated_at, description, current_version_uuid,
+                           open_lineage_snapshot_time, open_lineage_current_version_time
+                    FROM datasets
+                    WHERE uuid = :uuid
+                    """)
+                .bind("uuid", datasetUuid)
+                .mapToMap()
+                .one());
+  }
+
+  @Test
   @SuppressWarnings("unchecked")
   void testUpsertAllUsesBoundedGloballyOrderedChunksAndRestoresInputOrder() {
     DatasetDao batchingDao = mock(DatasetDao.class, CALLS_REAL_METHODS);
@@ -709,7 +821,29 @@ class DatasetDaoTest {
     List<marquez.service.models.Dataset> datasets = datasetDao.findAll(NAMESPACE, 5, 0);
     assertThat(datasets).hasSize(3);
 
-    datasetDao.delete(NAMESPACE, deletedDatasetName);
+    DatasetRow beforeDelete =
+        datasetDao.findDatasetAsRow(NAMESPACE, deletedDatasetName).orElseThrow();
+    DatasetRow deleted = datasetDao.delete(NAMESPACE, deletedDatasetName).orElseThrow();
+    assertThat(deleted.getUpdatedAt()).isAfterOrEqualTo(beforeDelete.getUpdatedAt());
+
+    Instant staleEventTime = deleted.getUpdatedAt().minusSeconds(1);
+    DatasetUpsert staleReplay =
+        new DatasetUpsert(
+            deleted.getUuid(),
+            DatasetType.valueOf(deleted.getType()),
+            staleEventTime,
+            deleted.getNamespaceUuid(),
+            deleted.getNamespaceName(),
+            deleted.getSourceUuid(),
+            deleted.getSourceName(),
+            deleted.getName(),
+            deleted.getPhysicalName(),
+            "stale replay",
+            deleted.isDeleted());
+    datasetDao.upsertAllInTransaction(
+        List.of(staleReplay),
+        new ProjectionOrder(staleEventTime, Utils.sha256Utf8("stale replay")));
+    assertThat(datasetDao.findDatasetByName(NAMESPACE, deletedDatasetName)).isEmpty();
 
     datasets = datasetDao.findAll(NAMESPACE, 5, 0);
     assertThat(datasets).hasSize(2);
@@ -769,6 +903,25 @@ class DatasetDaoTest {
                 "http://test.producer/",
                 "_schemaURL",
                 "http://test.schema/"));
+
+    Instant newerEventTime = deleted.getUpdatedAt().plusSeconds(1);
+    DatasetUpsert newerReplay =
+        new DatasetUpsert(
+            deleted.getUuid(),
+            DatasetType.valueOf(deleted.getType()),
+            newerEventTime,
+            deleted.getNamespaceUuid(),
+            deleted.getNamespaceName(),
+            deleted.getSourceUuid(),
+            deleted.getSourceName(),
+            deleted.getName(),
+            deleted.getPhysicalName(),
+            "newer replay",
+            deleted.isDeleted());
+    datasetDao.upsertAllInTransaction(
+        List.of(newerReplay),
+        new ProjectionOrder(newerEventTime, Utils.sha256Utf8("newer replay")));
+    assertThat(datasetDao.findDatasetByName(NAMESPACE, deletedDatasetName)).isPresent();
   }
 
   @Test

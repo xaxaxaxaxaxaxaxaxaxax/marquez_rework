@@ -25,6 +25,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
@@ -33,6 +34,7 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import marquez.api.JdbiUtils;
+import marquez.common.Utils;
 import marquez.common.models.DatasetId;
 import marquez.common.models.DatasetVersionId;
 import marquez.common.models.InputDatasetVersion;
@@ -50,6 +52,7 @@ import marquez.jdbi.MarquezJdbiExternalPostgresExtension;
 import marquez.service.models.JobMeta;
 import marquez.service.models.Run;
 import org.assertj.core.api.InstanceOfAssertFactories;
+import org.jdbi.v3.core.Handle;
 import org.jdbi.v3.core.Jdbi;
 import org.jetbrains.annotations.NotNull;
 import org.junit.jupiter.api.AfterEach;
@@ -491,6 +494,303 @@ class RunDaoTest {
   }
 
   @Test
+  void runUpsertAddsAParentOnceAndNeverReplacesIt() {
+    JobRow childJob =
+        newJobWith(
+            jdbi,
+            namespaceRow.getName(),
+            newJobName().getValue(),
+            newJobMetaWith(NamespaceName.of(namespaceRow.getName())));
+    JobRow parentJob =
+        newJobWith(
+            jdbi,
+            namespaceRow.getName(),
+            newJobName().getValue(),
+            newJobMetaWith(NamespaceName.of(namespaceRow.getName())));
+    RunArgsRow args = DbTestUtils.newRunArgs(jdbi);
+    UUID childRunUuid = UUID.randomUUID();
+    UUID firstParentUuid = DbTestUtils.newRun(jdbi, parentJob).getUuid();
+    UUID conflictingParentUuid = DbTestUtils.newRun(jdbi, parentJob).getUuid();
+    Instant now = Instant.parse("2026-08-13T01:00:00Z");
+
+    runDao.upsert(
+        childRunUuid,
+        null,
+        childRunUuid.toString(),
+        now,
+        childJob.getUuid(),
+        null,
+        args.getUuid(),
+        null,
+        null,
+        namespaceRow.getName(),
+        childJob.getName(),
+        null);
+    assertThat(runDao.findRunByUuidAsRow(childRunUuid).orElseThrow().getParentRunUuid()).isEmpty();
+
+    runDao.upsert(
+        childRunUuid,
+        firstParentUuid,
+        childRunUuid.toString(),
+        now.plusSeconds(1),
+        childJob.getUuid(),
+        null,
+        args.getUuid(),
+        null,
+        null,
+        namespaceRow.getName(),
+        childJob.getName(),
+        null);
+    runDao.upsert(
+        childRunUuid,
+        conflictingParentUuid,
+        childRunUuid.toString(),
+        now.plusSeconds(2),
+        childJob.getUuid(),
+        null,
+        args.getUuid(),
+        null,
+        null,
+        RunState.RUNNING,
+        now.plusSeconds(2),
+        namespaceRow.getName(),
+        childJob.getName(),
+        null);
+
+    assertThat(runDao.findRunByUuidAsRow(childRunUuid).orElseThrow().getParentRunUuid())
+        .contains(firstParentUuid);
+  }
+
+  @Test
+  void syntheticAndObservedNormalAndLegacyCandidatesConverge() {
+    JobRow owner = newRunOwner();
+    RunArgsRow neutralArgs = DbTestUtils.newRunArgs(jdbi);
+    RunArgsRow observedArgs = DbTestUtils.newRunArgs(jdbi);
+    String externalId = "legacy-parent-run";
+    UUID normal = Utils.openLineageRunUuid(externalId);
+    UUID legacy = Utils.toNameBasedUuid(owner.getNamespaceName(), owner.getName(), externalId);
+
+    RunRow fromLegacy = syntheticParent(owner, neutralArgs, legacy, externalId);
+    RunRow fromNormal = syntheticParent(owner, neutralArgs, normal, externalId);
+
+    assertThat(fromLegacy.getUuid()).isEqualTo(legacy);
+    assertThat(fromNormal.getUuid()).isEqualTo(legacy);
+    assertThat(fromLegacy.getCreatedAt()).isEqualTo(Instant.EPOCH);
+    assertThat(parentPlaceholder(legacy)).isTrue();
+    assertThat(runCount(owner.getUuid(), externalId)).isEqualTo(1);
+
+    RunRow observed =
+        runDao.upsertOpenLineageRun(
+            observedRun(owner, observedArgs, externalId, Instant.parse("2026-08-14T00:30:00Z")));
+
+    assertThat(observed.getUuid()).isEqualTo(legacy);
+    assertThat(observed.getRunArgsUuid()).isEqualTo(observedArgs.getUuid());
+    assertThat(parentPlaceholderIsNull(legacy)).isTrue();
+    assertThat(runCount(owner.getUuid(), externalId)).isEqualTo(1);
+  }
+
+  @Test
+  void observedRunPromotesMatchingPlaceholderOnceAndPreservesRealIdentityFields() {
+    JobRow owner = newRunOwner();
+    RunArgsRow neutralArgs = DbTestUtils.newRunArgs(jdbi);
+    RunArgsRow observedArgs = DbTestUtils.newRunArgs(jdbi);
+    RunArgsRow laterArgs = DbTestUtils.newRunArgs(jdbi);
+    UUID normal = UUID.randomUUID();
+    String syntheticSpelling = normal.toString().toUpperCase();
+    String observedSpelling = normal.toString();
+    syntheticParent(owner, neutralArgs, normal, syntheticSpelling);
+    Instant observedAt = Instant.parse("2026-08-14T01:00:00Z");
+
+    RunRow promoted =
+        runDao.upsertOpenLineageRun(observedRun(owner, observedArgs, observedSpelling, observedAt));
+    RunRow repeated =
+        runDao.upsertOpenLineageRun(
+            observedRun(owner, laterArgs, observedSpelling, observedAt.plusSeconds(30)));
+
+    assertThat(promoted.getUuid()).isEqualTo(normal);
+    assertThat(promoted.getCreatedAt()).isEqualTo(observedAt);
+    assertThat(promoted.getRunArgsUuid()).isEqualTo(observedArgs.getUuid());
+    assertThat(parentPlaceholderIsNull(normal)).isTrue();
+    assertThat(repeated.getCreatedAt()).isEqualTo(observedAt);
+    assertThat(repeated.getRunArgsUuid()).isEqualTo(observedArgs.getUuid());
+    assertThat(runExternalId(normal)).isEqualTo(syntheticSpelling);
+  }
+
+  @Test
+  void observedRunReusesUnclassifiedLegacyCandidateWithoutPromotingIdentityFields() {
+    JobRow owner = newRunOwner();
+    RunArgsRow legacyArgs = DbTestUtils.newRunArgs(jdbi);
+    RunArgsRow observedArgs = DbTestUtils.newRunArgs(jdbi);
+    String externalId = "unclassified-parent-" + UUID.randomUUID();
+    UUID normal = Utils.openLineageRunUuid(externalId);
+    Instant legacyCreatedAt = Instant.parse("2000-01-01T00:00:00Z");
+    runDao.upsert(
+        normal,
+        null,
+        externalId,
+        legacyCreatedAt,
+        owner.getUuid(),
+        null,
+        legacyArgs.getUuid(),
+        null,
+        null,
+        owner.getNamespaceName(),
+        owner.getName(),
+        "legacy-location");
+    assertThat(parentPlaceholderIsNull(normal)).isTrue();
+
+    Instant observedAt = Instant.parse("2026-08-14T01:30:00Z");
+    RunRow observed =
+        runDao.upsertOpenLineageRun(observedRun(owner, observedArgs, externalId, observedAt));
+
+    assertThat(observed.getUuid()).isEqualTo(normal);
+    assertThat(observed.getCreatedAt()).isEqualTo(legacyCreatedAt);
+    assertThat(observed.getRunArgsUuid()).isEqualTo(legacyArgs.getUuid());
+    assertThat(observed.getUpdatedAt()).isEqualTo(observedAt);
+    assertThat(observed.getCurrentRunState()).contains(RunState.RUNNING.name());
+    assertThat(parentPlaceholderIsNull(normal)).isTrue();
+    assertThat(runCount(owner.getUuid(), externalId)).isEqualTo(1);
+  }
+
+  @Test
+  void foreignNormalIdentityUsesOneRepairWithoutMutatingForeignRun() {
+    JobRow owner = newRunOwner();
+    JobRow foreignOwner = newRunOwner();
+    RunArgsRow foreignArgs = DbTestUtils.newRunArgs(jdbi);
+    RunArgsRow observedArgs = DbTestUtils.newRunArgs(jdbi);
+    String externalId = "shared-reported-run";
+    UUID normal = Utils.openLineageRunUuid(externalId);
+    Instant foreignTime = Instant.parse("2026-08-14T02:00:00Z");
+    runDao.upsert(
+        normal,
+        null,
+        externalId,
+        foreignTime,
+        foreignOwner.getUuid(),
+        null,
+        foreignArgs.getUuid(),
+        foreignTime,
+        foreignTime.plusSeconds(5),
+        RunState.COMPLETED,
+        foreignTime.plusSeconds(5),
+        foreignOwner.getNamespaceName(),
+        foreignOwner.getName(),
+        "foreign-location");
+    Map<String, Object> before = runIdentityState(normal);
+
+    RunRow resolved =
+        runDao.upsertOpenLineageRun(
+            observedRun(owner, observedArgs, externalId, foreignTime.plusSeconds(30)));
+
+    assertThat(resolved.getUuid())
+        .isEqualTo(
+            Utils.toNameBasedUuid(owner.getNamespaceName(), owner.getName(), normal.toString()));
+    assertThat(runIdentityState(normal)).isEqualTo(before);
+  }
+
+  @Test
+  void mismatchedSameJobCandidateIsSkippedWithoutMutation() {
+    JobRow owner = newRunOwner();
+    RunArgsRow existingArgs = DbTestUtils.newRunArgs(jdbi);
+    RunArgsRow observedArgs = DbTestUtils.newRunArgs(jdbi);
+    String externalId = "intended-run";
+    UUID normal = Utils.openLineageRunUuid(externalId);
+    Instant existingTime = Instant.parse("2026-08-14T03:00:00Z");
+    runDao.upsert(
+        normal,
+        null,
+        "different-run",
+        existingTime,
+        owner.getUuid(),
+        null,
+        existingArgs.getUuid(),
+        null,
+        null,
+        owner.getNamespaceName(),
+        owner.getName(),
+        "existing-location");
+    Map<String, Object> before = runIdentityState(normal);
+
+    RunRow resolved =
+        runDao.upsertOpenLineageRun(
+            observedRun(owner, observedArgs, externalId, existingTime.plusSeconds(30)));
+
+    assertThat(resolved.getUuid()).isNotEqualTo(normal);
+    assertThat(runIdentityState(normal)).isEqualTo(before);
+  }
+
+  @Test
+  void twoMatchingBoundedCandidatesFailWithoutMutation() {
+    JobRow owner = newRunOwner();
+    RunArgsRow args = DbTestUtils.newRunArgs(jdbi);
+    String externalId = "ambiguous-run";
+    UUID normal = Utils.openLineageRunUuid(externalId);
+    UUID legacy = Utils.toNameBasedUuid(owner.getNamespaceName(), owner.getName(), externalId);
+    Instant initial = Instant.parse("2026-08-14T04:00:00Z");
+    insertRealRun(owner, args, normal, externalId, initial);
+    insertRealRun(owner, args, legacy, externalId, initial);
+    Map<String, Object> normalBefore = runIdentityState(normal);
+    Map<String, Object> legacyBefore = runIdentityState(legacy);
+
+    assertThatThrownBy(
+            () ->
+                runDao.upsertOpenLineageRun(
+                    observedRun(owner, args, externalId, initial.plusSeconds(30))))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("Multiple OpenLineage runs match");
+    assertThat(runIdentityState(normal)).isEqualTo(normalBefore);
+    assertThat(runIdentityState(legacy)).isEqualTo(legacyBefore);
+  }
+
+  @Test
+  void rolledBackPromotionRestoresNeutralMarkerAndFields() {
+    JobRow owner = newRunOwner();
+    RunArgsRow neutralArgs = DbTestUtils.newRunArgs(jdbi);
+    RunArgsRow observedArgs = DbTestUtils.newRunArgs(jdbi);
+    String externalId = "rollback-parent";
+    UUID normal = Utils.openLineageRunUuid(externalId);
+    syntheticParent(owner, neutralArgs, normal, externalId);
+
+    assertThatThrownBy(
+            () ->
+                jdbi.useTransaction(
+                    handle -> {
+                      RunDao transactional = handle.attach(RunDao.class);
+                      transactional.upsertOpenLineageRun(
+                          observedRun(
+                              owner,
+                              observedArgs,
+                              externalId,
+                              Instant.parse("2026-08-14T05:00:00Z")));
+                      assertThat(parentPlaceholder(handle, normal)).isFalse();
+                      throw new IllegalStateException("rollback probe");
+                    }))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessage("rollback probe");
+
+    RunRow restored = runDao.findRunByUuidAsRow(normal).orElseThrow();
+    assertThat(restored.getCreatedAt()).isEqualTo(Instant.EPOCH);
+    assertThat(restored.getRunArgsUuid()).isEqualTo(neutralArgs.getUuid());
+    assertThat(parentPlaceholder(normal)).isTrue();
+  }
+
+  @Test
+  void ordinaryObservedRunInsertsDirectlyWithNullMarker() {
+    JobRow owner = newRunOwner();
+    RunArgsRow args = DbTestUtils.newRunArgs(jdbi);
+    String externalId = UUID.randomUUID().toString().toUpperCase();
+    Instant observedAt = Instant.parse("2026-08-14T06:00:00Z");
+
+    RunRow inserted = runDao.upsertOpenLineageRun(observedRun(owner, args, externalId, observedAt));
+
+    assertThat(inserted.getUuid()).isEqualTo(UUID.fromString(externalId));
+    assertThat(inserted.getCreatedAt()).isEqualTo(observedAt);
+    assertThat(inserted.getRunArgsUuid()).isEqualTo(args.getUuid());
+    assertThat(parentPlaceholderIsNull(inserted.getUuid())).isTrue();
+    assertThat(runExternalId(inserted.getUuid())).isEqualTo(externalId);
+  }
+
+  @Test
   public void findRunByUuidAsExtendedRowReturnsCoreEnrichmentAndUpdatedExternalId() {
     final RunDao runDao = jdbi.onDemand(RunDao.class);
 
@@ -543,6 +843,123 @@ class RunDaoTest {
         .map(DatasetVersionId::getName)
         .containsExactlyInAnyOrderElementsOf(
             jobMeta.getOutputs().stream().map(DatasetId::getName).collect(Collectors.toSet()));
+  }
+
+  private JobRow newRunOwner() {
+    return newJobWith(
+        jdbi,
+        namespaceRow.getName(),
+        newJobName().getValue(),
+        newJobMetaWith(NamespaceName.of(namespaceRow.getName())));
+  }
+
+  private RunRow syntheticParent(
+      JobRow owner, RunArgsRow args, UUID requestedUuid, String externalId) {
+    return runDao.getOrCreateSyntheticParentRun(
+        requestedUuid,
+        externalId,
+        owner.getUuid(),
+        args.getUuid(),
+        owner.getNamespaceName(),
+        owner.getName());
+  }
+
+  private RunDao.RunUpsert observedRun(
+      JobRow owner, RunArgsRow args, String externalId, Instant now) {
+    return RunDao.RunUpsert.builder()
+        .runUuid(Utils.openLineageRunUuid(externalId))
+        .externalId(externalId)
+        .now(now)
+        .jobUuid(owner.getUuid())
+        .runArgsUuid(args.getUuid())
+        .nominalStartTime(now.minusSeconds(1))
+        .nominalEndTime(now.plusSeconds(1))
+        .runStateType(RunState.RUNNING)
+        .runStateTime(now)
+        .namespaceName(owner.getNamespaceName())
+        .jobName(owner.getName())
+        .location("observed-location")
+        .build();
+  }
+
+  private void insertRealRun(
+      JobRow owner, RunArgsRow args, UUID runUuid, String externalId, Instant createdAt) {
+    runDao.upsert(
+        runUuid,
+        null,
+        externalId,
+        createdAt,
+        owner.getUuid(),
+        null,
+        args.getUuid(),
+        null,
+        null,
+        owner.getNamespaceName(),
+        owner.getName(),
+        "existing-location");
+  }
+
+  private boolean parentPlaceholder(UUID runUuid) {
+    return jdbi.withHandle(handle -> parentPlaceholder(handle, runUuid));
+  }
+
+  private boolean parentPlaceholder(Handle handle, UUID runUuid) {
+    return handle
+        .createQuery(
+            "SELECT open_lineage_parent_placeholder IS TRUE FROM runs WHERE uuid = :runUuid")
+        .bind("runUuid", runUuid)
+        .mapTo(Boolean.class)
+        .one();
+  }
+
+  private boolean parentPlaceholderIsNull(UUID runUuid) {
+    return jdbi.withHandle(
+        handle ->
+            handle
+                .createQuery(
+                    "SELECT open_lineage_parent_placeholder IS NULL FROM runs WHERE uuid = :runUuid")
+                .bind("runUuid", runUuid)
+                .mapTo(Boolean.class)
+                .one());
+  }
+
+  private String runExternalId(UUID runUuid) {
+    return jdbi.withHandle(
+        handle ->
+            handle
+                .createQuery("SELECT external_id FROM runs WHERE uuid = :runUuid")
+                .bind("runUuid", runUuid)
+                .mapTo(String.class)
+                .one());
+  }
+
+  private int runCount(UUID jobUuid, String externalId) {
+    return jdbi.withHandle(
+        handle ->
+            handle
+                .createQuery(
+                    "SELECT count(*) FROM runs WHERE job_uuid = :jobUuid AND external_id = :externalId")
+                .bind("jobUuid", jobUuid)
+                .bind("externalId", externalId)
+                .mapTo(Integer.class)
+                .one());
+  }
+
+  private Map<String, Object> runIdentityState(UUID runUuid) {
+    return jdbi.withHandle(
+        handle ->
+            handle
+                .createQuery(
+                    """
+                    SELECT created_at, updated_at, external_id, job_uuid, run_args_uuid,
+                           nominal_start_time, nominal_end_time, current_run_state,
+                           transitioned_at, location, open_lineage_parent_placeholder
+                    FROM runs
+                    WHERE uuid = :runUuid
+                    """)
+                .bind("runUuid", runUuid)
+                .mapToMap()
+                .one());
   }
 
   private static List<UUID> uuidSequence(int size) {

@@ -36,6 +36,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import marquez.BaseIntegrationTest;
 import marquez.api.models.JobVersion;
@@ -49,6 +54,7 @@ import marquez.db.models.ExtendedJobVersionRow;
 import marquez.db.models.JobRow;
 import marquez.db.models.ModelDaos;
 import marquez.db.models.NamespaceRow;
+import marquez.db.models.ProjectionOrder;
 import marquez.db.models.RunArgsRow;
 import marquez.db.models.RunIoSnapshot;
 import marquez.db.models.RunRow;
@@ -58,6 +64,7 @@ import marquez.service.models.JobMeta;
 import marquez.service.models.LineageEvent;
 import marquez.service.models.Run;
 import org.assertj.core.api.InstanceOfAssertFactories;
+import org.jdbi.v3.core.Handle;
 import org.jdbi.v3.core.Jdbi;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -105,6 +112,84 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
     // Each tests requires both a namespace and job row.
     namespaceRow = DbTestUtils.newNamespace(jdbiForTesting);
     jobRow = DbTestUtils.newJob(jdbiForTesting, namespaceRow.getName(), newJobName().getValue());
+  }
+
+  @Test
+  void jobGatePrecedesRunMutationForConcurrentTransition() throws Exception {
+    JobRow gatedJob =
+        DbTestUtils.newJob(jdbiForTesting, namespaceRow.getName(), newJobName().getValue());
+    RunRow gatedRun = DbTestUtils.newRun(jdbiForTesting, gatedJob);
+    JobVersionDao.JobRowRunDetails details =
+        jobVersionDao.loadJobRowRunDetails(gatedJob, gatedRun.getUuid());
+    String applicationName = "job-version-gate-" + UUID.randomUUID();
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    CountDownLatch started = new CountDownLatch(1);
+
+    try (Handle first = jdbiForTesting.open()) {
+      first.begin();
+      first.attach(JobDao.class).lockJobBeforeRunMutation(gatedJob.getUuid());
+      Future<BagOfJobVersionInfo> transition =
+          executor.submit(
+              () -> {
+                try (Handle second = jdbiForTesting.open()) {
+                  second.begin();
+                  second
+                      .createQuery("SELECT set_config('application_name', :name, true)")
+                      .bind("name", applicationName)
+                      .mapTo(String.class)
+                      .one();
+                  started.countDown();
+                  BagOfJobVersionInfo result =
+                      second
+                          .attach(JobVersionDao.class)
+                          .upsertJobVersionOnRunTransitionInTransaction(
+                              details, RunState.COMPLETED, Instant.now(), true);
+                  second.commit();
+                  return result;
+                }
+              });
+
+      assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+      awaitLockWait(applicationName);
+      assertThat(
+              first
+                  .createQuery("SELECT uuid FROM runs WHERE uuid = :runUuid FOR UPDATE NOWAIT")
+                  .bind("runUuid", gatedRun.getUuid())
+                  .mapTo(UUID.class)
+                  .one())
+          .isEqualTo(gatedRun.getUuid());
+      first.commit();
+
+      BagOfJobVersionInfo result = transition.get(20, TimeUnit.SECONDS);
+      assertThat(runDao.findRunByUuidAsRow(gatedRun.getUuid()).orElseThrow().getJobVersionUuid())
+          .contains(result.getJobVersionRow().getUuid());
+    } finally {
+      executor.shutdownNow();
+      executor.awaitTermination(5, TimeUnit.SECONDS);
+    }
+  }
+
+  private static void awaitLockWait(String applicationName) {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+    boolean waiting;
+    do {
+      waiting =
+          jdbiForTesting.withHandle(
+              handle ->
+                  handle
+                      .createQuery(
+                          """
+                          SELECT EXISTS (
+                            SELECT 1
+                            FROM pg_stat_activity
+                            WHERE application_name = :applicationName
+                              AND wait_event_type = 'Lock')
+                          """)
+                      .bind("applicationName", applicationName)
+                      .mapTo(Boolean.class)
+                      .one());
+    } while (!waiting && System.nanoTime() < deadline);
+    assertThat(waiting).as("transition should wait on the canonical job gate").isTrue();
   }
 
   @Test
@@ -225,6 +310,56 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
     assertThat(outputUuids.getValue()).containsExactly(outputUuid);
     verify(batchingDao, never())
         .markInputAndOutputDatasetsAsPreviousFor(any(UUID.class), any(UUID.class));
+    verify(batchingDao, never())
+        .upsertCurrentInputAndOutputDatasetsChunk(
+            any(UUID.class),
+            any(UUID[].class),
+            any(UUID[].class),
+            any(UUID.class),
+            any(UUID.class));
+  }
+
+  @Test
+  public void testOrderedInputOnlyIoWriteReplacesBothCurrentSides() {
+    JobVersionDao batchingDao = mock(JobVersionDao.class, CALLS_REAL_METHODS);
+    UUID jobVersionUuid = UUID.randomUUID();
+    UUID jobUuid = UUID.randomUUID();
+    UUID inputUuid = UUID.randomUUID();
+
+    batchingDao.replaceOpenLineageCurrentJobVersionIoInCurrentTransaction(
+        JobVersionDao.CurrentJobVersionIoWrite.of(
+            jobVersionUuid, jobUuid, null, List.of(inputUuid), List.of()));
+
+    InOrder writes = inOrder(batchingDao);
+    writes.verify(batchingDao).markInputAndOutputDatasetsAsPreviousFor(jobUuid);
+    ArgumentCaptor<UUID[]> inputUuids = ArgumentCaptor.forClass(UUID[].class);
+    writes
+        .verify(batchingDao)
+        .upsertCurrentInputOrOutputDatasetsChunk(
+            eq(jobVersionUuid), inputUuids.capture(), eq(jobUuid), eq(null), eq(INPUT));
+    assertThat(inputUuids.getValue()).containsExactly(inputUuid);
+    verify(batchingDao, never())
+        .markInputAndOutputDatasetsAsPreviousFor(any(UUID.class), any(UUID.class));
+  }
+
+  @Test
+  public void testOrderedEmptyIoWriteStillClearsBothCurrentSides() {
+    JobVersionDao batchingDao = mock(JobVersionDao.class, CALLS_REAL_METHODS);
+    UUID jobVersionUuid = UUID.randomUUID();
+    UUID jobUuid = UUID.randomUUID();
+
+    batchingDao.replaceOpenLineageCurrentJobVersionIoInCurrentTransaction(
+        JobVersionDao.CurrentJobVersionIoWrite.of(
+            jobVersionUuid, jobUuid, null, List.of(), List.of()));
+
+    verify(batchingDao).markInputAndOutputDatasetsAsPreviousFor(jobUuid);
+    verify(batchingDao, never())
+        .upsertCurrentInputOrOutputDatasetsChunk(
+            any(UUID.class),
+            any(UUID[].class),
+            any(UUID.class),
+            any(UUID.class),
+            any(JobVersionDao.IoType.class));
     verify(batchingDao, never())
         .upsertCurrentInputAndOutputDatasetsChunk(
             any(UUID.class),
@@ -642,6 +777,54 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
     // Ensure the latest run is associated with the job version.
     final Optional<UUID> latestRunUuid = jobVersionDao.findLatestRunFor(jobVersionRow.getUuid());
     assertThat(latestRunUuid).isPresent().contains(runRow.getUuid());
+  }
+
+  @Test
+  void legacyLatestRunWriteClearsWatermarkWithoutLoweringUpdatedAt() {
+    Instant highWater = Instant.parse("2030-08-13T01:00:30Z");
+    Instant olderLegacyTime = highWater.minusSeconds(20);
+    ExtendedJobVersionRow version =
+        jobVersionDao.upsertJobVersion(
+            newRowUuid(),
+            olderLegacyTime.minusSeconds(10),
+            jobRow.getUuid(),
+            "legacy-location",
+            newVersion().getValue(),
+            jobRow.getName(),
+            namespaceRow.getUuid(),
+            namespaceRow.getName());
+    RunRow orderedRun = DbTestUtils.newRun(jdbiForTesting, jobRow);
+    RunRow legacyRun = DbTestUtils.newRun(jdbiForTesting, jobRow);
+
+    assertThat(
+            jobVersionDao.updateLatestRunFor(
+                version.getUuid(),
+                orderedRun.getUuid(),
+                new ProjectionOrder(highWater, marquez.common.Utils.sha256Utf8("ordered latest"))))
+        .isTrue();
+    jobVersionDao.updateLatestRunFor(version.getUuid(), olderLegacyTime, legacyRun.getUuid());
+
+    jdbiForTesting.useHandle(
+        handle ->
+            handle
+                .createQuery(
+                    """
+                    SELECT updated_at, latest_run_uuid,
+                           open_lineage_latest_run_time, open_lineage_latest_run_key
+                    FROM job_versions WHERE uuid = :versionUuid
+                    """)
+                .bind("versionUuid", version.getUuid())
+                .map(
+                    (resultSet, context) -> {
+                      assertThat(resultSet.getTimestamp("updated_at").toInstant())
+                          .isEqualTo(highWater);
+                      assertThat(resultSet.getObject("latest_run_uuid", UUID.class))
+                          .isEqualTo(legacyRun.getUuid());
+                      assertThat(resultSet.getTimestamp("open_lineage_latest_run_time")).isNull();
+                      assertThat(resultSet.getBytes("open_lineage_latest_run_key")).isNull();
+                      return true;
+                    })
+                .one());
   }
 
   @Test

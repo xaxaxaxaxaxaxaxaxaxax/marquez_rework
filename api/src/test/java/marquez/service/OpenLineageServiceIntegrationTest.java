@@ -8,7 +8,6 @@ package marquez.service;
 import static marquez.db.LineageTestUtils.PRODUCER_URL;
 import static marquez.db.LineageTestUtils.SCHEMA_URL;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -130,7 +129,7 @@ public class OpenLineageServiceIntegrationTest {
             },
             new Object[] {
               Arrays.asList(Resources.getResource(EVENT_LARGE).toURI()),
-              new ExpectedResults(1, 1, 1, 1)
+              new ExpectedResults(2, 1, 1, 1)
             })
         .collect(Collectors.toList());
   }
@@ -162,11 +161,11 @@ public class OpenLineageServiceIntegrationTest {
     when(runService.hasRunTransitionListeners()).thenReturn(true);
     jobService = new JobService(jobDao, runService);
     runInputListener = ArgumentCaptor.forClass(JobInputUpdate.class);
-    doNothing().when(runService).notify(runInputListener.capture());
+    when(runService.notify(runInputListener.capture())).thenReturn(0);
     runOutputListener = ArgumentCaptor.forClass(JobOutputUpdate.class);
-    doNothing().when(runService).notify(runOutputListener.capture());
+    when(runService.notify(runOutputListener.capture())).thenReturn(0);
     runTransitionListener = ArgumentCaptor.forClass(RunTransition.class);
-    doNothing().when(runService).notify(runTransitionListener.capture());
+    when(runService.notify(runTransitionListener.capture())).thenReturn(0);
     lineageService = new OpenLineageService(openLineageDao, runService, Runnable::run);
     datasetDao = jdbi.onDemand(DatasetDao.class);
 

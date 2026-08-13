@@ -16,11 +16,13 @@ marquez:
   replicaCount: 1
   ## Marquez image version
   ## ref: https://hub.docker.com/r/marquezproject/marquez/tags/
+  ## This snapshot chart requires an explicitly supplied API image built from the current source.
+  ## The previously released 0.51.1 image does not contain the durable OpenLineage queue.
   ##
   image:
     registry: docker.io
     repository: marquezproject/marquez
-    tag: 0.51.1
+    tag: ""
     pullPolicy: IfNotPresent
   ## Name of the existing secret containing credentials for the Marquez installation.
   ## When this is specified, it will take precedence over the values configured in the 'db' section.
@@ -34,6 +36,8 @@ marquez:
     name: marquez
     user: buendia
     password: macondo
+    # Set true to restore automatic DAO.method comments on SQL statements.
+    autoCommentsEnabled: false
   dbRetention:
     enabled: false
     # Apply retention policy at a frequency of every 'X' minutes (default: 15)
@@ -55,6 +59,22 @@ marquez:
   ## Heath and liveness checks will run on this port
   ##
   adminPort: 5001
+  ## Durable OpenLineage intake worker settings
+  ##
+  openLineage:
+    workerThreads: 8
+    pollIntervalMillis: 1000
+    # Maximum committed caught-failure count; the failure reaching this count is dead-lettered.
+    maxAttempts: 10
+    retryInitialDelayMillis: 1000
+    retryMaxDelayMillis: 60000
+    # Bounds each of the two executor waits. Synchronous JDBC abort between them has no application
+    # deadline.
+    shutdownGracePeriodMillis: 30000
+  ## Should exceed twice openLineage.shutdownGracePeriodMillis, converted to seconds, with
+  ## additional lifecycle time. Kubernetes supplies the external bound if JDBC abort blocks.
+  ##
+  terminationGracePeriodSeconds: 90
   ## Resource requests and limits
   ## ref: http://kubernetes.io/docs/user-guide/compute-resources/
   ##

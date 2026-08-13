@@ -26,14 +26,24 @@ db:
   url: jdbc:postgresql://${POSTGRES_HOST:-localhost}:${POSTGRES_PORT:-5432}/${POSTGRES_DB}
   user: ${POSTGRES_USER}
   password: ${POSTGRES_PASSWORD}
+  # Set true to restore automatic DAO.method comments on SQL statements.
+  autoCommentsEnabled: ${DB_AUTO_COMMENTS_ENABLED:-false}
+  # Durable OpenLineage intake requires READ_COMMITTED. If omitted, DEFAULT is normalized to it;
+  # an explicitly configured alternative fails application startup.
+  # defaultTransactionIsolation: READ_COMMITTED
 
-# Adjusts retention policy
+# Adjusts retention policy. Queued OpenLineage dead letters are retained indefinitely when this
+# section is absent. Live queued events are never removed by age.
+# Scheduled retention and the one-off `db-retention` command create or replace persistent
+# PostgreSQL helper functions and therefore require DDL permission. `db-retention --dry-run` does
+# not delete retained rows, but it still creates or replaces its separate persistent estimation
+# helper.
 # dbRetention:
   # Apply retention policy at a frequency of every 'X' minutes (default: 15)
   # frequencyMins: ${DB_RETENTION_FREQUENCY_MINS:-15}
-  # Maximum number of rows deleted per batch (default: 1000)
+  # Metadata deletion batch size and maximum dead letters deleted per invocation (default: 1000)
   # numberOfRowsPerBatch:  ${DB_RETENTION_NUMBER_OF_ROWS_PER_BATCH:-1000}
-  # Maximum retention days (default: 7)
+  # Metadata and queued OpenLineage dead-letter retention days (default: 7)
   # retentionDays: ${DB_RETENTION_DAYS:-7}
 
 # Enables flyway configuration overrides (see: https://flywaydb.org/documentation/configfiles)
@@ -41,7 +51,8 @@ db:
 #   connectRetries: 3
 #   cleanDisabled: true
 
-# Enables database migration on startup (default: true)
+# Enables database migration on startup (default: true). If false, run this source version's
+# db-migrate command to apply durable-intake migrations V77 through V80 before starting the application.
 migrateOnStartup: ${MIGRATE_ON_STARTUP:-true}
 
 # Enabled the Graphql endpoint
@@ -68,10 +79,31 @@ logging:
 
 ### OPENLINEAGE INTAKE CONFIG ###
 
-# Bounds concurrent and queued OpenLineage events. Rejected requests return HTTP 503.
+# HTTP 201 confirms only that a valid event was committed to the durable database queue.
+# There is no application-level event-count cap; database capacity applies.
+# Lineage projections are updated asynchronously and may not be visible immediately after POST.
+# The queue retries database projection failures and can ultimately dead-letter an event.
+# Search indexing and run-transition listener delivery occur after queue acknowledgement and are
+# best effort: they have no durable delivery guarantee, may be missing, concurrent, or out of order,
+# and are not retried by the intake queue.
+# The legacy queueCapacity property is still accepted but is deprecated and ignored.
 openLineage:
+  # Concurrent event processors per application instance; total database concurrency scales with replicas.
   workerThreads: ${OPEN_LINEAGE_WORKER_THREADS:-8}
-  queueCapacity: ${OPEN_LINEAGE_QUEUE_CAPACITY:-100}
+  # Delay between database polls while no due work is found.
+  pollIntervalMillis: ${OPEN_LINEAGE_POLL_INTERVAL_MILLIS:-1000}
+  # Maximum committed caught-failure count; the failure reaching this count is dead-lettered. A
+  # confirmed whole-transaction rollback, including connection loss before commit or a database
+  # crash that aborts the transaction, consumes no attempt. A lost commit response is indeterminate.
+  maxAttempts: ${OPEN_LINEAGE_MAX_ATTEMPTS:-10}
+  # Initial and maximum bounds for retry backoff after processing failures.
+  retryInitialDelayMillis: ${OPEN_LINEAGE_RETRY_INITIAL_DELAY_MILLIS:-1000}
+  retryMaxDelayMillis: ${OPEN_LINEAGE_RETRY_MAX_DELAY_MILLIS:-60000}
+  # Graceful drain and the post-abort executor wait may each take this long. On escalation the
+  # worker interrupts tasks and synchronously aborts their registered JDBC connections, rolling
+  # back open transactions. Driver abort has no application deadline; set pod termination grace
+  # above 2x this value plus lifecycle overhead to provide an external bound.
+  shutdownGracePeriodMillis: ${OPEN_LINEAGE_SHUTDOWN_GRACE_PERIOD_MILLIS:-30000}
 
 search:
   enabled: true

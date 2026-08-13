@@ -33,10 +33,12 @@ import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import marquez.common.models.DatasetId;
 import marquez.common.models.DatasetName;
 import marquez.common.models.Field;
@@ -117,6 +119,81 @@ public class UtilsTest {
     final String urlStringMalformed = "http://test.com:-8080";
     assertThatExceptionOfType(AssertionError.class)
         .isThrownBy(() -> Utils.toUrl(urlStringMalformed));
+  }
+
+  @Test
+  public void sanitizeOpenLineageNamespaceMatchesProjectionRules() {
+    assertThat(Utils.sanitizeOpenLineageNamespace("https://example.com/a-b_c.d@e+f"))
+        .isEqualTo("https://example.com/a-b_c.d@e+f");
+    assertThat(Utils.sanitizeOpenLineageNamespace("namespace with spaces?#"))
+        .isEqualTo("namespace_with_spaces__");
+  }
+
+  @Test
+  public void openLineageRunUuidCanonicalizesValidUuidSpelling() {
+    UUID expected = UUID.fromString("A0B1C2D3-E4F5-4678-9ABC-DEF012345678");
+
+    assertThat(Utils.openLineageRunUuid("a0b1c2d3-e4f5-4678-9abc-def012345678"))
+        .isEqualTo(expected);
+    assertThat(Utils.openLineageRunUuid("A0B1C2D3-E4F5-4678-9ABC-DEF012345678"))
+        .isEqualTo(expected);
+  }
+
+  @Test
+  public void openLineageRunUuidUsesStableUtf8NameUuidForNonUuidId() {
+    String runId = "rūn-事件";
+
+    assertThat(Utils.openLineageRunUuid(runId))
+        .isEqualTo(UUID.nameUUIDFromBytes(runId.getBytes(StandardCharsets.UTF_8)))
+        .isEqualTo(Utils.openLineageRunUuid(runId));
+  }
+
+  @Test
+  public void openLineageRunUuidRejectsNullAndBlankIds() {
+    assertThatNullPointerException().isThrownBy(() -> Utils.openLineageRunUuid(null));
+    assertThatExceptionOfType(IllegalArgumentException.class)
+        .isThrownBy(() -> Utils.openLineageRunUuid("\u2003\u00a0"))
+        .withMessage("runId must not be blank");
+  }
+
+  @Test
+  public void openLineageParentRunUuidUsesNormalRunIdentityForNonUuidIds() {
+    String runId = "scheduled-normal-parent";
+    LineageEvent.ParentRunFacet parent =
+        LineageEvent.ParentRunFacet.builder()
+            .run(LineageEvent.RunLink.builder().runId(runId).build())
+            .job(
+                LineageEvent.JobLink.builder()
+                    .namespace("parent namespace")
+                    .name("parent-job")
+                    .build())
+            .build();
+
+    assertThat(Utils.openLineageParentRunUuid(parent, "parent-job.child"))
+        .isEqualTo(Utils.openLineageRunUuid(runId));
+  }
+
+  @Test
+  public void openLineageParentRunUuidIsolatesLegacyAirflowDerivation() {
+    String runId = "scheduled__2022-04-25T00:20:00+00:00";
+    String rawNamespace = "parent namespace";
+    String taskName = "dag.task";
+    LineageEvent.ParentRunFacet parent =
+        LineageEvent.ParentRunFacet.builder()
+            .run(LineageEvent.RunLink.builder().runId(runId).build())
+            .job(LineageEvent.JobLink.builder().namespace(rawNamespace).name(taskName).build())
+            .build();
+
+    assertThat(Utils.openLineageParentRunUuid(parent, taskName))
+        .isEqualTo(
+            Utils.toNameBasedUuid(Utils.sanitizeOpenLineageNamespace(rawNamespace), "dag", runId));
+  }
+
+  @Test
+  public void sha256Utf8HashesExactText() {
+    assertThat(Utils.sha256Utf8("{\"n\":1.00}"))
+        .hasSize(32)
+        .isNotEqualTo(Utils.sha256Utf8("{\"n\":1.0}"));
   }
 
   @Test

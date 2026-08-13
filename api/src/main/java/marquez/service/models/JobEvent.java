@@ -16,6 +16,7 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 import lombok.ToString;
+import marquez.service.models.LineageEvent.Dataset;
 
 @Builder
 @AllArgsConstructor
@@ -27,8 +28,8 @@ import lombok.ToString;
 public class JobEvent extends BaseEvent {
   @NotNull private ZonedDateTime eventTime;
   @Valid @NotNull private LineageEvent.Job job;
-  @Valid private List<LineageEvent.Dataset> inputs;
-  @Valid private List<LineageEvent.Dataset> outputs;
+  @Valid private List<@NotNull Dataset> inputs;
+  @Valid private List<@NotNull Dataset> outputs;
   @Valid @NotNull private String producer;
   @Valid @NotNull private URI schemaURL;
 }

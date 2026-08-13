@@ -5,14 +5,28 @@
 
 package marquez.logging;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.when;
 
+import com.codahale.metrics.MetricRegistry;
+import com.codahale.metrics.jdbi3.InstrumentedSqlLogger;
+import com.codahale.metrics.jdbi3.strategies.SmartNameStrategy;
 import java.sql.SQLException;
 import java.time.temporal.ChronoUnit;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
+import marquez.db.OpenLineageQueueDao;
 import marquez.service.DatabaseMetrics;
 import org.jdbi.v3.core.extension.ExtensionMethod;
+import org.jdbi.v3.core.statement.Query;
 import org.jdbi.v3.core.statement.StatementContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -30,10 +44,7 @@ public class LabelledSqlLoggerTest {
   public void setUp() {
     logger = new LabelledSqlLogger();
     context = mock(StatementContext.class);
-
-    // Setup default mock behavior
-    when(context.getElapsedTime(ChronoUnit.NANOS))
-        .thenReturn(1000000000L); // 1 second in nanoseconds
+    when(context.getElapsedTime(ChronoUnit.NANOS)).thenReturn(1_000_000_000L);
   }
 
   @AfterEach
@@ -41,71 +52,160 @@ public class LabelledSqlLoggerTest {
     MDC.clear();
   }
 
-  @SuppressWarnings({"rawtypes", "unchecked"})
   @Test
-  public void testLogAfterExecution() {
-    // Prepare MDC context
+  public void testLogAfterExecutionUsesExtensionMethod() throws NoSuchMethodException {
     MDC.put("method", "GET");
     MDC.put("pathWithParams", "/test/path");
+    when(context.getExtensionMethod()).thenReturn(extensionMethod(TestClass.class, "testMethod"));
 
-    ExtensionMethod extensionMethod = mock(ExtensionMethod.class);
-    when(extensionMethod.getType()).thenReturn((Class) TestClass.class);
-    when(extensionMethod.getMethod()).thenReturn(TestClass.class.getMethods()[0]);
-
-    when(context.getExtensionMethod()).thenReturn(extensionMethod);
-
-    // Mock static method
     try (MockedStatic<DatabaseMetrics> mockedDatabaseMetrics =
         Mockito.mockStatic(DatabaseMetrics.class)) {
-      // Call the method under test
       logger.logAfterExecution(context);
 
-      // Verify the static method call
       mockedDatabaseMetrics.verify(
           () ->
               DatabaseMetrics.recordDbDuration(
-                  "marquez.logging.LabelledSqlLoggerTest$TestClass",
-                  "testMethod",
-                  "GET",
-                  "/test/path",
+                  TestClass.class.getName(), "testMethod", "GET", "/test/path", 1.0),
+          times(1));
+    }
+  }
+
+  @Test
+  public void testLogExceptionUsesExtensionMethod() throws NoSuchMethodException {
+    MDC.put("method", "POST");
+    MDC.put("pathWithParams", "/test/exception");
+    when(context.getExtensionMethod()).thenReturn(extensionMethod(TestClass.class, "testMethod"));
+
+    try (MockedStatic<DatabaseMetrics> mockedDatabaseMetrics =
+        Mockito.mockStatic(DatabaseMetrics.class)) {
+      logger.logException(context, new SQLException("Test Exception"));
+
+      mockedDatabaseMetrics.verify(
+          () ->
+              DatabaseMetrics.recordDbDuration(
+                  TestClass.class.getName(), "testMethod", "POST", "/test/exception", 1.0),
+          times(1));
+    }
+  }
+
+  @Test
+  public void testExplicitIdentityOverridesExtensionMethod() throws NoSuchMethodException {
+    MDC.put("method", "POST");
+    MDC.put("pathWithParams", "/api/v1/lineage");
+    when(context.getExtensionMethod())
+        .thenReturn(extensionMethod(FallbackClass.class, "fallbackMethod"));
+    tagContext(OpenLineageQueueDao.class, "acquireOrderingKeyLock");
+
+    try (MockedStatic<DatabaseMetrics> mockedDatabaseMetrics =
+        Mockito.mockStatic(DatabaseMetrics.class)) {
+      logger.logAfterExecution(context);
+
+      mockedDatabaseMetrics.verify(
+          () ->
+              DatabaseMetrics.recordDbDuration(
+                  OpenLineageQueueDao.class.getName(),
+                  "acquireOrderingKeyLock",
+                  "POST",
+                  "/api/v1/lineage",
                   1.0),
           times(1));
     }
   }
 
-  @SuppressWarnings({"rawtypes", "unchecked"})
   @Test
-  public void testLogException() {
-    // Prepare MDC context
+  public void testNoIdentityDoesNotRecordLabelledMetric() {
     MDC.put("method", "POST");
-    MDC.put("pathWithParams", "/test/exception");
+    MDC.put("pathWithParams", "/api/v1/lineage");
 
-    ExtensionMethod extensionMethod = mock(ExtensionMethod.class);
-    when(extensionMethod.getType()).thenReturn((Class) TestClass.class);
-    when(extensionMethod.getMethod()).thenReturn(TestClass.class.getMethods()[0]);
-
-    when(context.getExtensionMethod()).thenReturn(extensionMethod);
-
-    // Mock static method
-    try (MockedStatic<DatabaseMetrics> mockedSqlMetrics =
+    try (MockedStatic<DatabaseMetrics> mockedDatabaseMetrics =
         Mockito.mockStatic(DatabaseMetrics.class)) {
-      // Call the method under test
-      logger.logException(context, new SQLException("Test Exception"));
+      logger.logAfterExecution(context);
 
-      // Verify the static method call
-      mockedSqlMetrics.verify(
-          () ->
-              DatabaseMetrics.recordDbDuration(
-                  "marquez.logging.LabelledSqlLoggerTest$TestClass",
-                  "testMethod",
-                  "POST",
-                  "/test/exception",
-                  1.0));
+      mockedDatabaseMetrics.verifyNoInteractions();
     }
   }
 
-  // Dummy class for the purpose of mocking
+  @Test
+  public void testExplicitIdentityNamesInstrumentedMetric() {
+    tagContext(OpenLineageQueueDao.class, "insertEventAndMaybeHeadAfterLock");
+    MetricRegistry registry = new MetricRegistry();
+    InstrumentedSqlLogger instrumented =
+        new InstrumentedSqlLogger(registry, SqlStatementIdentity::statementName);
+
+    instrumented.logAfterExecution(context);
+
+    String expected =
+        MetricRegistry.name(OpenLineageQueueDao.class, "insertEventAndMaybeHeadAfterLock");
+    assertEquals(Set.of(expected), registry.getTimers().keySet());
+    assertEquals(1L, registry.getTimers().get(expected).getCount());
+  }
+
+  @Test
+  public void testStatementNamePreservesSqlObjectFallback() throws NoSuchMethodException {
+    when(context.getRawSql()).thenReturn("select 1");
+    when(context.getExtensionMethod()).thenReturn(extensionMethod(TestClass.class, "testMethod"));
+
+    assertEquals(
+        new SmartNameStrategy().getStatementName(context),
+        SqlStatementIdentity.statementName(context));
+    assertEquals(
+        MetricRegistry.name(TestClass.class, "testMethod"),
+        SqlStatementIdentity.statementName(context));
+  }
+
+  @Test
+  public void testStatementNamePreservesRawFallback() {
+    when(context.getRawSql()).thenReturn("select 1");
+
+    assertEquals(
+        new SmartNameStrategy().getStatementName(context),
+        SqlStatementIdentity.statementName(context));
+    assertEquals("sql.raw", SqlStatementIdentity.statementName(context));
+  }
+
+  @Test
+  public void testStatementNamePreservesEmptyFallback() {
+    when(context.getRawSql()).thenReturn("");
+
+    assertEquals(
+        new SmartNameStrategy().getStatementName(context),
+        SqlStatementIdentity.statementName(context));
+    assertEquals("sql.empty", SqlStatementIdentity.statementName(context));
+  }
+
+  @Test
+  public void testIdentityRejectsBlankMethodName() {
+    assertThrows(
+        IllegalArgumentException.class, () -> new SqlStatementIdentity(TestClass.class, " "));
+  }
+
+  private void tagContext(Class<?> type, String methodName) {
+    Map<String, Object> attributes = new HashMap<>();
+    doAnswer(
+            invocation -> {
+              attributes.put(invocation.getArgument(0), invocation.getArgument(1));
+              return null;
+            })
+        .when(context)
+        .define(anyString(), any());
+    when(context.getAttribute(anyString()))
+        .thenAnswer(invocation -> attributes.get(invocation.getArgument(0)));
+
+    Query statement = mock(Query.class);
+    when(statement.getContext()).thenReturn(context);
+    assertSame(statement, SqlStatementIdentity.tag(statement, type, methodName));
+  }
+
+  private static ExtensionMethod extensionMethod(Class<?> type, String methodName)
+      throws NoSuchMethodException {
+    return new ExtensionMethod(type, type.getDeclaredMethod(methodName));
+  }
+
   private static class TestClass {
     public void testMethod() {}
+  }
+
+  private static class FallbackClass {
+    public void fallbackMethod() {}
   }
 }

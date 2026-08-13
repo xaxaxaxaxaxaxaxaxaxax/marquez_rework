@@ -12,6 +12,8 @@ db:
   url: jdbc:postgresql://${POSTGRES_HOST:-localhost}:${POSTGRES_PORT:-5432}/marquez
   user: marquez
   password: marquez
+  # Set true to restore automatic DAO.method comments on SQL statements.
+  autoCommentsEnabled: ${DB_AUTO_COMMENTS_ENABLED:-false}
 
 migrateOnStartup: true
 
@@ -20,7 +22,14 @@ graphql:
 
 openLineage:
   workerThreads: ${OPEN_LINEAGE_WORKER_THREADS:-8}
-  queueCapacity: ${OPEN_LINEAGE_QUEUE_CAPACITY:-100}
+  pollIntervalMillis: ${OPEN_LINEAGE_POLL_INTERVAL_MILLIS:-1000}
+  # Maximum committed caught-failure count; the failure reaching this count is dead-lettered.
+  maxAttempts: ${OPEN_LINEAGE_MAX_ATTEMPTS:-10}
+  retryInitialDelayMillis: ${OPEN_LINEAGE_RETRY_INITIAL_DELAY_MILLIS:-1000}
+  retryMaxDelayMillis: ${OPEN_LINEAGE_RETRY_MAX_DELAY_MILLIS:-60000}
+  # Bounds each of the two executor waits. Synchronous JDBC abort between them has no application
+  # deadline.
+  shutdownGracePeriodMillis: ${OPEN_LINEAGE_SHUTDOWN_GRACE_PERIOD_MILLIS:-30000}
 
 logging:
   level: INFO

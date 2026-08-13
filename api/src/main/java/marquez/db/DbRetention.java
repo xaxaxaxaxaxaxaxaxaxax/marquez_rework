@@ -9,6 +9,7 @@ import static marquez.common.base.MorePreconditions.checkNotBlank;
 
 import com.google.common.base.Stopwatch;
 import java.sql.Types;
+import java.time.Instant;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 import marquez.db.exceptions.DbRetentionException;
@@ -18,9 +19,9 @@ import org.jdbi.v3.core.statement.OutParameters;
 import org.jdbi.v3.core.statement.Script;
 
 /**
- * Apply retention policy directly to source, dataset, and job metadata collected by Marquez. When
- * invoking {@link DbRetention#retentionOnDbOrError(Jdbi, int, int)}, retention is applied by
- * invoking the following methods in an order of precedence from first-to-last:
+ * Apply retention policy directly to metadata and queued OpenLineage dead letters collected by
+ * Marquez. When invoking {@link DbRetention#retentionOnDbOrError(Jdbi, int, int)}, retention is
+ * applied by invoking the following methods in an order of precedence from first-to-last:
  *
  * <ul>
  *   <li>{@code retentionOnJobs()}
@@ -29,23 +30,28 @@ import org.jdbi.v3.core.statement.Script;
  *   <li>{@code retentionOnDatasets()}
  *   <li>{@code retentionOnDatasetVersions()}
  *   <li>{@code retentionOnLineageEvents()}
+ *   <li>{@code retentionOnOpenLineageDeadLetters()}
  * </ul>
  *
  * <p>Applying retention is not reversible, but can be applied many times. For this to perform well,
  * we delete rows in batches; this divides the deletion process into smaller chunks; the number of
  * rows to delete per batch is configurable. You may also apply retention as a dry run by invoking
  * {@link DbRetention#retentionOnDbOrError(Jdbi, int, int, boolean)}. By default, dry runs are
- * disable.
+ * disabled. Each invocation deletes at most one configured batch of queued OpenLineage dead
+ * letters. Live queued events are never removed by age.
  *
  * <p>When retention is configured, the following operations will be applied:
  *
  * <ul>
- *   <li>Delete jobs from {@code jobs} table if {@code jobs.updated_at} older than retention days.
+ *   <li>Delete jobs from {@code jobs} table if {@code jobs.updated_at} older than retention days; a
+ *       job is retained while one of its runs is the parent of another retained run.
  *   <li>Delete job versions from {@code job_versions} table if {@code job_versions.updated_at}
  *       older than retention days; a job version will not be deleted if the job version is the
- *       {@code current} version of a given job.
- *   <li>Delete runs from {@code runs} table if {@code uns.updated_at} older than retention days; a
- *       run will not be deleted if the run is the {@code current} run of a given job version.
+ *       {@code current} version of a given job or belongs to a run that is the parent of another
+ *       retained run.
+ *   <li>Delete runs from {@code runs} table if {@code runs.updated_at} is older than retention
+ *       days; a run will not be deleted while it is a job's current run or the parent of another
+ *       retained run.
  *   <li>Delete dataset from datasets table if {@code datasets.updated_at} older than retention
  *       days; a dataset will not be deleted if the dataset is an input / output of a given job
  *       version.
@@ -55,6 +61,9 @@ import org.jdbi.v3.core.statement.Script;
  *       or the input of a run.
  *   <li>Delete lineage events from {@code lineage_events} table if {@code
  *       lineage_events.event_time} older than retentionDays.
+ *   <li>Delete at most {@code numberOfRowsPerBatch} queued OpenLineage dead letters older than
+ *       retentionDays. When scheduled retention is not configured and no one-off retention command
+ *       is invoked, dead letters are retained indefinitely.
  * </ul>
  */
 @Slf4j
@@ -70,20 +79,26 @@ public final class DbRetention {
   /* Disable retention dry run by default. */
   public static final boolean DEFAULT_DRY_RUN = false;
 
-  /** Applies the retention policy to database. */
+  /** Applies the retention policy to database; batch size and retention days must be positive. */
   public static void retentionOnDbOrError(
       @NonNull final Jdbi jdbi, final int numberOfRowsPerBatch, final int retentionDays)
       throws DbRetentionException {
     retentionOnDbOrError(jdbi, numberOfRowsPerBatch, retentionDays, DEFAULT_DRY_RUN);
   }
 
-  /** Applies the retention policy to database; optionally as a dry run if specified. */
+  /**
+   * Applies the retention policy to database; optionally as a dry run if specified. Batch size and
+   * retention days must be positive.
+   */
   public static void retentionOnDbOrError(
       @NonNull final Jdbi jdbi,
       final int numberOfRowsPerBatch,
       final int retentionDays,
       final boolean dryRun)
       throws DbRetentionException {
+    requirePositive(numberOfRowsPerBatch, "numberOfRowsPerBatch");
+    requirePositive(retentionDays, "retentionDays");
+
     if (dryRun) {
       // On a dry run, add function(s) to return estimate of rows deleted (if not present).
       jdbi.useHandle(
@@ -97,8 +112,12 @@ public final class DbRetention {
     retentionOnDatasets(jdbi, numberOfRowsPerBatch, retentionDays, dryRun);
     retentionOnDatasetVersions(jdbi, numberOfRowsPerBatch, retentionDays, dryRun);
 
-    // Finally, apply retention policy to lineage events.
+    // Apply retention policy to stored lineage events.
     retentionOnLineageEvents(jdbi, numberOfRowsPerBatch, retentionDays, dryRun);
+
+    // Live queued events are never age-purged. Dead-letter deletion is deliberately limited to one
+    // batch per retention invocation so a large backlog cannot monopolize the database.
+    retentionOnOpenLineageDeadLetters(jdbi, numberOfRowsPerBatch, retentionDays, dryRun);
   }
 
   /** Apply retention policy on {@code jobs}. */
@@ -135,12 +154,19 @@ public final class DbRetention {
                       BEGIN
                         LOOP
                           WITH deleted_rows AS (
-                            DELETE FROM jobs
+                            DELETE FROM jobs AS job
                               WHERE uuid IN (
-                                SELECT uuid
-                                  FROM jobs
-                                 WHERE updated_at < CURRENT_TIMESTAMP - INTERVAL '${retentionDays} days'
-                                   FOR UPDATE SKIP LOCKED
+                                SELECT candidate.uuid
+                                  FROM jobs AS candidate
+                                 WHERE candidate.updated_at < CURRENT_TIMESTAMP - INTERVAL '${retentionDays} days'
+                                   AND NOT EXISTS (
+                                     SELECT 1
+                                       FROM runs AS parent
+                                       JOIN runs AS child
+                                         ON child.parent_run_uuid = parent.uuid
+                                      WHERE parent.job_uuid = candidate.uuid
+                                   )
+                                   FOR UPDATE OF candidate SKIP LOCKED
                                  LIMIT rows_per_batch
                               ) RETURNING uuid
                           )
@@ -201,10 +227,17 @@ public final class DbRetention {
                           WITH deleted_rows AS (
                             DELETE FROM job_versions AS jv
                               WHERE uuid IN (
-                                SELECT uuid
-                                  FROM job_versions
-                                 WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '${retentionDays} days'
-                                   FOR UPDATE SKIP LOCKED
+                                SELECT candidate.uuid
+                                  FROM job_versions AS candidate
+                                 WHERE candidate.created_at < CURRENT_TIMESTAMP - INTERVAL '${retentionDays} days'
+                                   AND NOT EXISTS (
+                                     SELECT 1
+                                       FROM runs AS parent
+                                       JOIN runs AS child
+                                         ON child.parent_run_uuid = parent.uuid
+                                      WHERE parent.job_version_uuid = candidate.uuid
+                                   )
+                                   FOR UPDATE OF candidate SKIP LOCKED
                                  LIMIT rows_per_batch
                               ) AND NOT EXISTS (
                                 SELECT 1
@@ -264,12 +297,22 @@ public final class DbRetention {
                       BEGIN
                         LOOP
                           WITH deleted_rows AS (
-                            DELETE FROM runs
+                            DELETE FROM runs AS run
                               WHERE uuid IN (
-                                SELECT uuid
-                                  FROM runs
-                                 WHERE updated_at < CURRENT_TIMESTAMP - INTERVAL '${retentionDays} days'
-                                   FOR UPDATE SKIP LOCKED
+                                SELECT candidate.uuid
+                                  FROM runs AS candidate
+                                 WHERE candidate.updated_at < CURRENT_TIMESTAMP - INTERVAL '${retentionDays} days'
+                                   AND NOT EXISTS (
+                                     SELECT 1
+                                       FROM runs AS child
+                                      WHERE child.parent_run_uuid = candidate.uuid
+                                   )
+                                   AND NOT EXISTS (
+                                     SELECT 1
+                                       FROM jobs AS job
+                                      WHERE job.current_run_uuid = candidate.uuid
+                                   )
+                                   FOR UPDATE OF candidate SKIP LOCKED
                                  LIMIT rows_per_batch
                               ) RETURNING uuid
                           )
@@ -535,6 +578,44 @@ public final class DbRetention {
         rowsDeleteTime.elapsed().toMillis());
   }
 
+  private static void retentionOnOpenLineageDeadLetters(
+      @NonNull final Jdbi jdbi,
+      final int numberOfRowsPerBatch,
+      final int retentionDays,
+      final boolean dryRun) {
+    final Instant cutoff =
+        jdbi.withHandle(
+            handle ->
+                handle
+                    .createQuery(
+                        "SELECT statement_timestamp() - " + "(:retentionDays * INTERVAL '1 day')")
+                    .bind("retentionDays", retentionDays)
+                    .mapTo(Instant.class)
+                    .one());
+    final OpenLineageQueueDao queueDao = jdbi.onDemand(OpenLineageQueueDao.class);
+    if (dryRun) {
+      final int rowsToDelete = queueDao.countDeadBefore(cutoff, numberOfRowsPerBatch);
+      log.info(
+          "A retention policy of '{}' days will delete '{}' queued OpenLineage dead letters "
+              + "in this invocation",
+          retentionDays,
+          rowsToDelete);
+      return;
+    }
+
+    final int rowsDeleted = queueDao.purgeDeadBefore(cutoff, numberOfRowsPerBatch);
+    log.info(
+        "Deleted one batch of '{}' queued OpenLineage dead letters older than '{}' days",
+        rowsDeleted,
+        retentionDays);
+  }
+
+  private static void requirePositive(final int value, @NonNull final String name) {
+    if (value <= 0) {
+      throw new IllegalArgumentException(name + " must be positive");
+    }
+  }
+
   /**
    * Returns generated {@code sql} using the {@code sqlTemplate} and the provided values for {@code
    * numberOfRowsPerBatch} and {@code retentionDays}.
@@ -600,20 +681,42 @@ public final class DbRetention {
 
   private static final String DRY_RUN_DELETE_FROM_JOBS_OLDER_THAN_X_DAYS =
       """
-      DELETE FROM jobs
-        WHERE updated_at < CURRENT_TIMESTAMP - INTERVAL '${retentionDays} days'
+      DELETE FROM jobs AS job
+        WHERE job.updated_at < CURRENT_TIMESTAMP - INTERVAL '${retentionDays} days'
+          AND NOT EXISTS (
+            SELECT 1
+              FROM runs AS parent
+              JOIN runs AS child ON child.parent_run_uuid = parent.uuid
+             WHERE parent.job_uuid = job.uuid
+          )
       """;
 
   private static final String DRY_RUN_DELETE_FROM_JOB_VERSIONS_OLDER_THAN_X_DAYS =
       """
-      DELETE FROM job_versions
-        WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '${retentionDays} days'
+      DELETE FROM job_versions AS job_version
+        WHERE job_version.created_at < CURRENT_TIMESTAMP - INTERVAL '${retentionDays} days'
+          AND NOT EXISTS (
+            SELECT 1
+              FROM runs AS parent
+              JOIN runs AS child ON child.parent_run_uuid = parent.uuid
+             WHERE parent.job_version_uuid = job_version.uuid
+          )
       """;
 
   private static final String DRY_RUN_DELETE_FROM_RUNS_OLDER_THAN_X_DAYS =
       """
-      DELETE FROM runs
-        WHERE updated_at < CURRENT_TIMESTAMP - INTERVAL '${retentionDays} days'
+      DELETE FROM runs AS run
+        WHERE run.updated_at < CURRENT_TIMESTAMP - INTERVAL '${retentionDays} days'
+          AND NOT EXISTS (
+            SELECT 1
+              FROM runs AS child
+             WHERE child.parent_run_uuid = run.uuid
+          )
+          AND NOT EXISTS (
+            SELECT 1
+              FROM jobs AS job
+             WHERE job.current_run_uuid = run.uuid
+          )
       """;
 
   /** Create {@code used_datasets_as_input_in_x_days()}. */

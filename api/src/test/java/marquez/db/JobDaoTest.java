@@ -29,9 +29,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -44,6 +46,7 @@ import marquez.common.models.RunState;
 import marquez.db.models.DbModelGenerator;
 import marquez.db.models.JobRow;
 import marquez.db.models.NamespaceRow;
+import marquez.db.models.ProjectionOrder;
 import marquez.db.models.RunRow;
 import marquez.jdbi.MarquezJdbiExternalPostgresExtension;
 import marquez.service.models.Job;
@@ -56,6 +59,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.postgresql.util.PGobject;
 
 @ExtendWith(MarquezJdbiExternalPostgresExtension.class)
@@ -125,6 +130,348 @@ public class JobDaoTest {
         .get()
         .hasFieldOrPropertyWithValue("name", targetJob.getName())
         .hasFieldOrPropertyWithValue("namespaceName", targetJob.getNamespaceName());
+  }
+
+  @Test
+  public void orderedPointersDoNotMutateHiddenJobs() {
+    JobRow job =
+        createJobWithoutSymlinkTarget(
+            jdbi, namespace, "hidden-pointer-" + UUID.randomUUID(), "hidden pointer test");
+    jobDao.delete(job.getNamespaceName(), job.getName());
+    Instant projectionTime = Instant.now().plusSeconds(60);
+    ProjectionOrder order =
+        new ProjectionOrder(projectionTime, Utils.sha256Utf8("hidden job pointer"));
+
+    assertThat(jobDao.updateCurrentRunFor(job.getUuid(), UUID.randomUUID(), order)).isFalse();
+    assertThat(jobDao.updateVersionFor(job.getUuid(), UUID.randomUUID(), order)).isFalse();
+    assertThat(jobDao.canProjectCurrentIo(job.getUuid(), order)).isFalse();
+
+    JobRow hidden = jobDao.lockJobByUuid(job.getUuid());
+    assertThat(hidden.getCurrentRunUuid()).isEmpty();
+    assertThat(hidden.getCurrentVersionUuid()).isEmpty();
+  }
+
+  @Test
+  void legacyJobWritesClearOwnedWatermarksWithoutLoweringUpdatedAt() {
+    String name = "legacy-job-watermark-" + UUID.randomUUID();
+    JobRow job = createJobWithoutSymlinkTarget(jdbi, namespace, name, "initial legacy snapshot");
+    Instant highWater = Instant.parse("2030-08-13T00:00:30Z");
+    Instant olderLegacyTime = highWater.minusSeconds(20);
+    byte[] digest = Utils.sha256Utf8("ordered-before-legacy");
+    jdbi.useHandle(
+        handle ->
+            handle
+                .createUpdate(
+                    """
+                    UPDATE jobs
+                    SET updated_at = :highWater,
+                        open_lineage_snapshot_time = :highWater,
+                        open_lineage_snapshot_key = :digest,
+                        open_lineage_current_run_time = :highWater,
+                        open_lineage_current_run_key = :digest
+                    WHERE uuid = :jobUuid
+                    """)
+                .bind("highWater", highWater)
+                .bind("digest", digest)
+                .bind("jobUuid", job.getUuid())
+                .execute());
+
+    jobDao.upsertJob(
+        UUID.randomUUID(),
+        JobType.BATCH,
+        olderLegacyTime,
+        namespace.getUuid(),
+        namespace.getName(),
+        name,
+        "legacy winner",
+        "legacy-location",
+        null,
+        jobDao.toJson(Collections.emptySet(), Utils.getMapper()),
+        null);
+
+    Map<String, Object> snapshot =
+        jdbi.withHandle(
+            handle ->
+                handle
+                    .createQuery(
+                        """
+                        SELECT updated_at, description, open_lineage_snapshot_time,
+                               open_lineage_current_run_time
+                        FROM jobs WHERE uuid = :jobUuid
+                        """)
+                    .bind("jobUuid", job.getUuid())
+                    .mapToMap()
+                    .one());
+    assertThat(((java.sql.Timestamp) snapshot.get("updated_at")).toInstant()).isEqualTo(highWater);
+    assertThat(snapshot.get("description")).isEqualTo("legacy winner");
+    assertThat(snapshot.get("open_lineage_snapshot_time")).isNull();
+    assertThat(snapshot.get("open_lineage_current_run_time")).isNull();
+
+    UUID legacyVersion = UUID.randomUUID();
+    jdbi.useHandle(
+        handle ->
+            handle
+                .createUpdate(
+                    """
+                    UPDATE jobs
+                    SET open_lineage_current_version_time = :highWater,
+                        open_lineage_current_version_key = :digest
+                    WHERE uuid = :jobUuid
+                    """)
+                .bind("highWater", highWater)
+                .bind("digest", digest)
+                .bind("jobUuid", job.getUuid())
+                .execute());
+    jobDao.updateVersionFor(job.getUuid(), olderLegacyTime, legacyVersion);
+
+    Map<String, Object> pointer =
+        jdbi.withHandle(
+            handle ->
+                handle
+                    .createQuery(
+                        """
+                        SELECT updated_at, current_version_uuid,
+                               open_lineage_current_version_time
+                        FROM jobs WHERE uuid = :jobUuid
+                        """)
+                    .bind("jobUuid", job.getUuid())
+                    .mapToMap()
+                    .one());
+    assertThat(((java.sql.Timestamp) pointer.get("updated_at")).toInstant()).isEqualTo(highWater);
+    assertThat(pointer.get("current_version_uuid")).isEqualTo(legacyVersion);
+    assertThat(pointer.get("open_lineage_current_version_time")).isNull();
+  }
+
+  @Test
+  void syntheticParentInsertInitializesOnlyANewIdentityWithNeutralSnapshotOrder() {
+    String insertedName = "synthetic-parent-" + UUID.randomUUID();
+    UUID insertedUuid = UUID.randomUUID();
+    jobDao.insertSyntheticParentJobIfAbsent(
+        insertedUuid, Instant.EPOCH, namespace.getUuid(), namespace.getName(), insertedName);
+
+    SyntheticSnapshotState inserted = syntheticSnapshotState(namespace.getUuid(), insertedName);
+    assertThat(inserted.uuid()).isEqualTo(insertedUuid);
+    assertThat(inserted.eventTime()).isEqualTo("-infinity");
+    assertThat(inserted.eventKey()).containsExactly(new byte[32]);
+
+    String existingName = "existing-parent-" + UUID.randomUUID();
+    JobRow existing =
+        createJobWithoutSymlinkTarget(jdbi, namespace, existingName, "legacy parent identity");
+    assertThat(syntheticSnapshotState(namespace.getUuid(), existingName).eventTime()).isNull();
+
+    jobDao.insertSyntheticParentJobIfAbsent(
+        UUID.randomUUID(), Instant.EPOCH, namespace.getUuid(), namespace.getName(), existingName);
+
+    SyntheticSnapshotState unchanged = syntheticSnapshotState(namespace.getUuid(), existingName);
+    assertThat(unchanged.uuid()).isEqualTo(existing.getUuid());
+    assertThat(unchanged.eventTime()).isNull();
+    assertThat(unchanged.eventKey()).isNull();
+  }
+
+  @Test
+  void newerSyntheticParentPointerDoesNotBlockOlderOrEqualTimeSnapshots() {
+    String parentName = "pointer-before-parent-snapshot-" + UUID.randomUUID();
+    Instant parentTime = Instant.parse("2026-08-13T02:00:00Z");
+    Instant childTime = parentTime.plusSeconds(1);
+    JobRow syntheticParent =
+        jobDao.getOrCreateSyntheticParentJob(
+            UUID.randomUUID(), namespace.getUuid(), namespace.getName(), parentName);
+    RunRow parentRun = DbTestUtils.newRun(jdbi, syntheticParent);
+    byte[] pointerKey = Utils.sha256Utf8("child-t2-parent-pointer");
+
+    assertThat(
+            jobDao.updateCurrentRunFor(
+                syntheticParent.getUuid(),
+                parentRun.getUuid(),
+                new ProjectionOrder(childTime, pointerKey)))
+        .isTrue();
+
+    byte[] digestA = Utils.sha256Utf8("parent-t1-snapshot-a");
+    byte[] digestB = Utils.sha256Utf8("parent-t1-snapshot-b");
+    boolean digestAIsLower = Arrays.compareUnsigned(digestA, digestB) < 0;
+    byte[] lowDigest = digestAIsLower ? digestA : digestB;
+    byte[] highDigest = digestAIsLower ? digestB : digestA;
+    PGobject inputs = jobDao.toJson(Collections.emptySet(), Utils.getMapper());
+
+    JobRow firstSnapshot =
+        jobDao.upsertOpenLineageJob(
+            UUID.randomUUID(),
+            JobType.BATCH,
+            parentTime,
+            namespace.getUuid(),
+            namespace.getName(),
+            parentName,
+            "parent T1 low snapshot",
+            "parent-t1-low",
+            null,
+            inputs,
+            new ProjectionOrder(parentTime, lowDigest));
+    assertThat(firstSnapshot.getUuid()).isEqualTo(syntheticParent.getUuid());
+    assertThat(firstSnapshot.getDescription()).contains("parent T1 low snapshot");
+    assertThat(firstSnapshot.getUpdatedAt()).isEqualTo(childTime);
+    assertThat(firstSnapshot.getCurrentRunUuid()).contains(parentRun.getUuid());
+
+    jobDao.upsertOpenLineageJob(
+        UUID.randomUUID(),
+        JobType.BATCH,
+        parentTime,
+        namespace.getUuid(),
+        namespace.getName(),
+        parentName,
+        "parent T1 high snapshot",
+        "parent-t1-high",
+        null,
+        inputs,
+        new ProjectionOrder(parentTime, highDigest));
+    jobDao.upsertOpenLineageJob(
+        UUID.randomUUID(),
+        JobType.BATCH,
+        parentTime,
+        namespace.getUuid(),
+        namespace.getName(),
+        parentName,
+        "parent T1 losing replay",
+        "parent-t1-losing-replay",
+        null,
+        inputs,
+        new ProjectionOrder(parentTime, lowDigest));
+
+    JobRow winner = jobDao.lockJobByUuid(syntheticParent.getUuid());
+    assertThat(winner.getDescription()).contains("parent T1 high snapshot");
+    assertThat(winner.getLocation()).isEqualTo("parent-t1-high");
+    assertThat(winner.getUpdatedAt()).isEqualTo(childTime);
+    assertThat(winner.getCurrentRunUuid()).contains(parentRun.getUuid());
+    SnapshotWatermark snapshot = snapshotWatermark(syntheticParent.getUuid());
+    assertThat(snapshot.eventTime()).isEqualTo(parentTime);
+    assertThat(snapshot.eventKey()).containsExactly(highDigest);
+    PointerWatermark pointer = pointerWatermark(syntheticParent.getUuid());
+    assertThat(pointer.eventTime()).isEqualTo(childTime);
+    assertThat(pointer.eventKey()).containsExactly(pointerKey);
+  }
+
+  @ParameterizedTest(name = "parent snapshot has higher equal-time digest: {0}")
+  @ValueSource(booleans = {false, true})
+  public void hierarchyEnrichmentIsAddOnlyAndIndependentOfSnapshotOrder(
+      boolean parentSnapshotHasHigherDigest) {
+    String suffix = UUID.randomUUID().toString();
+    Instant eventTime = Instant.parse("2026-08-13T00:00:00Z");
+    NamespaceRow firstParentNamespace =
+        namespaceDao.upsertNamespaceRow(
+            UUID.randomUUID(),
+            eventTime,
+            "hierarchy-parent-one-" + suffix,
+            JobDaoTest.class.getName());
+    NamespaceRow conflictingParentNamespace =
+        namespaceDao.upsertNamespaceRow(
+            UUID.randomUUID(),
+            eventTime,
+            "hierarchy-parent-two-" + suffix,
+            JobDaoTest.class.getName());
+    String parentName = "hierarchy-parent-" + suffix;
+    JobRow firstParent =
+        createJobWithoutSymlinkTarget(
+            jdbi, firstParentNamespace, parentName, "first hierarchy parent");
+    JobRow conflictingParent =
+        createJobWithoutSymlinkTarget(
+            jdbi, conflictingParentNamespace, parentName, "conflicting hierarchy parent");
+
+    byte[] digestA = Utils.sha256Utf8("hierarchy-snapshot-a");
+    byte[] digestB = Utils.sha256Utf8("hierarchy-snapshot-b");
+    boolean digestAIsLower = Arrays.compareUnsigned(digestA, digestB) < 0;
+    byte[] lowDigest = digestAIsLower ? digestA : digestB;
+    byte[] highDigest = digestAIsLower ? digestB : digestA;
+    byte[] parentlessDigest = parentSnapshotHasHigherDigest ? lowDigest : highDigest;
+    byte[] parentDigest = parentSnapshotHasHigherDigest ? highDigest : lowDigest;
+    String simpleName = "task";
+    String fullName = parentName + "." + simpleName;
+    PGobject inputs = jobDao.toJson(Collections.emptySet(), Utils.getMapper());
+
+    JobRow parentless =
+        jobDao.upsertOpenLineageJob(
+            UUID.randomUUID(),
+            JobType.BATCH,
+            eventTime,
+            namespace.getUuid(),
+            namespace.getName(),
+            fullName,
+            "parentless snapshot",
+            "parentless location",
+            null,
+            inputs,
+            new ProjectionOrder(eventTime, parentlessDigest));
+    jobDao.upsertOpenLineageJob(
+        UUID.randomUUID(),
+        firstParent.getUuid(),
+        JobType.BATCH,
+        eventTime,
+        namespace.getUuid(),
+        namespace.getName(),
+        simpleName,
+        "parent snapshot",
+        "parent location",
+        null,
+        inputs,
+        new ProjectionOrder(eventTime, parentDigest));
+
+    JobRow enriched = jobDao.lockJobByUuid(parentless.getUuid());
+    assertThat(enriched.getParentJobUuid()).isEqualTo(firstParent.getUuid());
+    assertThat(enriched.getSimpleName()).isEqualTo(simpleName);
+    assertThat(enriched.getDescription())
+        .contains(parentSnapshotHasHigherDigest ? "parent snapshot" : "parentless snapshot");
+    assertThat(enriched.getLocation())
+        .isEqualTo(parentSnapshotHasHigherDigest ? "parent location" : "parentless location");
+    SnapshotWatermark equalTimeWatermark = snapshotWatermark(parentless.getUuid());
+    assertThat(equalTimeWatermark.eventTime()).isEqualTo(eventTime);
+    assertThat(equalTimeWatermark.eventKey()).containsExactly(highDigest);
+
+    Instant missingParentTime = eventTime.plusSeconds(1);
+    byte[] missingParentDigest = Utils.sha256Utf8("newer-missing-parent");
+    jobDao.upsertOpenLineageJob(
+        UUID.randomUUID(),
+        JobType.BATCH,
+        missingParentTime,
+        namespace.getUuid(),
+        namespace.getName(),
+        fullName,
+        "newer missing-parent snapshot",
+        "newer missing-parent location",
+        null,
+        inputs,
+        new ProjectionOrder(missingParentTime, missingParentDigest));
+
+    JobRow afterMissingParent = jobDao.lockJobByUuid(parentless.getUuid());
+    assertThat(afterMissingParent.getParentJobUuid()).isEqualTo(firstParent.getUuid());
+    assertThat(afterMissingParent.getSimpleName()).isEqualTo(simpleName);
+    assertThat(afterMissingParent.getDescription()).contains("newer missing-parent snapshot");
+    assertThat(afterMissingParent.getLocation()).isEqualTo("newer missing-parent location");
+    SnapshotWatermark missingParentWatermark = snapshotWatermark(parentless.getUuid());
+    assertThat(missingParentWatermark.eventTime()).isEqualTo(missingParentTime);
+    assertThat(missingParentWatermark.eventKey()).containsExactly(missingParentDigest);
+
+    Instant conflictingParentTime = eventTime.plusSeconds(2);
+    byte[] conflictingParentDigest = Utils.sha256Utf8("newer-conflicting-parent");
+    jobDao.upsertOpenLineageJob(
+        UUID.randomUUID(),
+        conflictingParent.getUuid(),
+        JobType.BATCH,
+        conflictingParentTime,
+        namespace.getUuid(),
+        namespace.getName(),
+        simpleName,
+        "newer conflicting-parent snapshot",
+        "newer conflicting-parent location",
+        null,
+        inputs,
+        new ProjectionOrder(conflictingParentTime, conflictingParentDigest));
+
+    JobRow afterConflict = jobDao.lockJobByUuid(parentless.getUuid());
+    assertThat(afterConflict.getParentJobUuid()).isEqualTo(firstParent.getUuid());
+    assertThat(afterConflict.getSimpleName()).isEqualTo(simpleName);
+    assertThat(afterConflict.getDescription()).contains("newer conflicting-parent snapshot");
+    assertThat(afterConflict.getLocation()).isEqualTo("newer conflicting-parent location");
+    SnapshotWatermark finalWatermark = snapshotWatermark(parentless.getUuid());
+    assertThat(finalWatermark.eventTime()).isEqualTo(conflictingParentTime);
+    assertThat(finalWatermark.eventKey()).containsExactly(conflictingParentDigest);
   }
 
   @Test
@@ -578,6 +925,66 @@ public class JobDaoTest {
     assertThat(projectedJob.getOutputs())
         .containsExactlyInAnyOrderElementsOf(fixture.jobMeta().getOutputs());
   }
+
+  private static SnapshotWatermark snapshotWatermark(UUID jobUuid) {
+    return jdbi.withHandle(
+        handle ->
+            handle
+                .createQuery(
+                    "SELECT open_lineage_snapshot_time, open_lineage_snapshot_key "
+                        + "FROM jobs WHERE uuid = :jobUuid")
+                .bind("jobUuid", jobUuid)
+                .map(
+                    (resultSet, context) ->
+                        new SnapshotWatermark(
+                            resultSet.getTimestamp("open_lineage_snapshot_time").toInstant(),
+                            resultSet.getBytes("open_lineage_snapshot_key")))
+                .one());
+  }
+
+  private static PointerWatermark pointerWatermark(UUID jobUuid) {
+    return jdbi.withHandle(
+        handle ->
+            handle
+                .createQuery(
+                    "SELECT open_lineage_current_run_time, open_lineage_current_run_key "
+                        + "FROM jobs WHERE uuid = :jobUuid")
+                .bind("jobUuid", jobUuid)
+                .map(
+                    (resultSet, context) ->
+                        new PointerWatermark(
+                            resultSet.getTimestamp("open_lineage_current_run_time").toInstant(),
+                            resultSet.getBytes("open_lineage_current_run_key")))
+                .one());
+  }
+
+  private static SyntheticSnapshotState syntheticSnapshotState(UUID namespaceUuid, String name) {
+    return jdbi.withHandle(
+        handle ->
+            handle
+                .createQuery(
+                    """
+                    SELECT uuid, open_lineage_snapshot_time::text AS snapshot_time,
+                           open_lineage_snapshot_key AS snapshot_key
+                    FROM jobs
+                    WHERE namespace_uuid = :namespaceUuid AND name = :name
+                    """)
+                .bind("namespaceUuid", namespaceUuid)
+                .bind("name", name)
+                .map(
+                    (resultSet, context) ->
+                        new SyntheticSnapshotState(
+                            resultSet.getObject("uuid", UUID.class),
+                            resultSet.getString("snapshot_time"),
+                            resultSet.getBytes("snapshot_key")))
+                .one());
+  }
+
+  private record SnapshotWatermark(Instant eventTime, byte[] eventKey) {}
+
+  private record PointerWatermark(Instant eventTime, byte[] eventKey) {}
+
+  private record SyntheticSnapshotState(UUID uuid, String eventTime, byte[] eventKey) {}
 
   private record CurrentRunFixture(RunId currentRunId, JobMeta jobMeta) {}
 }

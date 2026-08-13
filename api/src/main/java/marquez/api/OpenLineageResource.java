@@ -7,8 +7,7 @@ package marquez.api;
 
 import static javax.ws.rs.core.MediaType.APPLICATION_JSON;
 import static javax.ws.rs.core.Response.Status.BAD_REQUEST;
-import static javax.ws.rs.core.Response.Status.INTERNAL_SERVER_ERROR;
-import static javax.ws.rs.core.Response.Status.SERVICE_UNAVAILABLE;
+import static javax.ws.rs.core.Response.Status.CREATED;
 
 import com.codahale.metrics.annotation.ExceptionMetered;
 import com.codahale.metrics.annotation.ResponseMetered;
@@ -17,7 +16,6 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import io.dropwizard.jersey.jsr310.ZonedDateTimeParam;
 import java.util.Collections;
 import java.util.List;
-import java.util.concurrent.CompletionException;
 import javax.validation.Valid;
 import javax.validation.constraints.Min;
 import javax.validation.constraints.NotNull;
@@ -28,8 +26,6 @@ import javax.ws.rs.POST;
 import javax.ws.rs.Path;
 import javax.ws.rs.Produces;
 import javax.ws.rs.QueryParam;
-import javax.ws.rs.container.AsyncResponse;
-import javax.ws.rs.container.Suspended;
 import javax.ws.rs.core.Response;
 import lombok.NonNull;
 import lombok.Value;
@@ -37,7 +33,9 @@ import lombok.extern.slf4j.Slf4j;
 import marquez.api.models.SortDirection;
 import marquez.common.models.RunId;
 import marquez.db.OpenLineageDao;
-import marquez.service.IntakeOverloadedException;
+import marquez.db.OpenLineageQueueDao;
+import marquez.db.OpenLineageQueueDao.PreparedEvent;
+import marquez.service.OpenLineageIntake;
 import marquez.service.ServiceFactory;
 import marquez.service.models.BaseEvent;
 import marquez.service.models.DatasetEvent;
@@ -49,14 +47,17 @@ import marquez.service.models.NodeId;
 @Path("/api/v1")
 public class OpenLineageResource extends BaseResource {
   private static final String DEFAULT_DEPTH = "20";
-  private static final int RETRY_AFTER_SECONDS = 1;
 
   private final OpenLineageDao openLineageDao;
+  private final OpenLineageIntake openLineageIntake;
 
   public OpenLineageResource(
-      @NonNull final ServiceFactory serviceFactory, @NonNull final OpenLineageDao openLineageDao) {
+      @NonNull final ServiceFactory serviceFactory,
+      @NonNull final OpenLineageDao openLineageDao,
+      @NonNull final OpenLineageIntake openLineageIntake) {
     super(serviceFactory);
     this.openLineageDao = openLineageDao;
+    this.openLineageIntake = openLineageIntake;
   }
 
   @Timed
@@ -66,59 +67,29 @@ public class OpenLineageResource extends BaseResource {
   @Consumes(APPLICATION_JSON)
   @Produces(APPLICATION_JSON)
   @Path("/lineage")
-  public void create(
-      @Valid @NotNull BaseEvent event, @Suspended final AsyncResponse asyncResponse) {
-    if (event instanceof LineageEvent) {
-      openLineageService
-          .createAsync((LineageEvent) event)
-          .whenComplete((result, err) -> onComplete(result, err, asyncResponse));
-    } else if (event instanceof DatasetEvent) {
-      openLineageService
-          .createAsync((DatasetEvent) event)
-          .whenComplete((result, err) -> onComplete(result, err, asyncResponse));
-    } else if (event instanceof JobEvent) {
-      openLineageService
-          .createAsync((JobEvent) event)
-          .whenComplete((result, err) -> onComplete(result, err, asyncResponse));
-    } else {
+  public Response create(@Valid @NotNull BaseEvent event) {
+    if (!(event instanceof LineageEvent)
+        && !(event instanceof DatasetEvent)
+        && !(event instanceof JobEvent)) {
       log.warn("Unsupported event type {}. Skipping without error", event.getClass().getName());
-
-      // return serialized event
-      asyncResponse.resume(Response.status(200).entity(event).build());
+      return Response.status(200).entity(event).build();
     }
-  }
 
-  private void onComplete(Void result, Throwable err, AsyncResponse asyncResponse) {
-    if (err != null) {
-      Throwable failure = unwrap(err);
-      if (failure instanceof IntakeOverloadedException) {
-        log.warn("OpenLineage intake is at capacity");
-        asyncResponse.resume(
-            Response.status(SERVICE_UNAVAILABLE)
-                .header("Retry-After", RETRY_AFTER_SECONDS)
-                .build());
-      } else {
-        log.error("Unexpected error while processing request", failure);
-        asyncResponse.resume(Response.status(determineStatusCode(failure)).build());
+    final PreparedEvent prepared;
+    try {
+      prepared = OpenLineageQueueDao.prepare(event);
+      if (event instanceof LineageEvent lineageEvent) {
+        OpenLineageDao.validateDatasetIds(lineageEvent.getInputs());
+      } else if (event instanceof JobEvent jobEvent) {
+        OpenLineageDao.validateDatasetIds(jobEvent.getInputs());
       }
-    } else {
-      asyncResponse.resume(Response.status(201).build());
+    } catch (IllegalArgumentException invalidArgument) {
+      log.warn("Invalid OpenLineage event: {}", invalidArgument.getMessage());
+      return Response.status(BAD_REQUEST).build();
     }
-  }
 
-  private int determineStatusCode(Throwable e) {
-    if (e instanceof IllegalArgumentException) {
-      return BAD_REQUEST.getStatusCode();
-    }
-    return INTERNAL_SERVER_ERROR.getStatusCode();
-  }
-
-  private Throwable unwrap(Throwable error) {
-    Throwable unwrapped = error;
-    while (unwrapped instanceof CompletionException && unwrapped.getCause() != null) {
-      unwrapped = unwrapped.getCause();
-    }
-    return unwrapped;
+    openLineageIntake.enqueue(prepared);
+    return Response.status(CREATED).build();
   }
 
   @Timed

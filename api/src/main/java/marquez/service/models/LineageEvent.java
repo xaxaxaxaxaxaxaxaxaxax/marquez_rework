@@ -19,6 +19,7 @@ import java.util.Optional;
 import javax.annotation.Nullable;
 import javax.validation.Valid;
 import javax.validation.constraints.NotNull;
+import javax.validation.constraints.Pattern;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Getter;
@@ -41,14 +42,15 @@ import marquez.common.models.JobType;
 @Valid
 @ToString
 public class LineageEvent extends BaseEvent {
+  private static final String CONTAINS_NON_BLANK_UNICODE = "(?s).*[^\\p{javaWhitespace}\\p{Z}].*";
 
   private String eventType;
 
   @NotNull private ZonedDateTime eventTime;
   @Valid @NotNull private LineageEvent.Run run;
   @Valid @NotNull private LineageEvent.Job job;
-  @Valid private List<Dataset> inputs;
-  @Valid private List<Dataset> outputs;
+  @Valid private List<@NotNull Dataset> inputs;
+  @Valid private List<@NotNull Dataset> outputs;
   @Valid @NotNull private String producer;
   @Valid private URI schemaURL;
 
@@ -75,7 +77,10 @@ public class LineageEvent extends BaseEvent {
   @NotNull
   public static class Run extends BaseJsonModel {
 
-    @NotNull private String runId;
+    @NotNull
+    @Pattern(regexp = CONTAINS_NON_BLANK_UNICODE, message = "must not be blank")
+    private String runId;
+
     @Valid private RunFacet facets;
   }
 
@@ -194,7 +199,9 @@ public class LineageEvent extends BaseEvent {
   @ToString
   public static class RunLink {
 
-    @NotNull private String runId;
+    @NotNull
+    @Pattern(regexp = CONTAINS_NON_BLANK_UNICODE, message = "must not be blank")
+    private String runId;
   }
 
   @Builder
@@ -206,8 +213,13 @@ public class LineageEvent extends BaseEvent {
   @ToString
   public static class JobLink {
 
-    @NotNull private String namespace;
-    @NotNull private String name;
+    @NotNull
+    @Pattern(regexp = CONTAINS_NON_BLANK_UNICODE, message = "must not be blank")
+    private String namespace;
+
+    @NotNull
+    @Pattern(regexp = CONTAINS_NON_BLANK_UNICODE, message = "must not be blank")
+    private String name;
   }
 
   @Builder
@@ -219,8 +231,14 @@ public class LineageEvent extends BaseEvent {
   @ToString
   public static class Job extends BaseJsonModel {
 
-    @NotNull private String namespace;
-    @NotNull private String name;
+    @NotNull
+    @Pattern(regexp = CONTAINS_NON_BLANK_UNICODE, message = "must not be blank")
+    private String namespace;
+
+    @NotNull
+    @Pattern(regexp = CONTAINS_NON_BLANK_UNICODE, message = "must not be blank")
+    private String name;
+
     @Valid private JobFacet facets;
 
     /**
@@ -372,8 +390,14 @@ public class LineageEvent extends BaseEvent {
   @NotNull
   public static class Dataset extends BaseJsonModel {
 
-    @NotNull private String namespace;
-    @NotNull private String name;
+    @NotNull
+    @Pattern(regexp = CONTAINS_NON_BLANK_UNICODE, message = "must not be blank")
+    private String namespace;
+
+    @NotNull
+    @Pattern(regexp = CONTAINS_NON_BLANK_UNICODE, message = "must not be blank")
+    private String name;
+
     @Valid private DatasetFacets facets;
     @Valid private InputDatasetFacets inputFacets;
     @Valid private OutputDatasetFacets outputFacets;

@@ -62,6 +62,7 @@ public class DatasetIntegrationTest extends BaseIntegrationTest {
 
   @AfterEach
   public void tearDown(Jdbi jdbi) {
+    awaitOpenLineageProjection(jdbi);
     JdbiUtils.cleanDatabase(jdbi);
   }
 
@@ -145,6 +146,7 @@ public class DatasetIntegrationTest extends BaseIntegrationTest {
 
     final CompletableFuture<Integer> resp = sendEvent(lineageEvent);
     assertThat(resp.join()).isEqualTo(201);
+    awaitOpenLineageProjection();
 
     datasetFacets.setAdditional(inputFacets);
     final LineageEvent readEvent =
@@ -168,6 +170,7 @@ public class DatasetIntegrationTest extends BaseIntegrationTest {
 
     final CompletableFuture<Integer> readResp = sendEvent(readEvent);
     assertThat(readResp.join()).isEqualTo(201);
+    awaitOpenLineageProjection();
 
     // update dataset facet to include input and output facets
     // save the expected facets as a map for comparison
@@ -381,6 +384,7 @@ public class DatasetIntegrationTest extends BaseIntegrationTest {
 
     final CompletableFuture<Integer> resp = sendEvent(event);
     assertThat(resp.join()).isEqualTo(201);
+    awaitOpenLineageProjection();
 
     client.deleteDataset(namespace, name);
 
@@ -407,6 +411,7 @@ public class DatasetIntegrationTest extends BaseIntegrationTest {
 
     CompletableFuture<Integer> resp = sendEvent(event);
     assertThat(resp.join()).isEqualTo(201);
+    awaitOpenLineageProjection();
 
     client.deleteDataset(namespace, name);
 
@@ -414,6 +419,15 @@ public class DatasetIntegrationTest extends BaseIntegrationTest {
     assertThat(datasets).hasSize(0);
     resp = sendEvent(event);
     assertThat(resp.join()).isEqualTo(201);
+    awaitOpenLineageProjection();
+
+    datasets = client.listDatasets(namespace);
+    assertThat(datasets).isEmpty();
+
+    event.setEventTime(Instant.now().plusSeconds(60).atZone(ZoneId.systemDefault()));
+    resp = sendEvent(event);
+    assertThat(resp.join()).isEqualTo(201);
+    awaitOpenLineageProjection();
 
     datasets = client.listDatasets(namespace);
     assertThat(datasets).hasSize(1);
@@ -442,6 +456,7 @@ public class DatasetIntegrationTest extends BaseIntegrationTest {
                   }
                 });
     resp.join();
+    awaitOpenLineageProjection();
 
     // verify listDatasets contains column lineage
     List<ColumnLineage> columnLineage;
@@ -480,6 +495,7 @@ public class DatasetIntegrationTest extends BaseIntegrationTest {
 
     final CompletableFuture<Integer> resp = sendEvent(event);
     assertThat(resp.join()).isEqualTo(201);
+    awaitOpenLineageProjection();
 
     client.deleteNamespace(namespace);
 
@@ -522,9 +538,11 @@ public class DatasetIntegrationTest extends BaseIntegrationTest {
 
     CompletableFuture<Integer> resp = sendEvent(firstEvent);
     assertThat(resp.join()).isEqualTo(201);
+    awaitOpenLineageProjection();
 
     resp = sendEvent(secondEvent);
     assertThat(resp.join()).isEqualTo(201);
+    awaitOpenLineageProjection();
 
     List<Dataset> datasets = client.listDatasets(namespaceName);
     assertThat(datasets).hasSize(2);
@@ -561,6 +579,7 @@ public class DatasetIntegrationTest extends BaseIntegrationTest {
 
     resp = sendEvent(eventThatWillUndeleteNamespace);
     assertThat(resp.join()).isEqualTo(201);
+    awaitOpenLineageProjection();
 
     namespaces = client.listNamespaces();
     assertThat(namespaces)
@@ -622,6 +641,7 @@ public class DatasetIntegrationTest extends BaseIntegrationTest {
             .build();
     final CompletableFuture<Integer> resp = sendEvent(lineageEvent);
     assertThat(resp.join()).isEqualTo(201);
+    awaitOpenLineageProjection();
     List<DatasetVersion> versions = client.listDatasetVersions(NAMESPACE_NAME, DB_TABLE_NAME);
 
     versions.forEach(

@@ -8,14 +8,13 @@ package marquez.logging;
 import java.sql.SQLException;
 import java.time.temporal.ChronoUnit;
 import marquez.service.DatabaseMetrics;
-import org.jdbi.v3.core.extension.ExtensionMethod;
 import org.jdbi.v3.core.statement.SqlLogger;
 import org.jdbi.v3.core.statement.StatementContext;
 import org.slf4j.MDC;
 
 /**
- * A {@link SqlLogger} implementation for JDBI which uses the SQL objects' class names and method
- * names for nanosecond-precision timers.
+ * A {@link SqlLogger} implementation for JDBI which uses DAO class and method identities for
+ * nanosecond-precision timers.
  */
 public class LabelledSqlLogger implements SqlLogger {
 
@@ -30,17 +29,18 @@ public class LabelledSqlLogger implements SqlLogger {
   }
 
   private void log(StatementContext context) {
-    ExtensionMethod extensionMethod = context.getExtensionMethod();
-    if (extensionMethod != null) {
-      final long elapsed = context.getElapsedTime(ChronoUnit.NANOS);
-      if (MDC.get("method") != null && MDC.get("pathWithParams") != null) {
-        DatabaseMetrics.recordDbDuration(
-            extensionMethod.getType().getName(),
-            extensionMethod.getMethod().getName(),
-            MDC.get("method"),
-            MDC.get("pathWithParams"),
-            elapsed / 1e9);
-      }
-    }
+    SqlStatementIdentity.resolve(context)
+        .ifPresent(
+            identity -> {
+              final long elapsed = context.getElapsedTime(ChronoUnit.NANOS);
+              if (MDC.get("method") != null && MDC.get("pathWithParams") != null) {
+                DatabaseMetrics.recordDbDuration(
+                    identity.typeName(),
+                    identity.methodName(),
+                    MDC.get("method"),
+                    MDC.get("pathWithParams"),
+                    elapsed / 1e9);
+              }
+            });
   }
 }

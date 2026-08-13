@@ -14,6 +14,7 @@ import java.util.Set;
 import javax.validation.ConstraintViolation;
 import javax.validation.Validation;
 import javax.validation.Validator;
+import marquez.MarquezConfig;
 import org.junit.jupiter.api.Test;
 
 /** The test suite for {@link DbRetentionConfig}. */
@@ -121,5 +122,25 @@ public class DbRetentionConfigTest {
     final Set<ConstraintViolation<DbRetentionConfig>> violations =
         VALIDATOR.validate(configWithNegativeRetentionDays);
     assertThat(violations).hasSize(1);
+  }
+
+  @Test
+  public void testMarquezConfigCascadesDbRetentionValidation() {
+    final MarquezConfig marquezConfig = new MarquezConfig();
+    marquezConfig.setDbRetention(
+        DbRetentionConfig.builder()
+            .frequencyMins(0)
+            .numberOfRowsPerBatch(0)
+            .retentionDays(0)
+            .build());
+
+    final Set<ConstraintViolation<MarquezConfig>> violations = VALIDATOR.validate(marquezConfig);
+
+    assertThat(violations)
+        .extracting(violation -> violation.getPropertyPath().toString())
+        .containsExactlyInAnyOrder(
+            "dbRetention.frequencyMins",
+            "dbRetention.numberOfRowsPerBatch",
+            "dbRetention.retentionDays");
   }
 }

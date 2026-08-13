@@ -31,6 +31,7 @@ import marquez.db.mappers.JobRowMapper;
 import marquez.db.mappers.RunMapper;
 import marquez.db.models.JobRow;
 import marquez.db.models.NamespaceRow;
+import marquez.db.models.ProjectionOrder;
 import marquez.service.models.Job;
 import marquez.service.models.JobMeta;
 import marquez.service.models.Run;
@@ -72,7 +73,7 @@ public interface JobDao extends BaseDao {
   String FIND_ALL_SQL_SUFFIX =
       """
           AND
-            (r.current_run_state IN (<lastRunStates>) OR r.uuid IS NULL)
+            (r.current_run_state IN (<lastRunStates>) OR r.current_run_state IS NULL)
           ORDER BY
             j.updated_at DESC,
             j.uuid DESC
@@ -145,11 +146,104 @@ public interface JobDao extends BaseDao {
   @SqlUpdate(
       """
         UPDATE jobs
-        SET updated_at = :updatedAt,
-            current_version_uuid = :currentVersionUuid
+        SET updated_at = GREATEST(
+                COALESCE(jobs.updated_at, '-infinity'::timestamptz),
+                COALESCE(:updatedAt, statement_timestamp())),
+            current_version_uuid = :currentVersionUuid,
+            open_lineage_current_version_time = NULL,
+            open_lineage_current_version_key = NULL
         WHERE uuid = :rowUuid
       """)
   void updateVersionFor(UUID rowUuid, Instant updatedAt, UUID currentVersionUuid);
+
+  default boolean updateVersionFor(UUID rowUuid, UUID currentVersionUuid, ProjectionOrder order) {
+    return updateVersionForOrdered(
+            rowUuid, currentVersionUuid, order.getEventTime(), order.getEventKey())
+        == 1;
+  }
+
+  @SqlUpdate(
+      """
+        UPDATE jobs AS j
+        SET updated_at = GREATEST(j.updated_at, :projectionTime),
+            current_version_uuid = :currentVersionUuid,
+            open_lineage_current_version_time = :projectionTime,
+            open_lineage_current_version_key = :projectionKey
+        WHERE j.uuid = :rowUuid
+          AND j.is_hidden IS FALSE
+          AND ROW(:projectionTime, :projectionKey) > ROW(
+              COALESCE(
+                  j.open_lineage_current_version_time,
+                  (SELECT GREATEST(jv.updated_at, jv.created_at)
+                   FROM job_versions AS jv
+                   WHERE jv.uuid = j.current_version_uuid),
+                  '-infinity'::timestamptz),
+              CASE WHEN j.open_lineage_current_version_time IS NULL
+                   THEN decode(repeat('00', 32), 'hex')
+                   ELSE j.open_lineage_current_version_key END)
+      """)
+  int updateVersionForOrdered(
+      UUID rowUuid, UUID currentVersionUuid, Instant projectionTime, byte[] projectionKey);
+
+  /**
+   * Returns the one event-level winner signal used for missing-side invalidation and subsequent
+   * current-version I/O activation. The ordered job snapshot upsert already holds this row lock.
+   */
+  default boolean canProjectCurrentIo(UUID rowUuid, ProjectionOrder order) {
+    return canProjectCurrentIo(rowUuid, order.getEventTime(), order.getEventKey());
+  }
+
+  @SqlQuery(
+      """
+        SELECT EXISTS (
+          SELECT 1
+          FROM jobs AS j
+          WHERE j.uuid = :rowUuid
+            AND j.is_hidden IS FALSE
+            AND j.open_lineage_snapshot_time = :projectionTime
+            AND j.open_lineage_snapshot_key = :projectionKey
+            AND ROW(:projectionTime, :projectionKey) > ROW(
+                COALESCE(
+                    j.open_lineage_current_version_time,
+                    (SELECT GREATEST(jv.updated_at, jv.created_at)
+                     FROM job_versions AS jv
+                     WHERE jv.uuid = j.current_version_uuid),
+                    '-infinity'::timestamptz),
+                CASE WHEN j.open_lineage_current_version_time IS NULL
+                     THEN decode(repeat('00', 32), 'hex')
+                     ELSE j.open_lineage_current_version_key END)
+        )
+      """)
+  boolean canProjectCurrentIo(UUID rowUuid, Instant projectionTime, byte[] projectionKey);
+
+  default boolean updateCurrentRunFor(UUID rowUuid, UUID currentRunUuid, ProjectionOrder order) {
+    return updateCurrentRunForOrdered(
+            rowUuid, currentRunUuid, order.getEventTime(), order.getEventKey())
+        == 1;
+  }
+
+  @SqlUpdate(
+      """
+        UPDATE jobs AS j
+        SET updated_at = GREATEST(j.updated_at, :projectionTime),
+            current_run_uuid = :currentRunUuid,
+            open_lineage_current_run_time = :projectionTime,
+            open_lineage_current_run_key = :projectionKey
+        WHERE j.uuid = :rowUuid
+          AND j.is_hidden IS FALSE
+          AND ROW(:projectionTime, :projectionKey) > ROW(
+              COALESCE(
+                  j.open_lineage_current_run_time,
+                  (SELECT COALESCE(r.transitioned_at, r.created_at)
+                   FROM runs AS r
+                   WHERE r.uuid = j.current_run_uuid),
+                  '-infinity'::timestamptz),
+              CASE WHEN j.open_lineage_current_run_time IS NULL
+                   THEN decode(repeat('00', 32), 'hex')
+                   ELSE j.open_lineage_current_run_key END)
+      """)
+  int updateCurrentRunForOrdered(
+      UUID rowUuid, UUID currentRunUuid, Instant projectionTime, byte[] projectionKey);
 
   @SqlQuery(
       """
@@ -211,7 +305,11 @@ public interface JobDao extends BaseDao {
   @SqlUpdate(
       """
         UPDATE jobs
-        SET is_hidden = true
+        SET is_hidden = true,
+            updated_at = GREATEST(
+                COALESCE(jobs.updated_at, '-infinity'::timestamptz), statement_timestamp()),
+            open_lineage_snapshot_time = NULL,
+            open_lineage_snapshot_key = NULL
         WHERE namespace_name = :namespaceName
         AND name = :name
       """)
@@ -220,7 +318,11 @@ public interface JobDao extends BaseDao {
   @SqlUpdate(
       """
       UPDATE jobs
-      SET is_hidden = true
+      SET is_hidden = true,
+          updated_at = GREATEST(
+              COALESCE(jobs.updated_at, '-infinity'::timestamptz), statement_timestamp()),
+          open_lineage_snapshot_time = NULL,
+          open_lineage_snapshot_key = NULL
       FROM namespaces n
       WHERE jobs.namespace_uuid = n.uuid
       AND n.name = :namespaceName
@@ -261,6 +363,116 @@ public interface JobDao extends BaseDao {
         FOR UPDATE OF j
       """)
   JobRow lockJobByUuid(UUID jobUuid);
+
+  /**
+   * Establishes the canonical job-before-run mutation order without blocking foreign-key readers.
+   */
+  @SqlQuery(
+      """
+      SELECT j.uuid
+      FROM jobs AS j
+      WHERE j.uuid = :jobUuid
+      FOR NO KEY UPDATE OF j
+      """)
+  UUID lockJobBeforeRunMutation(UUID jobUuid);
+
+  /** Creates only a missing synthetic parent's neutral identity and snapshot-order sentinel. */
+  @SqlUpdate(
+      """
+      INSERT INTO jobs (
+          uuid, type, created_at, updated_at, namespace_uuid, namespace_name, name, simple_name,
+          description, current_location, current_inputs, is_hidden,
+          open_lineage_snapshot_time, open_lineage_snapshot_key)
+      VALUES (
+          :uuid, 'BATCH', :neutralTime, :neutralTime, :namespaceUuid, :namespaceName, :name, :name,
+          NULL, NULL, '[]'::jsonb, FALSE,
+          '-infinity'::timestamptz, decode(repeat('00', 32), 'hex'))
+      ON CONFLICT (namespace_uuid, name) DO NOTHING
+      """)
+  void insertSyntheticParentJobIfAbsent(
+      UUID uuid, Instant neutralTime, UUID namespaceUuid, String namespaceName, String name);
+
+  /** Locks the exact base identity, including hidden rows and aliases. */
+  @SqlQuery(
+      """
+      SELECT j.*, p.name::text AS parent_job_name
+      FROM jobs AS j
+      LEFT JOIN jobs AS p ON p.uuid = j.parent_job_uuid
+      WHERE j.namespace_uuid = :namespaceUuid AND j.name = :name
+      FOR UPDATE OF j
+      """)
+  Optional<JobRow> lockSyntheticParentJobIdentity(UUID namespaceUuid, String name);
+
+  /**
+   * Initializes only neutral snapshot order and resolves an existing alias to its canonical row.
+   */
+  default JobRow getOrCreateSyntheticParentJob(
+      UUID uuid, UUID namespaceUuid, String namespaceName, String name) {
+    insertSyntheticParentJobIfAbsent(uuid, Instant.EPOCH, namespaceUuid, namespaceName, name);
+    JobRow identity =
+        lockSyntheticParentJobIdentity(namespaceUuid, name)
+            .orElseThrow(
+                () ->
+                    new IllegalStateException(
+                        "Synthetic parent job disappeared after insert attempt: "
+                            + namespaceName
+                            + "."
+                            + name));
+    return identity.getSymlinkTargetId() == null
+        ? identity
+        : lockJobByUuid(identity.getSymlinkTargetId());
+  }
+
+  /**
+   * Applies an ordered alias event to its locked canonical target. Identity, hierarchy and alias
+   * columns deliberately remain owned by the canonical row.
+   */
+  default boolean projectOpenLineageSnapshotForCanonicalAlias(
+      UUID rowUuid,
+      JobType type,
+      Instant updatedAt,
+      String description,
+      String location,
+      PGobject inputs,
+      ProjectionOrder order) {
+    return projectOpenLineageSnapshotForCanonicalAlias(
+            rowUuid,
+            type,
+            updatedAt,
+            description,
+            location,
+            inputs,
+            order.getEventTime(),
+            order.getEventKey())
+        == 1;
+  }
+
+  @SqlUpdate(
+      """
+        UPDATE jobs AS j
+        SET type = :type,
+            updated_at = GREATEST(j.updated_at, :updatedAt),
+            description = :description,
+            current_location = :location,
+            current_inputs = :inputs,
+            is_hidden = FALSE,
+            open_lineage_snapshot_time = :projectionTime,
+            open_lineage_snapshot_key = :projectionKey
+        WHERE j.uuid = :rowUuid
+          AND j.symlink_target_uuid IS NULL
+          AND ROW(:projectionTime, :projectionKey) > ROW(
+              COALESCE(j.open_lineage_snapshot_time, j.updated_at),
+              COALESCE(j.open_lineage_snapshot_key, decode(repeat('00', 32), 'hex')))
+      """)
+  int projectOpenLineageSnapshotForCanonicalAlias(
+      UUID rowUuid,
+      JobType type,
+      Instant updatedAt,
+      String description,
+      String location,
+      PGobject inputs,
+      Instant projectionTime,
+      byte[] projectionKey);
 
   @SqlQuery(
       """
@@ -513,6 +725,32 @@ public interface JobDao extends BaseDao {
       PGobject inputs,
       UUID currentRunUuid);
 
+  /** Ordered OpenLineage snapshot upsert; the run pointer is advanced only after its row exists. */
+  @SqlQuery(
+      """
+        INSERT INTO jobs_view AS j (
+          uuid, type, created_at, updated_at, namespace_uuid, namespace_name, name, description,
+          current_location, current_inputs, symlink_target_uuid, parent_job_uuid_string,
+          open_lineage_snapshot_time, open_lineage_snapshot_key
+        ) VALUES (
+          :uuid, :type, :now, :now, :namespaceUuid, :namespaceName, :name, :description,
+          :location, :inputs, :symlinkTargetId, '', :projectionTime, :projectionKey
+        ) RETURNING *
+      """)
+  JobRow upsertOpenLineageJob(
+      UUID uuid,
+      JobType type,
+      Instant now,
+      UUID namespaceUuid,
+      String namespaceName,
+      String name,
+      String description,
+      String location,
+      UUID symlinkTargetId,
+      PGobject inputs,
+      Instant projectionTime,
+      byte[] projectionKey);
+
   /*
    * Note: following SQL never executes. There is database trigger on `jobs_view`
    * that replaces following SQL
@@ -565,6 +803,90 @@ public interface JobDao extends BaseDao {
       UUID symlinkTargetId,
       PGobject inputs,
       UUID currentRunUuid);
+
+  /** Parent-aware ordered OpenLineage snapshot upsert. */
+  @SqlQuery(
+      """
+        INSERT INTO jobs_view AS j (
+          uuid, parent_job_uuid, type, created_at, updated_at, namespace_uuid, namespace_name,
+          name, description, current_location, current_inputs, symlink_target_uuid,
+          open_lineage_snapshot_time, open_lineage_snapshot_key
+        ) VALUES (
+          :uuid, :parentJobUuid, :type, :now, :now, :namespaceUuid, :namespaceName,
+          :name, :description, :location, :inputs, :symlinkTargetId,
+          :projectionTime, :projectionKey
+        ) RETURNING *
+      """)
+  JobRow upsertOpenLineageJob(
+      UUID uuid,
+      UUID parentJobUuid,
+      JobType type,
+      Instant now,
+      UUID namespaceUuid,
+      String namespaceName,
+      String name,
+      String description,
+      String location,
+      UUID symlinkTargetId,
+      PGobject inputs,
+      Instant projectionTime,
+      byte[] projectionKey);
+
+  default JobRow upsertOpenLineageJob(
+      UUID uuid,
+      JobType type,
+      Instant now,
+      UUID namespaceUuid,
+      String namespaceName,
+      String name,
+      String description,
+      String location,
+      UUID symlinkTargetId,
+      PGobject inputs,
+      ProjectionOrder order) {
+    return upsertOpenLineageJob(
+        uuid,
+        type,
+        now,
+        namespaceUuid,
+        namespaceName,
+        name,
+        description,
+        location,
+        symlinkTargetId,
+        inputs,
+        order.getEventTime(),
+        order.getEventKey());
+  }
+
+  default JobRow upsertOpenLineageJob(
+      UUID uuid,
+      UUID parentJobUuid,
+      JobType type,
+      Instant now,
+      UUID namespaceUuid,
+      String namespaceName,
+      String name,
+      String description,
+      String location,
+      UUID symlinkTargetId,
+      PGobject inputs,
+      ProjectionOrder order) {
+    return upsertOpenLineageJob(
+        uuid,
+        parentJobUuid,
+        type,
+        now,
+        namespaceUuid,
+        namespaceName,
+        name,
+        description,
+        location,
+        symlinkTargetId,
+        inputs,
+        order.getEventTime(),
+        order.getEventKey());
+  }
 
   @SqlUpdate(
       """

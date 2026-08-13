@@ -17,8 +17,6 @@ import java.util.Collections;
 import java.util.Optional;
 import java.util.UUID;
 import marquez.common.Utils;
-import marquez.common.models.DatasetType;
-import marquez.db.models.DatasetRow;
 import marquez.db.models.NamespaceRow;
 import marquez.db.models.RunArgsRow;
 import marquez.db.models.RunRow;
@@ -211,25 +209,34 @@ public class BackfillTestUtils {
         });
   }
 
-  public static DatasetRow writeDataset(Jdbi jdbi, NamespaceRow namespaceRow, String datasetName) {
-    DatasetDao datasetDao = jdbi.onDemand(DatasetDao.class);
-
+  public static UUID writeDataset(Jdbi jdbi, NamespaceRow namespaceRow, String datasetName) {
     SourceRow sourceRow =
         jdbi.onDemand(SourceDao.class)
             .upsert(UUID.randomUUID(), "type", Instant.now(), "name", "http://a");
-
-    return datasetDao.upsert(
-        UUID.randomUUID(),
-        DatasetType.DB_TABLE,
-        Instant.now(),
-        namespaceRow.getUuid(),
-        namespaceRow.getName(),
-        sourceRow.getUuid(),
-        "sourceName",
-        datasetName,
-        "",
-        "",
-        false);
+    UUID datasetUuid = UUID.randomUUID();
+    Instant now = Instant.now();
+    return jdbi.withHandle(
+        handle ->
+            handle
+                .createQuery(
+                    """
+                    INSERT INTO datasets (
+                        uuid, type, created_at, updated_at, namespace_uuid, namespace_name,
+                        source_uuid, source_name, name, physical_name, description, is_deleted,
+                        is_hidden)
+                    VALUES (
+                        :uuid, 'DB_TABLE', :now, :now, :namespaceUuid, :namespaceName,
+                        :sourceUuid, 'sourceName', :name, '', '', false, false)
+                    RETURNING uuid
+                    """)
+                .bind("uuid", datasetUuid)
+                .bind("now", now)
+                .bind("namespaceUuid", namespaceRow.getUuid())
+                .bind("namespaceName", namespaceRow.getName())
+                .bind("sourceUuid", sourceRow.getUuid())
+                .bind("name", datasetName)
+                .mapTo(UUID.class)
+                .one());
   }
 
   public static UUID writeJobIOMapping(Jdbi jdbi, UUID jobUuid, UUID datasetUuid)

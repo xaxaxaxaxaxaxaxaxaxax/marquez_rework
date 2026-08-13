@@ -59,6 +59,7 @@ import marquez.client.models.LineageEvent;
 import marquez.client.models.Run;
 import marquez.common.Utils;
 import marquez.db.LineageTestUtils;
+import marquez.db.OpenLineageQueueDao;
 import org.assertj.core.api.InstanceOfAssertFactories;
 import org.jdbi.v3.core.Jdbi;
 import org.jetbrains.annotations.NotNull;
@@ -103,8 +104,9 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
 
   @AfterEach
   public void tearDown() {
-    JdbiUtils.cleanDatabase(
-        Jdbi.create(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword()));
+    Jdbi jdbi = Jdbi.create(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+    awaitOpenLineageProjection(jdbi);
+    JdbiUtils.cleanDatabase(jdbi);
   }
 
   @Test
@@ -128,6 +130,86 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
 
     final CompletableFuture<Integer> resp = sendEvent(event);
     assertThat(resp.join()).isEqualTo(400);
+  }
+
+  @Test
+  public void testHttpRejectsNestedNulBeforeDurableAdmission() throws Exception {
+    Jdbi jdbi = Jdbi.create(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+    UUID runId = UUID.randomUUID();
+    marquez.service.models.LineageEvent.RunFacet facets =
+        new marquez.service.models.LineageEvent.RunFacet();
+    facets.setFacet("custom", Map.of("outer", List.of(Map.of("value", String.valueOf('\0')))));
+    marquez.service.models.LineageEvent event =
+        marquez.service.models.LineageEvent.builder()
+            .eventType("START")
+            .eventTime(ZonedDateTime.parse("2026-08-11T00:00:00Z"))
+            .producer("testHttpRejectsNestedNulBeforeDurableAdmission")
+            .run(new marquez.service.models.LineageEvent.Run(runId.toString(), facets))
+            .job(
+                marquez.service.models.LineageEvent.Job.builder()
+                    .namespace(NAMESPACE_NAME)
+                    .name("nul-admission-job")
+                    .build())
+            .inputs(List.of())
+            .outputs(List.of())
+            .schemaURL(new URI(RUN_EVENT_SCHEMA_URL))
+            .build();
+    UUID queueKey = OpenLineageQueueDao.orderingKeyFor(event);
+
+    assertThat(sendEvent(event).get(5, TimeUnit.SECONDS)).isEqualTo(400);
+
+    QueueAdmissionState state = queueAdmissionState(jdbi, queueKey, runId);
+    assertThat(state.liveCount()).isZero();
+    assertThat(state.headEventId()).isNull();
+    assertThat(state.frozenHead()).isFalse();
+    assertThat(state.rawCount()).isZero();
+  }
+
+  @Test
+  public void testHttp201AdmitsDurablyBeforeProjectionAndQueueLaterDrains() throws Exception {
+    Jdbi jdbi = Jdbi.create(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+    UUID runId = UUID.randomUUID();
+    ZonedDateTime eventTime = ZonedDateTime.parse("2026-08-11T00:00:00Z");
+    marquez.service.models.LineageEvent.Run run =
+        new marquez.service.models.LineageEvent.Run(runId.toString(), null);
+    marquez.service.models.LineageEvent.Job job =
+        marquez.service.models.LineageEvent.Job.builder()
+            .namespace(NAMESPACE_NAME)
+            .name("durable-admission-job")
+            .build();
+    marquez.service.models.LineageEvent.LineageEventBuilder builder =
+        marquez.service.models.LineageEvent.builder()
+            .producer("testHttp201AdmitsDurablyBeforeProjectionAndQueueLaterDrains")
+            .run(run)
+            .job(job)
+            .inputs(List.of())
+            .outputs(List.of())
+            .schemaURL(new URI(RUN_EVENT_SCHEMA_URL));
+    marquez.service.models.LineageEvent predecessor =
+        builder.eventType("START").eventTime(eventTime).build();
+    marquez.service.models.LineageEvent successor =
+        builder.eventType("COMPLETE").eventTime(eventTime.plusSeconds(1)).build();
+    UUID queueKey = OpenLineageQueueDao.orderingKeyFor(predecessor);
+    long predecessorId = seedUnavailableQueueHead(jdbi, queueKey, predecessor);
+
+    try {
+      assertThat(sendEvent(successor).get(5, TimeUnit.SECONDS)).isEqualTo(201);
+
+      QueueAdmissionState admitted = queueAdmissionState(jdbi, queueKey, runId);
+      assertThat(admitted.liveCount()).isEqualTo(2);
+      assertThat(admitted.headEventId()).isEqualTo(predecessorId);
+      assertThat(admitted.frozenHead()).isTrue();
+      assertThat(admitted.rawCount()).isZero();
+    } finally {
+      makeQueueHeadDue(jdbi, queueKey);
+    }
+
+    awaitOpenLineageProjection(jdbi);
+    QueueAdmissionState drained = queueAdmissionState(jdbi, queueKey, runId);
+    assertThat(drained.liveCount()).isZero();
+    assertThat(drained.headEventId()).isNull();
+    assertThat(drained.frozenHead()).isFalse();
+    assertThat(drained.rawCount()).isEqualTo(2);
   }
 
   @ParameterizedTest
@@ -156,12 +238,85 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
             + "\"job\": {\"facets\": {}, \"name\": \"testing_name_1\", \"namespace\": \"testing_namespace_1\"}, "
             + "\"outputs\": [], \"producer\": \"me\", \"run\": {\"facets\": {}, \"runId\": null}}",
 
+        // run has a blank id
+        "{\"eventTime\": \"2021-11-03T10:53:52.427343\", \"eventType\": \"COMPLETE\", \"inputs\": [], "
+            + "\"job\": {\"name\": \"testing_name_1\", \"namespace\": \"testing_namespace_1\"}, "
+            + "\"outputs\": [], \"producer\": \"me\", \"run\": {\"runId\": \"   \"}}",
+
+        // run has a Unicode-only blank id
+        "{\"eventTime\": \"2021-11-03T10:53:52.427343\", \"eventType\": \"COMPLETE\", \"inputs\": [], "
+            + "\"job\": {\"name\": \"testing_name_1\", \"namespace\": \"testing_namespace_1\"}, "
+            + "\"outputs\": [], \"producer\": \"me\", \"run\": {\"runId\": \"\u00a0\"}}",
+
+        // job has a blank name
+        "{\"eventTime\": \"2021-11-03T10:53:52.427343\", \"eventType\": \"COMPLETE\", \"inputs\": [], "
+            + "\"job\": {\"name\": \"   \", \"namespace\": \"testing_namespace_1\"}, "
+            + "\"outputs\": [], \"producer\": \"me\", \"run\": {\"runId\": \"dae0d60a-6010-4c37-980e-c5270f5a6be4\"}}",
+
+        // input dataset has a blank namespace
+        "{\"eventTime\": \"2021-11-03T10:53:52.427343\", \"eventType\": \"COMPLETE\", "
+            + "\"inputs\": [{\"name\": \"input\", \"namespace\": \"   \"}], "
+            + "\"job\": {\"name\": \"testing_name_1\", \"namespace\": \"testing_namespace_1\"}, "
+            + "\"outputs\": [], \"producer\": \"me\", \"run\": {\"runId\": \"dae0d60a-6010-4c37-980e-c5270f5a6be4\"}}",
+
+        // input and output collections cannot contain null elements
+        "{\"eventTime\": \"2021-11-03T10:53:52.427343\", \"eventType\": \"COMPLETE\", \"inputs\": [null], "
+            + "\"job\": {\"name\": \"testing_name_1\", \"namespace\": \"testing_namespace_1\"}, "
+            + "\"outputs\": [], \"producer\": \"me\", \"run\": {\"runId\": \"dae0d60a-6010-4c37-980e-c5270f5a6be4\"}}",
+        "{\"eventTime\": \"2021-11-03T10:53:52.427343\", \"eventType\": \"COMPLETE\", \"inputs\": [], "
+            + "\"job\": {\"name\": \"testing_name_1\", \"namespace\": \"testing_namespace_1\"}, "
+            + "\"outputs\": [null], \"producer\": \"me\", \"run\": {\"runId\": \"dae0d60a-6010-4c37-980e-c5270f5a6be4\"}}",
+
+        // job event input collection cannot contain a null element
+        "{\"eventTime\": \"2021-11-03T10:53:52.427343Z\", \"inputs\": [null], "
+            + "\"job\": {\"name\": \"testing_name_1\", \"namespace\": \"testing_namespace_1\"}, "
+            + "\"outputs\": [], \"producer\": \"me\", "
+            + "\"schemaURL\": \"https://openlineage.io/spec/2-8-9/OpenLineage.json#/definitions/JobEvent\"}",
+
+        // dataset event has a missing or null dataset
+        "{\"eventTime\": \"2021-11-03T10:53:52.427343Z\", \"producer\": \"me\", "
+            + "\"schemaURL\": \"https://openlineage.io/spec/2-8-9/OpenLineage.json#/definitions/DatasetEvent\"}",
+        "{\"eventTime\": \"2021-11-03T10:53:52.427343Z\", \"dataset\": null, \"producer\": \"me\", "
+            + "\"schemaURL\": \"https://openlineage.io/spec/2-8-9/OpenLineage.json#/definitions/DatasetEvent\"}",
+
         // parent run facet has an empty {} run section
         "{\"eventTime\": \"2021-11-03T10:53:52.427343\", \"eventType\": \"COMPLETE\", \"inputs\": [{\"facets\": {}, \"name\": \"OPEN_LINEAGE_DEMO.DEMO.SOURCE_TABLE_1\", \"namespace\": \"testing_namespace_1\"}], "
             + "\"job\": {\"facets\": {}, \"name\": \"testing_name_1\", \"namespace\": \"testing_namespace_1\"}, "
             + "\"outputs\": [], \"producer\": \"me\", \"run\": {\"facets\": { \"parent\": "
             + "{ \"_producer\": \"me\", \"_schemaURL\": \"https://me\", \"run\": {}, \"job\": { \"namespace\": \"my-scheduler-namespace\", \"name\": \"myjob.mytask\"} }},"
             + "\"runId\": \"dae0d60a-6010-4c37-980e-c5270f5a6be4\"}}",
+
+        // parent run facet identities cannot be blank
+        "{\"eventTime\": \"2021-11-03T10:53:52.427343Z\", \"eventType\": \"COMPLETE\", \"inputs\": [], "
+            + "\"job\": {\"name\": \"child\", \"namespace\": \"testing_namespace_1\"}, \"outputs\": [], "
+            + "\"producer\": \"me\", \"run\": {\"runId\": \"dae0d60a-6010-4c37-980e-c5270f5a6be4\", "
+            + "\"facets\": {\"parent\": {\"_producer\": \"https://me\", \"_schemaURL\": \"https://me\", "
+            + "\"run\": {\"runId\": \"   \"}, \"job\": {\"namespace\": \"parent-ns\", \"name\": \"parent\"}}}}}",
+        "{\"eventTime\": \"2021-11-03T10:53:52.427343Z\", \"eventType\": \"COMPLETE\", \"inputs\": [], "
+            + "\"job\": {\"name\": \"child\", \"namespace\": \"testing_namespace_1\"}, \"outputs\": [], "
+            + "\"producer\": \"me\", \"run\": {\"runId\": \"dae0d60a-6010-4c37-980e-c5270f5a6be4\", "
+            + "\"facets\": {\"parent\": {\"_producer\": \"https://me\", \"_schemaURL\": \"https://me\", "
+            + "\"run\": {\"runId\": \"\u2003\u00a0\"}, \"job\": {\"namespace\": \"parent-ns\", \"name\": \"parent\"}}}}}",
+        "{\"eventTime\": \"2021-11-03T10:53:52.427343Z\", \"eventType\": \"COMPLETE\", \"inputs\": [], "
+            + "\"job\": {\"name\": \"child\", \"namespace\": \"testing_namespace_1\"}, \"outputs\": [], "
+            + "\"producer\": \"me\", \"run\": {\"runId\": \"dae0d60a-6010-4c37-980e-c5270f5a6be4\", "
+            + "\"facets\": {\"parent\": {\"_producer\": \"https://me\", \"_schemaURL\": \"https://me\", "
+            + "\"run\": {\"runId\": \"parent-run\"}, \"job\": {\"namespace\": \"   \", \"name\": \"parent\"}}}}}",
+        "{\"eventTime\": \"2021-11-03T10:53:52.427343Z\", \"eventType\": \"COMPLETE\", \"inputs\": [], "
+            + "\"job\": {\"name\": \"child\", \"namespace\": \"testing_namespace_1\"}, \"outputs\": [], "
+            + "\"producer\": \"me\", \"run\": {\"runId\": \"dae0d60a-6010-4c37-980e-c5270f5a6be4\", "
+            + "\"facets\": {\"parent\": {\"_producer\": \"https://me\", \"_schemaURL\": \"https://me\", "
+            + "\"run\": {\"runId\": \"parent-run\"}, \"job\": {\"namespace\": \"\u2003\u00a0\", \"name\": \"parent\"}}}}}",
+        "{\"eventTime\": \"2021-11-03T10:53:52.427343Z\", \"eventType\": \"COMPLETE\", \"inputs\": [], "
+            + "\"job\": {\"name\": \"child\", \"namespace\": \"testing_namespace_1\"}, \"outputs\": [], "
+            + "\"producer\": \"me\", \"run\": {\"runId\": \"dae0d60a-6010-4c37-980e-c5270f5a6be4\", "
+            + "\"facets\": {\"parent\": {\"_producer\": \"https://me\", \"_schemaURL\": \"https://me\", "
+            + "\"run\": {\"runId\": \"parent-run\"}, \"job\": {\"namespace\": \"parent-ns\", \"name\": \"   \"}}}}}",
+        "{\"eventTime\": \"2021-11-03T10:53:52.427343Z\", \"eventType\": \"COMPLETE\", \"inputs\": [], "
+            + "\"job\": {\"name\": \"child\", \"namespace\": \"testing_namespace_1\"}, \"outputs\": [], "
+            + "\"producer\": \"me\", \"run\": {\"runId\": \"dae0d60a-6010-4c37-980e-c5270f5a6be4\", "
+            + "\"facets\": {\"parent\": {\"_producer\": \"https://me\", \"_schemaURL\": \"https://me\", "
+            + "\"run\": {\"runId\": \"parent-run\"}, \"job\": {\"namespace\": \"parent-ns\", \"name\": \"\u2003\u00a0\"}}}}}",
       })
   public void testSendOpenLineageEventFailsValidation(String eventBody) throws IOException {
     final CompletableFuture<Integer> resp =
@@ -181,18 +336,11 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
     String eventWithIncorrectEventTimeFormat =
         "{\"eventTime\": \"2021-11-03\", \"eventType\": \"START\", \"inputs\": [], \"job\": {\"facets\": {}, \"name\": \"job\", \"namespace\": \"openlineage\"}, \"outputs\": [], \"run\": {\"facets\": {}, \"runId\": \"123e4567-e89b-12d3-a456-426614174000\"}}";
 
-    final CompletableFuture<String> resp =
-        this.sendLineage(eventWithIncorrectEventTimeFormat)
-            .thenApply(HttpResponse::body)
-            .whenComplete(
-                (val, err) -> {
-                  if (err != null) {
-                    Assertions.fail("Could not complete request");
-                  }
-                });
-    assertThat(resp.join())
-        .contains(
-            "Cannot deserialize value of type `java.time.ZonedDateTime` from String \\\"2021-11-03\\\"");
+    final HttpResponse<String> response =
+        this.sendLineage(eventWithIncorrectEventTimeFormat).join();
+
+    assertThat(response.statusCode()).isEqualTo(400);
+    assertThat(response.body()).isEqualTo("{\"code\":400,\"message\":\"Unable to process JSON\"}");
   }
 
   @Test
@@ -245,11 +393,13 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
 
     CompletableFuture<Integer> future = sendAllEvents(airflowTask1, airflowTask2);
     future.get(5, TimeUnit.SECONDS);
+    awaitOpenLineageProjection();
 
     Job job = client.getJob(NAMESPACE_NAME, dagName + "." + task1Name);
     assertThat(job)
         .isNotNull()
         .hasFieldOrPropertyWithValue("id", new JobId(NAMESPACE_NAME, dagName + "." + task1Name))
+        .hasFieldOrPropertyWithValue("simpleName", task1Name)
         .hasFieldOrPropertyWithValue("parentJobName", dagName);
 
     Job parentJob = client.getJob(NAMESPACE_NAME, dagName);
@@ -304,11 +454,13 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
 
     CompletableFuture<Integer> future = sendAllEvents(airflowTask1, airflowTask2);
     future.get(5, TimeUnit.SECONDS);
+    awaitOpenLineageProjection();
 
     Job job = client.getJob(NAMESPACE_NAME, dagName + "." + task1Name);
     assertThat(job)
         .isNotNull()
         .hasFieldOrPropertyWithValue("id", new JobId(NAMESPACE_NAME, dagName + "." + task1Name))
+        .hasFieldOrPropertyWithValue("simpleName", task1Name)
         .hasFieldOrPropertyWithValue("parentJobName", dagName);
 
     Job parentJob = client.getJob(NAMESPACE_NAME, dagName);
@@ -378,11 +530,13 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
 
     CompletableFuture<Integer> future = sendAllEvents(airflowTask1, airflowTask2);
     future.get(5, TimeUnit.SECONDS);
+    awaitOpenLineageProjection();
 
     Job job = client.getJob(NAMESPACE_NAME, dagName + "." + task1Name);
     assertThat(job)
         .isNotNull()
         .hasFieldOrPropertyWithValue("id", new JobId(NAMESPACE_NAME, dagName + "." + task1Name))
+        .hasFieldOrPropertyWithValue("simpleName", task1Name)
         .hasFieldOrPropertyWithValue("parentJobName", dagName);
 
     Job parentJob = client.getJob(NAMESPACE_NAME, dagName);
@@ -432,11 +586,13 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
                       }
                     }))
         .get(5, TimeUnit.SECONDS);
+    awaitOpenLineageProjection();
 
     Job job = client.getJob(NAMESPACE_NAME, dagName + "." + task1Name);
     assertThat(job)
         .isNotNull()
         .hasFieldOrPropertyWithValue("id", new JobId(NAMESPACE_NAME, dagName + "." + task1Name))
+        .hasFieldOrPropertyWithValue("simpleName", task1Name)
         .hasFieldOrPropertyWithValue("parentJobName", dagName);
 
     Job parentJob = client.getJob(NAMESPACE_NAME, dagName);
@@ -450,8 +606,7 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
         .hasSize(1)
         .first()
         .extracting("startedAt", as(InstanceOfAssertFactories.OPTIONAL))
-        .get()
-        .isNotNull();
+        .isEmpty();
   }
 
   @Test
@@ -498,6 +653,7 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
                       }
                     }))
         .get(5, TimeUnit.SECONDS);
+    awaitOpenLineageProjection();
 
     Job job = client.getJob(NAMESPACE_NAME, dagName + "." + task1Name);
     assertThat(job)
@@ -557,6 +713,7 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
                       }
                     }))
         .get(5, TimeUnit.SECONDS);
+    awaitOpenLineageProjection();
 
     Job job = client.getJob(NAMESPACE_NAME, dagName + "." + task1Name);
     assertThat(job)
@@ -622,11 +779,13 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
                       }
                     }))
         .get(5, TimeUnit.SECONDS);
+    awaitOpenLineageProjection();
 
     Job job = client.getJob(NAMESPACE_NAME, dagName + "." + task1Name);
     assertThat(job)
         .isNotNull()
         .hasFieldOrPropertyWithValue("id", new JobId(NAMESPACE_NAME, dagName + "." + task1Name))
+        .hasFieldOrPropertyWithValue("simpleName", task1Name)
         .hasFieldOrPropertyWithValue("parentJobName", dagName);
 
     Job parentJob = client.getJob(NAMESPACE_NAME, dagName);
@@ -678,6 +837,7 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
 
     CompletableFuture<Integer> future = sendAllEvents(airflowTask1, airflowTask2);
     future.get(5, TimeUnit.SECONDS);
+    awaitOpenLineageProjection();
 
     Job job = client.getJob(NAMESPACE_NAME, dagName + "." + task1Name);
     assertThat(job)
@@ -730,6 +890,7 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
 
     CompletableFuture<Integer> future = sendAllEvents(airflowTask1, airflowTask2);
     future.get(5, TimeUnit.SECONDS);
+    awaitOpenLineageProjection();
 
     Job job = client.getJob(NAMESPACE_NAME, dagName + "." + task1Name);
     assertThat(job)
@@ -789,6 +950,7 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
 
     CompletableFuture<Integer> future = sendAllEvents(airflowTask1, airflowTask2);
     future.get(5, TimeUnit.SECONDS);
+    awaitOpenLineageProjection();
 
     Job job = client.getJob(NAMESPACE_NAME, dagName + "." + task1Name);
     assertThat(job)
@@ -816,12 +978,13 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
       throws ExecutionException, InterruptedException, TimeoutException {
     OpenLineage ol = new OpenLineage(URI.create("http://openlineage.test.com/"));
     ZonedDateTime startOfHour =
-        Instant.now()
-            .atZone(LineageTestUtils.LOCAL_ZONE)
-            .with(ChronoField.MINUTE_OF_HOUR, 0)
-            .with(ChronoField.SECOND_OF_MINUTE, 0);
+        ZonedDateTime.parse("2026-08-14T00:00:00Z")
+            .withZoneSameInstant(LineageTestUtils.LOCAL_ZONE);
     ZonedDateTime endOfHour = startOfHour.plusHours(1);
-    String airflowParentRunId = UUID.randomUUID().toString();
+    UUID requestedParentRunId = UUID.fromString("22000000-0000-4000-8000-000000000001");
+    String firstReportedParentRunId =
+        requestedParentRunId.toString().toUpperCase(java.util.Locale.ROOT);
+    String secondReportedParentRunId = requestedParentRunId.toString();
     String task1Name = "task1";
     String dagName = "reused_dag_name";
 
@@ -831,7 +994,7 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
             ol,
             startOfHour,
             endOfHour,
-            airflowParentRunId,
+            firstReportedParentRunId,
             dagName,
             dagName + "." + task1Name,
             NAMESPACE_NAME);
@@ -842,13 +1005,20 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
             ol,
             startOfHour,
             endOfHour,
-            airflowParentRunId,
+            secondReportedParentRunId,
             dagName,
             dagName + "." + task1Name,
             secondNamespace);
 
-    CompletableFuture<Integer> future = sendAllEvents(airflowTask1, airflowTask2);
-    future.get(5, TimeUnit.SECONDS);
+    assertThat(sendEvent(airflowTask1).get(5, TimeUnit.SECONDS)).isEqualTo(201);
+    awaitOpenLineageProjection();
+    Jdbi jdbi = Jdbi.create(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
+    HttpParentIdentity firstParentBefore =
+        httpParentIdentity(jdbi, NAMESPACE_NAME, dagName, requestedParentRunId);
+    assertThat(firstParentBefore.parentPlaceholder()).isTrue();
+
+    assertThat(sendEvent(airflowTask2).get(5, TimeUnit.SECONDS)).isEqualTo(201);
+    awaitOpenLineageProjection();
 
     Job job = client.getJob(NAMESPACE_NAME, dagName + "." + task1Name);
     assertThat(job)
@@ -863,6 +1033,46 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
         .hasFieldOrPropertyWithValue("parentJobName", null);
     List<Run> runsList = client.listRuns(secondNamespace, dagName);
     assertThat(runsList).isNotEmpty().hasSize(1);
+
+    UUID repairedParentRunUuid = UUID.fromString(runsList.get(0).getId());
+    assertThat(repairedParentRunUuid).isNotEqualTo(requestedParentRunId);
+    UUID childParentRunUuid =
+        jdbi.withHandle(
+            handle ->
+                handle
+                    .createQuery(
+                        """
+                        SELECT child.parent_run_uuid
+                        FROM runs AS child
+                        JOIN jobs AS job ON job.uuid = child.job_uuid
+                        WHERE job.namespace_name = :namespace
+                          AND job.name = :jobName
+                        """)
+                    .bind("namespace", secondNamespace)
+                    .bind("jobName", dagName + "." + task1Name)
+                    .mapTo(UUID.class)
+                    .one());
+    assertThat(childParentRunUuid).isEqualTo(repairedParentRunUuid);
+    assertThat(
+            httpParentIdentity(jdbi, secondNamespace, dagName, repairedParentRunUuid)
+                .parentPlaceholder())
+        .isTrue();
+
+    RunEvent observedParent =
+        createObservedParentRunEvent(
+            ol, endOfHour.plusMinutes(1), requestedParentRunId, dagName, secondNamespace);
+    assertThat(sendEvent(observedParent).get(5, TimeUnit.SECONDS)).isEqualTo(201);
+    awaitOpenLineageProjection();
+
+    List<Run> promotedRuns = client.listRuns(secondNamespace, dagName);
+    assertThat(promotedRuns).hasSize(1);
+    assertThat(UUID.fromString(promotedRuns.get(0).getId())).isEqualTo(repairedParentRunUuid);
+    HttpParentIdentity promotedParent =
+        httpParentIdentity(jdbi, secondNamespace, dagName, repairedParentRunUuid);
+    assertThat(promotedParent.parentPlaceholder()).isNull();
+    assertThat(promotedParent.rawEventCount()).isEqualTo(1);
+    assertThat(httpParentIdentity(jdbi, NAMESPACE_NAME, dagName, requestedParentRunId))
+        .isEqualTo(firstParentBefore);
   }
 
   @Test
@@ -902,6 +1112,7 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
 
     CompletableFuture<Integer> future = sendAllEvents(airflowTask1, sparkTask);
     future.get(5, TimeUnit.SECONDS);
+    awaitOpenLineageProjection();
 
     Job airflowTask = client.getJob(NAMESPACE_NAME, dagName + "." + task1Name);
     assertThat(airflowTask)
@@ -962,6 +1173,7 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
 
     final CompletableFuture<Integer> resp = sendEvent(lineageEvent);
     assertThat(resp.join()).isEqualTo(201);
+    awaitOpenLineageProjection();
 
     List<LineageEvent> events = client.listLineageEvents();
 
@@ -1016,6 +1228,7 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
 
     resp = sendEvent(secondEvent);
     assertThat(resp.join()).isEqualTo(201);
+    awaitOpenLineageProjection();
 
     List<LineageEvent> rawEvents = client.listLineageEvents();
 
@@ -1071,6 +1284,7 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
 
     resp = sendEvent(secondEvent);
     assertThat(resp.join()).isEqualTo(201);
+    awaitOpenLineageProjection();
 
     List<LineageEvent> rawEvents = client.listLineageEvents(MarquezClient.SortDirection.ASC, 10);
 
@@ -1128,6 +1342,7 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
 
     resp = sendEvent(secondEvent);
     assertThat(resp.join()).isEqualTo(201);
+    awaitOpenLineageProjection();
 
     marquez.service.models.LineageEvent thirdEvent =
         builder
@@ -1185,6 +1400,7 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
 
     CompletableFuture<Integer> resp = sendEvent(event);
     assertThat(resp.join()).isEqualTo(201);
+    awaitOpenLineageProjection();
 
     List<Job> jobs = client.listJobs(NAMESPACE_NAME);
 
@@ -1214,6 +1430,125 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
               }
             });
   }
+
+  private long seedUnavailableQueueHead(
+      Jdbi jdbi, UUID orderingKey, marquez.service.models.LineageEvent event) {
+    return jdbi.withHandle(
+        handle ->
+            handle
+                .createQuery(
+                    """
+                    WITH inserted AS (
+                      INSERT INTO open_lineage_queue (ordering_key, event)
+                      VALUES (:orderingKey, :eventJson)
+                      RETURNING ordering_key, id
+                    ), created_head AS (
+                      INSERT INTO open_lineage_queue_heads (
+                          ordering_key, event_id, available_at)
+                      SELECT ordering_key, id, 'infinity'::timestamptz
+                      FROM inserted
+                      RETURNING event_id
+                    )
+                    SELECT event_id
+                    FROM created_head
+                    """)
+                .bind("orderingKey", orderingKey)
+                .bind("eventJson", Utils.toJson(event))
+                .mapTo(Long.class)
+                .one());
+  }
+
+  private void makeQueueHeadDue(Jdbi jdbi, UUID orderingKey) {
+    int updated =
+        jdbi.withHandle(
+            handle ->
+                handle
+                    .createUpdate(
+                        "UPDATE open_lineage_queue_heads "
+                            + "SET available_at = '-infinity'::timestamptz "
+                            + "WHERE ordering_key = :orderingKey")
+                    .bind("orderingKey", orderingKey)
+                    .execute());
+    assertThat(updated).isEqualTo(1);
+  }
+
+  private QueueAdmissionState queueAdmissionState(Jdbi jdbi, UUID orderingKey, UUID runUuid) {
+    return jdbi.withHandle(
+        handle ->
+            handle
+                .createQuery(
+                    """
+                    SELECT
+                      (SELECT count(*)
+                         FROM open_lineage_queue
+                        WHERE ordering_key = :orderingKey) AS live_count,
+                      (SELECT event_id
+                         FROM open_lineage_queue_heads
+                        WHERE ordering_key = :orderingKey) AS head_event_id,
+                      EXISTS (
+                        SELECT 1
+                        FROM open_lineage_queue_heads
+                        WHERE ordering_key = :orderingKey
+                          AND available_at = 'infinity'::timestamptz
+                          AND attempt_count = 0
+                          AND refresh_due_on_advance = FALSE
+                      ) AS frozen_head,
+                      (SELECT count(*)
+                         FROM lineage_events
+                        WHERE run_uuid = :runUuid) AS raw_count
+                    """)
+                .bind("orderingKey", orderingKey)
+                .bind("runUuid", runUuid)
+                .map(
+                    (resultSet, context) -> {
+                      long headValue = resultSet.getLong("head_event_id");
+                      Long headEventId = resultSet.wasNull() ? null : headValue;
+                      return new QueueAdmissionState(
+                          resultSet.getLong("live_count"),
+                          headEventId,
+                          resultSet.getBoolean("frozen_head"),
+                          resultSet.getLong("raw_count"));
+                    })
+                .one());
+  }
+
+  private record QueueAdmissionState(
+      long liveCount, Long headEventId, boolean frozenHead, long rawCount) {}
+
+  private HttpParentIdentity httpParentIdentity(
+      Jdbi jdbi, String namespace, String jobName, UUID runUuid) {
+    return jdbi.withHandle(
+        handle ->
+            handle
+                .createQuery(
+                    """
+                    SELECT jsonb_build_object(
+                               'job', to_jsonb(job),
+                               'run', to_jsonb(run))::text AS identity_json,
+                           run.open_lineage_parent_placeholder,
+                           (SELECT count(*)
+                              FROM lineage_events
+                             WHERE run_uuid = run.uuid) AS raw_event_count
+                    FROM runs AS run
+                    JOIN jobs AS job ON job.uuid = run.job_uuid
+                    WHERE job.namespace_name = :namespace
+                      AND job.name = :jobName
+                      AND run.uuid = :runUuid
+                    """)
+                .bind("namespace", namespace)
+                .bind("jobName", jobName)
+                .bind("runUuid", runUuid)
+                .map(
+                    (resultSet, context) ->
+                        new HttpParentIdentity(
+                            resultSet.getString("identity_json"),
+                            resultSet.getObject("open_lineage_parent_placeholder", Boolean.class),
+                            resultSet.getLong("raw_event_count")))
+                .one());
+  }
+
+  private record HttpParentIdentity(
+      String identityJson, Boolean parentPlaceholder, long rawEventCount) {}
 
   private CompletableFuture<Integer> sendAllEvents(RunEvent... events) {
     return Arrays.stream(events)
@@ -1264,6 +1599,32 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
         taskName,
         Optional.of(airflowVersionFacet),
         namespace);
+  }
+
+  @NotNull
+  private RunEvent createObservedParentRunEvent(
+      OpenLineage ol, ZonedDateTime eventTime, UUID runId, String jobName, String namespace) {
+    return ol.newRunEventBuilder()
+        .eventType(EventType.COMPLETE)
+        .eventTime(eventTime)
+        .run(
+            ol.newRun(
+                runId,
+                ol.newRunFacetsBuilder()
+                    .nominalTime(
+                        ol.newNominalTimeRunFacet(
+                            eventTime.minusMinutes(1), eventTime.plusMinutes(1)))
+                    .build()))
+        .job(
+            ol.newJob(
+                namespace,
+                jobName,
+                ol.newJobFacetsBuilder()
+                    .documentation(ol.newDocumentationJobFacet("observed parent"))
+                    .build()))
+        .inputs(Collections.emptyList())
+        .outputs(Collections.emptyList())
+        .build();
   }
 
   @NotNull
@@ -1332,6 +1693,7 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
 
     // Ensure the event was received.
     assertThat(resp.join()).isEqualTo(201);
+    awaitOpenLineageProjection();
 
     // (3) Convert the OpenLineage event to Json.
     final JsonNode openLineageEventAsJson =
@@ -1397,6 +1759,7 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
     Map<Integer, String> respMap = resp.join();
 
     assertThat(respMap.containsKey(201)).isTrue();
+    awaitOpenLineageProjection();
 
     // (3) Convert the OpenLineage event to Json.
     final JsonNode openLineageEventAsJson =
@@ -1444,6 +1807,7 @@ public class OpenLineageIntegrationTest extends BaseIntegrationTest {
     // Ensure the event was received.
     Map<Integer, String> respMap = resp.join();
     assertThat(respMap.containsKey(201)).isTrue();
+    awaitOpenLineageProjection();
 
     // (2) Verify the job facets associated with the OpenLineage event.
     final JsonNode jobAsJson = openLineageEventAsJson.path("job");

@@ -33,8 +33,9 @@ data:
       url: jdbc:postgresql://${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
       user: ${POSTGRES_USER}
       password: ${POSTGRES_PASSWORD}
+      autoCommentsEnabled: {{ .Values.marquez.db.autoCommentsEnabled }}
     # Enables retention policy configuration for database (default: disabled)
-    {{- if .Values.marquez.dbRetention }}
+    {{- if .Values.marquez.dbRetention.enabled }}
     dbRetention:
       frequencyMins: {{ .Values.marquez.dbRetention.frequencyMins }}
       numberOfRowsPerBatch: {{ .Values.marquez.dbRetention.numberOfRowsPerBatch }}
@@ -43,6 +44,17 @@ data:
 
     # Enables database migration on startup (default: true)
     migrateOnStartup: ${MIGRATE_ON_STARTUP}
+
+    ### OPENLINEAGE INTAKE CONFIG ###
+
+    openLineage:
+      workerThreads: {{ .Values.marquez.openLineage.workerThreads }}
+      pollIntervalMillis: {{ .Values.marquez.openLineage.pollIntervalMillis }}
+      maxAttempts: {{ .Values.marquez.openLineage.maxAttempts }}
+      retryInitialDelayMillis: {{ .Values.marquez.openLineage.retryInitialDelayMillis }}
+      retryMaxDelayMillis: {{ .Values.marquez.openLineage.retryMaxDelayMillis }}
+      shutdownGracePeriodMillis: {{ .Values.marquez.openLineage.shutdownGracePeriodMillis }}
+
     logging:
       level: ${LOG_LEVEL}
       appenders:

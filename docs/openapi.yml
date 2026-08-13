@@ -3,7 +3,7 @@
 openapi: 3.0.2
 info:
   title: Marquez
-  version: 0.50.0
+  version: 0.51.2-SNAPSHOT
   description: Marquez is an open source **metadata service** for the **collection**, **aggregation**,
     and **visualization** of a data ecosystem's metadata.
   license:
@@ -582,29 +582,37 @@ paths:
     post:
       operationId: recordLineage
       summary: Record a single lineage event
-      description: Receive, process, and store lineage metadata using the [OpenLineage](https://github.com/OpenLineage/OpenLineage/blob/main/spec/OpenLineage.json) standard.
+      description: >-
+        Receive and commit a single lineage event to a durable database-backed intake queue using the
+        [OpenLineage](https://github.com/OpenLineage/OpenLineage/blob/main/spec/OpenLineage.json) standard.
+        Derived lineage projections are processed asynchronously and may not be visible immediately.
+        There is no application-level event-count cap; database capacity applies. Acceptance confirms
+        only that the event was committed to the intake queue. The queue retries database projection
+        failures and can ultimately dead-letter an event after repeated failures. Search indexing and
+        run-transition listener delivery happen after the queue item is acknowledged and are best
+        effort: they have no durable delivery guarantee, may be missing, concurrent, or out of order,
+        and are not retried by the intake queue. Any 5xx response during queue admission is
+        commit-indeterminate: the queue transaction may already have committed even if Marquez did
+        not observe the commit result. Clients that retry must tolerate duplicate events.
       tags:
         - Lineage
       requestBody:
+        required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/LineageEvent'
+              $ref: '#/components/schemas/OpenLineageEventRequest'
       responses:
         '201':
-          description: Lineage event accepted and stored
+          description: Empty response confirming only that the lineage event was committed to the durable intake queue
         '400':
-          description: Invalid lineage event
+          description: Malformed lineage event JSON, invalid input dataset identifier, or a text value containing U+0000
+        '422':
+          description: Lineage event failed request validation
         '500':
-          description: Lineage event processing failed
-        '503':
-          description: OpenLineage intake is at capacity; retry the request later
-          headers:
-            Retry-After:
-              description: Minimum number of seconds to wait before retrying
-              schema:
-                type: integer
-                minimum: 1
+          description: >-
+            Queue admission failed or its commit outcome is indeterminate; the lineage event may
+            already have been committed, and a retry can submit a duplicate
     get:
       operationId: getLineage
       parameters:
@@ -1950,6 +1958,188 @@ components:
           type: string
       example:
         description: My first tag!
+
+    OpenLineageEventRequest:
+      description: >-
+        A supported OpenLineage RunEvent, DatasetEvent, or JobEvent. The variants are selected by
+        their documented shape and schema URL; no discriminator is used because a RunEvent may omit
+        schemaURL for backward compatibility.
+      oneOf:
+        - $ref: '#/components/schemas/OpenLineageRunEventRequest'
+        - $ref: '#/components/schemas/OpenLineageDatasetEventRequest'
+        - $ref: '#/components/schemas/OpenLineageJobEventRequest'
+
+    OpenLineageRunEventRequest:
+      type: object
+      additionalProperties: true
+      required: [eventTime, run, job, producer]
+      properties:
+        eventType:
+          type: string
+        eventTime:
+          type: string
+          format: date-time
+        run:
+          $ref: '#/components/schemas/OpenLineageRunRequest'
+        job:
+          $ref: '#/components/schemas/OpenLineageJobRequest'
+        inputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/OpenLineageDatasetRequest'
+        outputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/OpenLineageDatasetRequest'
+        producer:
+          type: string
+        schemaURL:
+          type: string
+          format: uri
+          nullable: true
+          pattern: '/RunEvent$'
+          description: May be omitted or null; the server then uses the RunEvent model.
+      example:
+        eventType: COMPLETE
+        eventTime: 2019-05-09T19:49:24.201361Z
+        run: {runId: d46e465b-d358-4d32-83d4-df660ff614dd}
+        job: {namespace: my-namespace, name: my-job}
+        outputs: [{namespace: my-namespace, name: my-output}]
+        producer: https://example.com/openlineage-producer
+
+    OpenLineageDatasetEventRequest:
+      type: object
+      additionalProperties: true
+      required: [eventTime, dataset, producer, schemaURL]
+      properties:
+        eventTime:
+          type: string
+          format: date-time
+        dataset:
+          $ref: '#/components/schemas/OpenLineageDatasetRequest'
+        producer:
+          type: string
+        schemaURL:
+          type: string
+          format: uri
+          pattern: '/DatasetEvent$'
+      example:
+        eventTime: 2019-05-09T19:49:24.201361Z
+        dataset: {namespace: my-namespace, name: my-dataset}
+        producer: https://example.com/openlineage-producer
+        schemaURL: https://openlineage.io/spec/2-0-0/OpenLineage.json#/definitions/DatasetEvent
+
+    OpenLineageJobEventRequest:
+      type: object
+      additionalProperties: true
+      required: [eventTime, job, producer, schemaURL]
+      properties:
+        eventTime:
+          type: string
+          format: date-time
+        job:
+          $ref: '#/components/schemas/OpenLineageJobRequest'
+        inputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/OpenLineageDatasetRequest'
+        outputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/OpenLineageDatasetRequest'
+        producer:
+          type: string
+        schemaURL:
+          type: string
+          format: uri
+          pattern: '/JobEvent$'
+      example:
+        eventTime: 2019-05-09T19:49:24.201361Z
+        job: {namespace: my-namespace, name: my-job}
+        producer: https://example.com/openlineage-producer
+        schemaURL: https://openlineage.io/spec/2-0-0/OpenLineage.json#/definitions/JobEvent
+
+    OpenLineageRunRequest:
+      type: object
+      additionalProperties: true
+      required: [runId]
+      properties:
+        runId:
+          $ref: '#/components/schemas/OpenLineageIdentityRequest'
+        facets:
+          $ref: '#/components/schemas/OpenLineageRunFacetsRequest'
+
+    OpenLineageRunFacetsRequest:
+      type: object
+      additionalProperties: true
+      properties:
+        parent:
+          $ref: '#/components/schemas/OpenLineageParentRunFacetRequest'
+        parentRun:
+          $ref: '#/components/schemas/OpenLineageParentRunFacetRequest'
+
+    OpenLineageParentRunFacetRequest:
+      type: object
+      additionalProperties: true
+      required: [_producer, _schemaURL, run, job]
+      properties:
+        _producer:
+          type: string
+          format: uri
+        _schemaURL:
+          type: string
+          format: uri
+        run:
+          $ref: '#/components/schemas/OpenLineageRunLinkRequest'
+        job:
+          $ref: '#/components/schemas/OpenLineageJobRequest'
+
+    OpenLineageRunLinkRequest:
+      type: object
+      additionalProperties: true
+      required: [runId]
+      properties:
+        runId:
+          $ref: '#/components/schemas/OpenLineageIdentityRequest'
+
+    OpenLineageJobRequest:
+      type: object
+      additionalProperties: true
+      required: [namespace, name]
+      properties:
+        namespace:
+          $ref: '#/components/schemas/OpenLineageIdentityRequest'
+        name:
+          $ref: '#/components/schemas/OpenLineageIdentityRequest'
+        facets:
+          type: object
+          additionalProperties: true
+
+    OpenLineageDatasetRequest:
+      type: object
+      additionalProperties: true
+      required: [namespace, name]
+      properties:
+        namespace:
+          $ref: '#/components/schemas/OpenLineageIdentityRequest'
+        name:
+          $ref: '#/components/schemas/OpenLineageIdentityRequest'
+        facets:
+          type: object
+          additionalProperties: true
+        inputFacets:
+          type: object
+          additionalProperties: true
+        outputFacets:
+          type: object
+          additionalProperties: true
+
+    OpenLineageIdentityRequest:
+      type: string
+      minLength: 1
+      description: >-
+        An OpenLineage identity component. Runtime validation also rejects values made entirely of
+        Java or Unicode separator whitespace, which OpenAPI 3.0 cannot express portably.
 
     LineageEvent:
       example:

@@ -42,6 +42,7 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
 import java.util.function.Function;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javax.annotation.Nullable;
@@ -83,6 +84,8 @@ public final class Utils {
       UUID.fromString("6ba7b811-9dad-11d1-80b4-00c04fd430c8");
 
   private static final ObjectMapper MAPPER = newObjectMapper();
+  private static final Pattern INVALID_OPEN_LINEAGE_NAMESPACE_CHARACTER =
+      Pattern.compile("[^a-z:/A-Z0-9\\-_.@+]");
 
   private static final int UUID_LENGTH = 36;
 
@@ -143,6 +146,60 @@ public final class Utils {
     return MAPPER;
   }
 
+  /** Applies the namespace normalization used by OpenLineage relational projection. */
+  public static String sanitizeOpenLineageNamespace(@NonNull String namespace) {
+    return INVALID_OPEN_LINEAGE_NAMESPACE_CHARACTER.matcher(namespace).replaceAll("_");
+  }
+
+  /** Returns the SHA-256 key for the exact UTF-8 text supplied by durable intake. */
+  public static byte[] sha256Utf8(@NonNull String value) {
+    return Hashing.sha256().hashString(value, UTF_8).asBytes();
+  }
+
+  /** Rejects identifiers made entirely from Unicode whitespace without otherwise normalizing. */
+  public static String requireOpenLineageIdentity(
+      @Nullable String value, @NonNull String description) {
+    if (value == null) {
+      throw new IllegalArgumentException(description + " is required");
+    }
+    if (value.isEmpty()
+        || value
+            .codePoints()
+            .allMatch(
+                codePoint ->
+                    Character.isWhitespace(codePoint) || Character.isSpaceChar(codePoint))) {
+      throw new IllegalArgumentException(description + " must not be blank");
+    }
+    return value;
+  }
+
+  /** Returns the UUID used by OpenLineage projection for a reported run ID. */
+  public static UUID openLineageRunUuid(@NonNull String runId) {
+    requireOpenLineageIdentity(runId, "runId");
+    try {
+      return UUID.fromString(runId);
+    } catch (IllegalArgumentException ignored) {
+      return UUID.nameUUIDFromBytes(runId.getBytes(StandardCharsets.UTF_8));
+    }
+  }
+
+  /**
+   * Resolves a parent run using the normal OpenLineage run identity, while retaining the old
+   * Airflow adapter's namespaced derivation only for its identifiable fully-qualified-task shape.
+   */
+  public static UUID openLineageParentRunUuid(
+      @NonNull ParentRunFacet parent, @NonNull String childJobName) {
+    String parentNamespace =
+        requireOpenLineageIdentity(parent.getJob().getNamespace(), "parent namespace");
+    String parentJobName = requireOpenLineageIdentity(parent.getJob().getName(), "parent job name");
+    String parentRunId = requireOpenLineageIdentity(parent.getRun().getRunId(), "parent runId");
+    if (parentJobName.equals(childJobName) && parentJobName.contains(".")) {
+      return findParentRunUuid(
+          sanitizeOpenLineageNamespace(parentNamespace), parentJobName, parentRunId);
+    }
+    return openLineageRunUuid(parentRunId);
+  }
+
   public static URL toUrl(@NonNull final String urlString) {
     checkNotBlank(urlString, "urlString must not be blank or empty");
     try {
@@ -188,7 +245,7 @@ public final class Utils {
   }
 
   /**
-   * Construct a UUID from a {@link ParentRunFacet} - if the {@link
+   * Construct the legacy Airflow-compatible UUID from a {@link ParentRunFacet} - if the {@link
    * marquez.service.models.LineageEvent.RunLink#runId} field is a valid {@link UUID}, use it.
    * Otherwise, compute a {@link UUID} from the job name and the reported runId. If the job name
    * contains a dot (.), only return the portion up to the last dot in the name (this attempts to

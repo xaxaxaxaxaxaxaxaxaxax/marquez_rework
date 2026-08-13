@@ -35,6 +35,8 @@ Create chart name and version as used by the chart label.
 Return the proper Marquez image name
 */}}
 {{- define "marquez.image" -}}
+{{- $message := printf "marquez.image.tag is required: chart %s configures the durable OpenLineage queue and is incompatible with the 0.51.1 API image; supply an image built from the current source" .Chart.Version -}}
+{{- $_ := required $message .Values.marquez.image.tag -}}
 {{- include "common.images.image" (dict "imageRoot" .Values.marquez.image "global" .Values.global) -}}
 {{- end -}}
 

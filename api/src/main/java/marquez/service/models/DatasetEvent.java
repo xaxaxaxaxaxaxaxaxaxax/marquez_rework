@@ -25,7 +25,7 @@ import lombok.ToString;
 @ToString
 public class DatasetEvent extends BaseEvent {
   @NotNull private ZonedDateTime eventTime;
-  @Valid private LineageEvent.Dataset dataset;
+  @Valid @NotNull private LineageEvent.Dataset dataset;
   @Valid @NotNull private String producer;
   @Valid @NotNull private URI schemaURL;
 }

@@ -12,6 +12,9 @@ public class JdbiUtils {
   public static void cleanDatabase(Jdbi jdbi) {
     jdbi.inTransaction(
         handle -> {
+          handle.execute("DELETE FROM open_lineage_queue_heads");
+          handle.execute("DELETE FROM open_lineage_queue");
+          handle.execute("DELETE FROM open_lineage_dead_letters");
           handle.execute("DELETE FROM lineage_events");
           handle.execute("DELETE FROM runs_input_mapping");
           handle.execute("DELETE FROM dataset_versions_field_mapping");

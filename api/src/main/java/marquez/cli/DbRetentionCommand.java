@@ -22,10 +22,12 @@ import net.sourceforge.argparse4j.impl.Arguments;
 import net.sourceforge.argparse4j.inf.Namespace;
 import org.jdbi.v3.core.Jdbi;
 import org.jdbi.v3.postgres.PostgresPlugin;
+import org.jdbi.v3.sqlobject.SqlObjectPlugin;
 
 /**
- * A command to apply a one-off ad-hoc retention policy directly to source, dataset, and job
- * metadata collected by Marquez.
+ * A command to apply a one-off ad-hoc retention policy directly to metadata and queued OpenLineage
+ * dead letters collected by Marquez. Each invocation removes at most one configured batch of dead
+ * letters; live queued events are never removed by age.
  *
  * <h2>Usage</h2>
  *
@@ -46,7 +48,7 @@ public class DbRetentionCommand extends ConfiguredCommand<MarquezConfig> {
 
   /* Define 'db-retention' command. */
   public DbRetentionCommand() {
-    super("db-retention", "apply one-off ad-hoc retention policy directly to database");
+    super("db-retention", "apply one-off metadata and dead-letter retention to database");
   }
 
   @Override
@@ -59,7 +61,9 @@ public class DbRetentionCommand extends ConfiguredCommand<MarquezConfig> {
         .type(Integer.class)
         .required(false)
         .setDefault(DEFAULT_NUMBER_OF_ROWS_PER_BATCH)
-        .help("the number of rows deleted per batch");
+        .help(
+            "the positive metadata deletion batch size and maximum dead letters deleted per "
+                + "invocation");
     // Arg '--retention-days'
     subparser
         .addArgument("--retention-days")
@@ -67,7 +71,7 @@ public class DbRetentionCommand extends ConfiguredCommand<MarquezConfig> {
         .type(Integer.class)
         .required(false)
         .setDefault(DEFAULT_RETENTION_DAYS)
-        .help("the number of days to retain metadata");
+        .help("the positive number of days to retain metadata and queued OpenLineage dead letters");
     // Arg '--dry-run'
     subparser
         .addArgument("--dry-run")
@@ -77,8 +81,8 @@ public class DbRetentionCommand extends ConfiguredCommand<MarquezConfig> {
         .setDefault(DEFAULT_DRY_RUN)
         .action(Arguments.storeTrue())
         .help(
-            "only output an estimate of metadata deleted by the retention policy, "
-                + "without applying the policy on database");
+            "only output metadata deletion estimates and the bounded dead-letter count, without "
+                + "applying the policy on database");
   }
 
   @Override
@@ -99,6 +103,7 @@ public class DbRetentionCommand extends ConfiguredCommand<MarquezConfig> {
     // Open connection.
     final Jdbi jdbi = Jdbi.create(source);
     jdbi.installPlugin(new PostgresPlugin()); // Add postgres support.
+    jdbi.installPlugin(new SqlObjectPlugin()); // Add DAO support for queued dead-letter retention.
 
     try {
       // Attempt to apply a database retention policy. An exception is thrown on failed retention

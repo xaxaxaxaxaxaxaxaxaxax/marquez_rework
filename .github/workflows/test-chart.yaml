@@ -3,12 +3,27 @@ name: test-chart
 on:
   pull_request:
     paths:
+      - '.github/workflows/test-chart.yaml'
+      - 'ct.yaml'
+      - '.dockerignore'
+      - 'Dockerfile'
+      - 'docker/entrypoint.sh'
+      - 'marquez.dev.yml'
+      - 'gradle.properties'
+      - 'build.gradle'
+      - 'settings.gradle'
+      - 'gradlew'
+      - 'gradle/**'
+      - 'api/**'
+      - 'clients/java/**'
       - 'chart/**'
       - '!chart/**.md'
 
 jobs:
   lint-test-chart:
     runs-on: ubuntu-latest
+    env:
+      CHART_TEST_IMAGE: docker.io/marquezproject/marquez:chart-test
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -26,6 +41,12 @@ jobs:
       - name: Setup chart-testing
         uses: helm/chart-testing-action@v2.6.1
 
+      - name: Build chart dependencies
+        run: helm dependency build chart
+
+      - name: Verify rendered chart contract
+        run: bash chart/tests/render-contract.sh
+
       - name: Run chart-testing (list-changed)
         id: list-changed
         run: |
@@ -37,8 +58,16 @@ jobs:
       - name: Run chart-testing (lint)
         run: ct lint --config ct.yaml
 
+      - name: Build current-source API image
+        run: docker build --tag "${CHART_TEST_IMAGE}" .
+
       - name: Create kind cluster
         uses: helm/kind-action@v1.10.0
+        with:
+          cluster_name: chart-testing
+
+      - name: Load current-source API image into kind
+        run: kind load docker-image "${CHART_TEST_IMAGE}" --name chart-testing
 
       - name: Run chart-testing (install)
         run: ct install --config ct.yaml

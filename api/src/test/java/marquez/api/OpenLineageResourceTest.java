@@ -6,53 +6,64 @@
 package marquez.api;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.google.common.collect.ImmutableSortedSet;
+import io.dropwizard.jersey.jackson.JsonProcessingExceptionMapper;
 import io.dropwizard.testing.junit5.DropwizardExtensionsSupport;
 import io.dropwizard.testing.junit5.ResourceExtension;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.RejectedExecutionException;
-import javax.ws.rs.container.AsyncResponse;
+import javax.ws.rs.client.Entity;
+import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
+import marquez.api.exceptions.JdbiExceptionExceptionMapper;
 import marquez.common.Utils;
 import marquez.db.OpenLineageDao;
-import marquez.service.IntakeOverloadedException;
+import marquez.db.OpenLineageQueueDao;
+import marquez.db.OpenLineageQueueDao.PreparedEvent;
 import marquez.service.JobService;
 import marquez.service.LineageService;
+import marquez.service.OpenLineageIntake;
 import marquez.service.OpenLineageService;
 import marquez.service.ServiceFactory;
+import marquez.service.models.BaseEvent;
+import marquez.service.models.DatasetEvent;
+import marquez.service.models.JobEvent;
 import marquez.service.models.Lineage;
 import marquez.service.models.LineageEvent;
 import marquez.service.models.Node;
 import marquez.service.models.NodeId;
+import org.jdbi.v3.core.statement.UnableToExecuteStatementException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.ArgumentCaptor;
 
 @ExtendWith(DropwizardExtensionsSupport.class)
 class OpenLineageResourceTest {
-  private static ResourceExtension UNDER_TEST;
-  private static OpenLineageResource RESOURCE;
-  private static Lineage LINEAGE;
-  private static OpenLineageService OPEN_LINEAGE_SERVICE;
+  private static final String INVALID_NAMESPACE = "namespace-\uD83D\uDE02";
+  private static final OpenLineageDao OPEN_LINEAGE_DAO = mock(OpenLineageDao.class);
+  private static final OpenLineageIntake OPEN_LINEAGE_INTAKE = mock(OpenLineageIntake.class);
+  private static final OpenLineageResource RESOURCE;
+  private static final ResourceExtension UNDER_TEST;
+  private static final Lineage LINEAGE;
 
   static {
     LineageService lineageService = mock(LineageService.class);
-    OpenLineageDao openLineageDao = mock(OpenLineageDao.class);
     JobService jobService = mock(JobService.class);
-    OPEN_LINEAGE_SERVICE = mock(OpenLineageService.class);
+    OpenLineageService openLineageService = mock(OpenLineageService.class);
     when(jobService.exists(anyString(), anyString())).thenReturn(true);
 
     Node testNode =
@@ -70,57 +81,181 @@ class OpenLineageResourceTest {
                 JobService.class,
                 jobService,
                 OpenLineageService.class,
-                OPEN_LINEAGE_SERVICE));
+                openLineageService));
 
-    RESOURCE = new OpenLineageResource(serviceFactory, openLineageDao);
-    UNDER_TEST = ResourceExtension.builder().addResource(RESOURCE).build();
+    RESOURCE = new OpenLineageResource(serviceFactory, OPEN_LINEAGE_DAO, OPEN_LINEAGE_INTAKE);
+    UNDER_TEST =
+        ResourceExtension.builder()
+            .setMapper(Utils.newObjectMapper())
+            .addResource(RESOURCE)
+            .addProvider(new JdbiExceptionExceptionMapper())
+            .addProvider(new JsonProcessingExceptionMapper(false))
+            .build();
   }
 
   @BeforeEach
-  void setUpOpenLineageService() {
-    reset(OPEN_LINEAGE_SERVICE);
-    when(OPEN_LINEAGE_SERVICE.createAsync(any(LineageEvent.class)))
-        .thenReturn(CompletableFuture.completedFuture(null));
+  void setUpOpenLineageIntake() {
+    reset(OPEN_LINEAGE_DAO, OPEN_LINEAGE_INTAKE);
+    when(OPEN_LINEAGE_INTAKE.enqueue(any(PreparedEvent.class))).thenReturn(1L);
   }
 
   @Test
-  public void testCreateLineageEvent() throws IOException {
-    Response response = postLineageEvent();
+  void testCreateLineageEvent() throws IOException {
+    BaseEvent event = eventFrom("/open_lineage/event_required_only.json");
+
+    Response response = RESOURCE.create(event);
 
     assertEquals(201, response.getStatus());
+    assertFalse(response.hasEntity());
+    verify(OPEN_LINEAGE_INTAKE).enqueue(OpenLineageQueueDao.prepare(event));
   }
 
   @Test
-  public void testCreateLineageEventBadRequest() throws IOException {
-    when(OPEN_LINEAGE_SERVICE.createAsync(any(LineageEvent.class)))
-        .thenReturn(CompletableFuture.failedFuture(new IllegalArgumentException("invalid")));
+  void testCreateDatasetEvent() throws IOException {
+    BaseEvent event = eventFrom("/open_lineage/event_dataset_event.json");
 
-    assertEquals(400, postLineageEvent().getStatus());
+    assertEquals(DatasetEvent.class, event.getClass());
+    assertEquals(201, RESOURCE.create(event).getStatus());
+    verify(OPEN_LINEAGE_INTAKE).enqueue(OpenLineageQueueDao.prepare(event));
   }
 
   @Test
-  public void testCreateLineageEventInternalFailure() throws IOException {
-    when(OPEN_LINEAGE_SERVICE.createAsync(any(LineageEvent.class)))
-        .thenReturn(CompletableFuture.failedFuture(new IllegalStateException("failed")));
+  void testCreateJobEvent() throws IOException {
+    BaseEvent event = eventFrom("/open_lineage/event_job_event.json");
 
-    assertEquals(500, postLineageEvent().getStatus());
+    assertEquals(JobEvent.class, event.getClass());
+    assertEquals(201, RESOURCE.create(event).getStatus());
+    verify(OPEN_LINEAGE_INTAKE).enqueue(OpenLineageQueueDao.prepare(event));
   }
 
   @Test
-  public void testCreateLineageEventOverloaded() throws IOException {
-    when(OPEN_LINEAGE_SERVICE.createAsync(any(LineageEvent.class)))
-        .thenReturn(
-            CompletableFuture.failedFuture(
-                new IntakeOverloadedException(new RejectedExecutionException("full"))));
+  void testCreateLineageEventWithInvalidInputIdentifierReturnsBadRequest() throws IOException {
+    LineageEvent event = (LineageEvent) eventFrom("/open_lineage/event_simple.json");
+    event.getInputs().get(0).setNamespace(INVALID_NAMESPACE);
 
-    Response response = postLineageEvent();
+    Response response = RESOURCE.create(event);
 
-    assertEquals(503, response.getStatus());
-    assertEquals("1", response.getHeaderString("Retry-After"));
+    assertEquals(400, response.getStatus());
+    verifyNoInteractions(OPEN_LINEAGE_INTAKE);
   }
 
   @Test
-  public void testGetLineage() {
+  void testCreateNestedNulReturnsBadRequestBeforeIntake() throws IOException {
+    LineageEvent event = (LineageEvent) eventFrom("/open_lineage/event_required_only.json");
+    LineageEvent.RunFacet facets = new LineageEvent.RunFacet();
+    facets.setFacet("custom", Map.of("nested", Map.of("value", String.valueOf('\0'))));
+    event.getRun().setFacets(facets);
+
+    Response response = RESOURCE.create(event);
+
+    assertEquals(400, response.getStatus());
+    assertFalse(response.hasEntity());
+    verifyNoInteractions(OPEN_LINEAGE_INTAKE);
+  }
+
+  @Test
+  void testCreateJobEventWithInvalidInputIdentifierReturnsBadRequest() throws IOException {
+    JobEvent event = (JobEvent) eventFrom("/open_lineage/event_job_event.json");
+    event.getInputs().get(0).setNamespace(INVALID_NAMESPACE);
+
+    Response response = RESOURCE.create(event);
+
+    assertEquals(400, response.getStatus());
+    verifyNoInteractions(OPEN_LINEAGE_INTAKE);
+  }
+
+  @Test
+  void testCreateUnicodeBlankParentIdentityFailsValidationBeforeIntake() {
+    String event =
+        "{\"eventTime\": \"2021-11-03T10:53:52.427343Z\", \"eventType\": \"COMPLETE\", "
+            + "\"inputs\": [], \"job\": {\"name\": \"child\", \"namespace\": \"namespace\"}, "
+            + "\"outputs\": [], \"producer\": \"me\", "
+            + "\"run\": {\"runId\": \"dae0d60a-6010-4c37-980e-c5270f5a6be4\", "
+            + "\"facets\": {\"parent\": {\"_producer\": \"https://me\", "
+            + "\"_schemaURL\": \"https://me\", \"run\": {\"runId\": \"\u2003\u00a0\"}, "
+            + "\"job\": {\"namespace\": \"parent-ns\", \"name\": \"parent\"}}}}}";
+
+    try (Response response =
+        UNDER_TEST
+            .target("/api/v1/lineage")
+            .request()
+            .post(Entity.entity(event, MediaType.APPLICATION_JSON_TYPE))) {
+      assertEquals(422, response.getStatus());
+    }
+    verifyNoInteractions(OPEN_LINEAGE_INTAKE);
+  }
+
+  @Test
+  void testCreateMalformedJsonReturnsGenericBadRequestBeforeIntake() {
+    String malformedEvent = "{\"producer\":\"password=do-not-return\",";
+
+    try (Response response =
+        UNDER_TEST
+            .target("/api/v1/lineage")
+            .request()
+            .post(Entity.entity(malformedEvent, MediaType.APPLICATION_JSON_TYPE))) {
+      assertEquals(400, response.getStatus());
+      String body = response.readEntity(String.class);
+      assertTrue(body.contains("Unable to process JSON"));
+      assertFalse(body.contains("password=do-not-return"));
+    }
+    verifyNoInteractions(OPEN_LINEAGE_INTAKE);
+  }
+
+  @Test
+  void testCreateAdmissionIllegalArgumentReturnsInternalServerError() throws IOException {
+    String event = eventJsonFrom("/open_lineage/event_required_only.json");
+    when(OPEN_LINEAGE_INTAKE.enqueue(any(PreparedEvent.class)))
+        .thenThrow(new IllegalArgumentException("password=do-not-return"));
+
+    try (Response response =
+        UNDER_TEST
+            .target("/api/v1/lineage")
+            .request()
+            .post(Entity.entity(event, MediaType.APPLICATION_JSON_TYPE))) {
+      assertEquals(500, response.getStatus());
+      assertFalse(response.getHeaders().containsKey("Retry-After"));
+      String body = response.readEntity(String.class);
+      assertFalse(body.contains("password=do-not-return"));
+    }
+    verify(OPEN_LINEAGE_INTAKE).enqueue(any(PreparedEvent.class));
+  }
+
+  @Test
+  void testCreateDatabaseAdmissionFailureReturnsInternalServerError() throws IOException {
+    String event = eventJsonFrom("/open_lineage/event_required_only.json");
+    UnableToExecuteStatementException databaseFailure =
+        new UnableToExecuteStatementException(
+            "password=do-not-return; SQL statement: insert into open_lineage_queue");
+    when(OPEN_LINEAGE_INTAKE.enqueue(any(PreparedEvent.class))).thenThrow(databaseFailure);
+
+    try (Response response =
+        UNDER_TEST
+            .target("/api/v1/lineage")
+            .request()
+            .post(Entity.entity(event, MediaType.APPLICATION_JSON_TYPE))) {
+      assertEquals(500, response.getStatus());
+      assertFalse(response.getHeaders().containsKey("Retry-After"));
+      String body = response.readEntity(String.class);
+      assertTrue(body.contains("Internal Server Error"));
+      assertFalse(body.contains("password=do-not-return"));
+      assertFalse(body.contains("insert into open_lineage_queue"));
+    }
+  }
+
+  @Test
+  void testCreateUnsupportedEventRetainsLegacyResponse() {
+    BaseEvent event = new BaseEvent();
+
+    Response response = RESOURCE.create(event);
+
+    assertEquals(200, response.getStatus());
+    assertSame(event, response.getEntity());
+    verifyNoInteractions(OPEN_LINEAGE_INTAKE);
+  }
+
+  @Test
+  void testGetLineage() {
     final Lineage lineage =
         UNDER_TEST
             .target("/api/v1/lineage")
@@ -133,7 +268,7 @@ class OpenLineageResourceTest {
   }
 
   @Test
-  public void testGetLineageEventsBadSort() {
+  void testGetLineageEventsBadSort() {
     final Response response =
         UNDER_TEST
             .target("/api/v1/events/lineage")
@@ -144,19 +279,14 @@ class OpenLineageResourceTest {
     assertEquals(response.getStatus(), 400);
   }
 
-  private Response postLineageEvent() throws IOException {
-    String event =
-        new String(
-            OpenLineageResourceTest.class
-                .getResourceAsStream("/open_lineage/event_required_only.json")
-                .readAllBytes(),
-            StandardCharsets.UTF_8);
-    LineageEvent lineageEvent = Utils.newObjectMapper().readValue(event, LineageEvent.class);
-    AsyncResponse asyncResponse = mock(AsyncResponse.class);
-    RESOURCE.create(lineageEvent, asyncResponse);
+  private BaseEvent eventFrom(String resourceName) throws IOException {
+    return Utils.newObjectMapper()
+        .readValue(OpenLineageResourceTest.class.getResource(resourceName), BaseEvent.class);
+  }
 
-    ArgumentCaptor<Response> response = ArgumentCaptor.forClass(Response.class);
-    verify(asyncResponse).resume(response.capture());
-    return response.getValue();
+  private String eventJsonFrom(String resourceName) throws IOException {
+    return new String(
+        OpenLineageResourceTest.class.getResourceAsStream(resourceName).readAllBytes(),
+        StandardCharsets.UTF_8);
   }
 }

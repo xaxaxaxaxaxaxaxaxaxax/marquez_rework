@@ -20,7 +20,6 @@ import lombok.extern.slf4j.Slf4j;
 import marquez.db.JobVersionDao.IoType;
 import marquez.db.NamespaceDao;
 import marquez.db.OpenLineageDao;
-import marquez.db.models.DatasetRow;
 import marquez.db.models.NamespaceRow;
 import marquez.jdbi.JdbiExternalPostgresExtension.FlywaySkipRepeatable;
 import marquez.jdbi.JdbiExternalPostgresExtension.FlywayTarget;
@@ -82,11 +81,11 @@ public class V67_2_JobFacetsBackfillJobVersionTest {
                 .execute());
 
     // (3) Write a dataset
-    DatasetRow dataset = writeDataset(jdbi, namespace, "some_dataset");
+    UUID datasetUuid = writeDataset(jdbi, namespace, "some_dataset");
 
     // (4) Write a job io mapping
-    insertJobIOMapping(oldJobVersion, dataset);
-    insertJobIOMapping(currentJobVersion, dataset);
+    insertJobIOMapping(oldJobVersion, datasetUuid);
+    insertJobIOMapping(currentJobVersion, datasetUuid);
 
     // (5) Run Migration
     runMigration();
@@ -131,7 +130,7 @@ public class V67_2_JobFacetsBackfillJobVersionTest {
         .isEqualTo(1);
   }
 
-  private static void insertJobIOMapping(UUID jobVersion, DatasetRow dataset) {
+  private static void insertJobIOMapping(UUID jobVersion, UUID datasetUuid) {
     jdbi.withHandle(
         h -> {
           return h.createQuery(
@@ -143,7 +142,7 @@ public class V67_2_JobFacetsBackfillJobVersionTest {
                       RETURNING job_version_uuid
                   """)
               .bind("job_version_uuid", jobVersion)
-              .bind("dataset_uuid", dataset.getUuid())
+              .bind("dataset_uuid", datasetUuid)
               .bind("io_type", IoType.OUTPUT)
               .mapTo(UUID.class)
               .first();

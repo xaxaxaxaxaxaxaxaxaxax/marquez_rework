@@ -1,6 +1,6 @@
 # Cumulative performance profile
 
-Profile date: 2026-08-11
+Profile date: 2026-08-13
 
 This is an indicative, correctness-gated PostgreSQL 14 profile of the rework against the
 unmodified repository at `/tmp/marquez-rework-upstream`. It is not a production capacity test.
@@ -229,6 +229,134 @@ regressed 10.3%, p95 improved only 1.0%, and throughput changed by +0.1%. The fi
 retains the bind-bean writer. No V77 schema change was made: the remaining candidate indexes lack
 leave-one-out evidence, serve read or foreign-key paths, and isolated drops would not restore HOT
 eligibility while other indexed run-state and timestamp columns remain.
+
+## Durable asynchronous intake
+
+The fourth profile compares the synchronous `7dc1343d` endpoint with the first durable
+asynchronous intake candidate. These latency figures are retained as historical admission and
+projection baselines; that candidate serialized Lineage events by job and predates the final
+run-causal queue described below. It also used a two-transaction lease protocol, so its worker-side
+measurements are not a performance claim for the landed transaction-scoped row-lock protocol.
+The HTTP contract remains: POST returns 201 after a PostgreSQL queue insert commits, and a managed
+worker projects it asynchronously. The landed worker selects and row-locks one due head, performs
+the relational projection, and acknowledges or records a caught failure in one READ COMMITTED
+transaction. External listeners and search run after that database commit and remain best effort.
+
+The HTTP comparison used 36 fresh PostgreSQL 14 databases: four workloads, three cells, and three
+interleaved paired trials. `SYNC_7DC` is the exact clean pre-queue revision; `DURABLE_RUNNING` admits
+and projects concurrently; `DURABLE_STOPPED` admits the whole backlog with its worker stopped and
+then drains it after an application restart. All measured requests returned 201. All 36 cells
+drained with zero live rows, dead letters, or unexpected retries. Normalized semantic digests and
+per-type counts matched, and dangling/current-version, dataset-facet, and input-version integrity
+checks remained zero.
+
+| Workload | Admission p50, sync -> running | Admission p95, sync -> running | Admission requests/s | Running end-to-end requests/s | Paired end-to-end ratio |
+|---|---:|---:|---:|---:|---:|
+| M0: required-only | 25.7 -> 12.3 ms | 31.5 -> 18.0 ms | 150.5 -> 305.4 | 126.8 | 0.875x |
+| M1: 6 datasets, 8 fields | 32.4 -> 12.5 ms | 58.8 -> 17.9 ms | 111.7 -> 301.8 | 95.8 | 0.869x |
+| M3: 32 fields, 256 column edges | 40.1 -> 16.4 ms | 119.5 -> 26.0 ms | 59.8 -> 227.8 | 56.8 | 0.947x |
+| HOT: identical COMPLETE replay | 53.7 -> 17.5 ms | 285.8 -> 26.2 ms | 42.3 -> 204.5 | 32.9 | 0.875x |
+
+Displayed values are medians of the three cell trials; the final column is the median paired
+candidate/baseline ratio. Durable admission was 2.1-5.1x faster and its p95 was 50-91% lower.
+Projection completion retained 87-95% of synchronous throughput. With projection stopped,
+admission p50 was 9.4-15.4 ms and throughput was 245-400 requests/s; its end-to-end time includes a
+new application startup and is not a steady-state projection comparison.
+
+Queue WAL at the 201 boundary was 549 bytes/request for M0, 713 for M1, 2,196 for M3, and 849 for
+HOT. After drain, the durable path added about 9-10 tracked SQL executions/request. Total LSN bytes
+were 63% higher for the tiny M0 event, where queue metadata dominates, but 17%, 3%, and 23% lower
+for M1, M3, and HOT respectively because the queue work is smaller than the write-path savings.
+
+The final queue has exactly one live head per ordering key. Lineage events use a `run` domain over
+the canonical UUID produced by `Utils.openLineageRunUuid(runId)`; Job and Dataset events use
+separate sanitized namespace/name domains. A key-local transaction advisory lock orders
+concurrent inserts before identity allocation. Polls read only due heads through the
+single-column `available_at` index and use `FOR UPDATE SKIP LOCKED`; selection, projection, and ACK
+or caught-failure transition share the same transaction. Commit makes the projection and queue
+transition visible together; rollback releases the lock and leaves the event unchanged. Different
+runs of one job can be selected independently, while events for one run remain FIFO.
+Shared job and dataset snapshots converge by `(UTC event time, SHA-256 of the exact queued JSON)`
+instead of relying on scheduler-wide job serialization.
+`refresh_due_on_advance` is durable q2 scheduling state. Promotions alternate between a
+HOT-eligible update that omits indexed `available_at` and an update that refreshes it to
+millisecond-floored database time, bounding clock preservation to two successful promotions.
+Retry refreshes the clock and resets the bit. This reduces indexed head updates; it does not
+promise that another lane runs between the two promotions.
+
+The head lock is acquired before the projection savepoint. A caught projection failure rolls back
+partial projection writes to that savepoint and commits either retry state or a dead letter;
+`maxAttempts` counts only those committed caught failures. Before commit, an uncaught database
+error, lost connection, process crash, or PostgreSQL crash that aborts the transaction consumes no
+attempt and leaves the head eligible when PostgreSQL releases it. A connection or process failure
+while the commit result is being returned is indeterminate: projection and acknowledgement may
+already be committed, so the worker fails health rather than inferring replay eligibility. Database
+projection and queue state are atomic, but commit observation, best-effort post-commit listeners,
+and asynchronous failover remain at-least-once boundaries.
+
+Each active event pins one JDBC connection for its transaction. Size the pool for all configured
+processors plus independent HTTP capacity, and monitor old `pg_stat_activity.xact_start` values:
+a long transaction holds its row lock and can delay vacuum cleanup. `statement_timeout` bounds an
+individual SQL statement, while `idle_in_transaction_session_timeout` bounds idle gaps; neither is
+a general PG14 total-transaction deadline. Apply database timeouts only to a dedicated queue
+role/session. There is no per-event application cancellation deadline; forced shutdown relies on
+task interruption followed by synchronous connection abort to roll back unfinished transactions.
+
+Worker shutdown has two intervals of `shutdownGracePeriodMillis`. The first drains cooperatively.
+If it expires or shutdown is interrupted, the forced phase interrupts remaining tasks and invokes
+JDBC `Connection.abort` synchronously for every registered connection before the second
+deadline-bounded executor wait. The two waits are bounded, but the synchronous driver abort calls
+between them have no application-enforced deadline and can extend total stop time if a driver
+blocks. A completed abort rolls back the open transaction and releases its head lock.
+`shutdown_incomplete` means a coordinator or processor thread, registered connection, or
+connection-abort failure was still present after that process; there is no delayed queue-recovery
+timer.
+
+The smallest useful model is:
+
+```text
+H                     = number of nonempty ordering keys
+live selectable rows  = H
+B                     = requested poll batch; production fixes B = 1
+L                     = earlier due heads locked by concurrent transactions
+D                     = dead or invisible index entries encountered by PostgreSQL
+live-row poll work    = O(B + L)
+physical index work   = O(B + L + D)
+same-run concurrency  = 1
+queue bytes           = fixed pages + sum(serialized payload bytes + row/index overhead) + O(H)
+```
+
+With `W` processors holding at most one head each, `L <= W - 1`; production therefore has a live
+candidate bound of `O(W)` for `B = 1`, independent of queue cardinality. A transaction held by a
+slow processor keeps its lane locked and lets later due lanes pass it until commit or rollback.
+Vacuum and the due-index statistics determine `D`, so the live-row bound is not a promise of
+constant physical page reads in a bloated relation.
+
+The replaced anti-predecessor selection scanned deferred followers. With 100,000 due followers behind
+one unavailable hot head plus 100 independent heads, it took 308.49 ms and visited 100,099 due
+rows/probes. The compact-head plan returned the independent work in 0.842 ms while visiting 101
+head-index rows, a 366x reduction. At 1,000 followers it improved 3.882 to 1.581 ms. A 100,100-row
+tiny-payload fixture occupied 9.68 MiB of heap and 6.10 MiB of indexes, 15.82 MiB total including
+auxiliary storage.
+
+The job-domain predecessor reduced canonical job-row lock waits: in one M1 profile its three
+`JobDao.upsertJob` totals fell from 1.67-1.80 seconds to 40.5-42.8 ms per 120 requests. A paired JFR
+diagnostic also showed 213 -> 154 execution samples and 77.1 -> 61.5 ms total GC pause. It achieved
+that by serializing independent runs, however, and the four-job profile increased drain time and
+reduced end-to-end throughput. The final design keeps run-local FIFO and makes shared projection
+state monotonic, accepting ordinary row-lock contention without turning the queue into a per-job
+scheduler.
+
+### Million-event queue gate
+
+The final scale gate uses frozen JOBKEY and run-causal source snapshots with PostgreSQL durability
+settings intact. It measures 100,000 and 1,000,000-row HOT, MANY, MIX, and BLOCKED fixtures;
+fixed-work poll/follower/head/enqueue plans; storage and WAL slopes; an exact eight-worker
+100,000-event transaction-stress prefix at a one-million-row high-water mark; lossless bulk
+reclamation of the remaining rows; vacuum/refill reuse; real worker sensitivity; HTTP admission
+and drain; and one JFR diagnostic. Bulk reclamation is explicitly excluded from throughput and WAL
+comparisons. Results are recorded only after the fail-closed source manifest and DAO/schema/worker
+adapter review match the production files.
 
 ## Caveats
 

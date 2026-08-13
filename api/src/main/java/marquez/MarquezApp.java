@@ -5,6 +5,7 @@
 
 package marquez;
 
+import com.codahale.metrics.health.HealthCheckRegistry;
 import com.codahale.metrics.jdbi3.InstrumentedSqlLogger;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import io.dropwizard.Application;
@@ -14,6 +15,8 @@ import io.dropwizard.configuration.SubstitutingSourceProvider;
 import io.dropwizard.db.DataSourceFactory;
 import io.dropwizard.db.ManagedDataSource;
 import io.dropwizard.jdbi3.JdbiFactory;
+import io.dropwizard.lifecycle.Managed;
+import io.dropwizard.lifecycle.setup.LifecycleEnvironment;
 import io.dropwizard.setup.Bootstrap;
 import io.dropwizard.setup.Environment;
 import io.prometheus.client.CollectorRegistry;
@@ -22,9 +25,6 @@ import io.prometheus.client.exporter.MetricsServlet;
 import io.prometheus.client.hotspot.DefaultExports;
 import io.sentry.Sentry;
 import java.util.EnumSet;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.ThreadPoolExecutor;
 import javax.servlet.DispatcherType;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
@@ -42,7 +42,10 @@ import marquez.jobs.MaterializeViewRefresherJob;
 import marquez.logging.DelegatingSqlLogger;
 import marquez.logging.LabelledSqlLogger;
 import marquez.logging.LoggingMdcFilter;
+import marquez.logging.SqlStatementIdentity;
 import marquez.service.DatabaseMetrics;
+import marquez.service.OpenLineageWorker;
+import marquez.service.OpenLineageWorkerHealthCheck;
 import marquez.tracing.SentryConfig;
 import marquez.tracing.TracingContainerResponseFilter;
 import marquez.tracing.TracingSQLLogger;
@@ -113,6 +116,7 @@ public final class MarquezApp extends Application<MarquezConfig> {
   @Override
   public void run(@NonNull MarquezConfig config, @NonNull Environment env) {
     final DataSourceFactory sourceFactory = config.getDataSourceFactory();
+    enforceReadCommittedTransactionIsolation(sourceFactory);
     final ManagedDataSource source = sourceFactory.build(env.metrics(), DB_SOURCE_NAME);
 
     log.info("Running startup actions...");
@@ -141,39 +145,62 @@ public final class MarquezApp extends Application<MarquezConfig> {
     }
 
     final Jdbi jdbi = newJdbi(config, env, source);
-    final int openLineageWorkerThreads = config.getOpenLineageConfig().getWorkerThreads();
-    final ExecutorService openLineageExecutor =
-        env.lifecycle()
-            .executorService("open-lineage-intake-%d")
-            .minThreads(openLineageWorkerThreads)
-            .maxThreads(openLineageWorkerThreads)
-            .workQueue(new ArrayBlockingQueue<>(config.getOpenLineageConfig().getQueueCapacity()))
-            .rejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy())
-            .build();
     final MarquezContext marquezContext =
         MarquezContext.builder()
             .jdbi(jdbi)
             .searchConfig(config.getSearchConfig())
-            .openLineageExecutor(openLineageExecutor)
+            .openLineageConfig(config.getOpenLineageConfig())
+            .metricRegistry(env.metrics())
             .tags(config.getTags())
             .build();
+
+    registerHealthChecks(env.healthChecks(), marquezContext.getOpenLineageWorker());
 
     registerResources(config, env, marquezContext);
     registerServlets(env);
     registerFilters(env, marquezContext);
 
-    // Add scheduled jobs to lifecycle.
-    if (config.hasDbRetentionPolicy()) {
-      // Add job to apply retention policy to database.
-      env.lifecycle().manage(new DbRetentionJob(jdbi, config.getDbRetention()));
-    }
-
-    // Add job to refresh materialized views.
-    env.lifecycle().manage(new MaterializeViewRefresherJob(jdbi));
+    registerManagedServices(env.lifecycle(), jdbi, config, marquezContext.getOpenLineageWorker());
 
     // set namespaceFilter
     ExclusionsConfig exclusions = config.getExclude();
     Exclusions.use(exclusions);
+  }
+
+  static void enforceReadCommittedTransactionIsolation(DataSourceFactory sourceFactory) {
+    DataSourceFactory.TransactionIsolation configured =
+        sourceFactory.getDefaultTransactionIsolation();
+    if (configured == DataSourceFactory.TransactionIsolation.DEFAULT) {
+      sourceFactory.setDefaultTransactionIsolation(
+          DataSourceFactory.TransactionIsolation.READ_COMMITTED);
+      return;
+    }
+    if (configured != DataSourceFactory.TransactionIsolation.READ_COMMITTED) {
+      throw new IllegalArgumentException(
+          "Marquez requires db.defaultTransactionIsolation=READ_COMMITTED for durable "
+              + "OpenLineage intake, but was "
+              + configured);
+    }
+  }
+
+  /**
+   * Registers application services in start order. Dropwizard stops managed objects in reverse, so
+   * the intake worker is deliberately last and receives its shutdown budget before scheduled jobs
+   * can block while stopping.
+   */
+  static void registerManagedServices(
+      LifecycleEnvironment lifecycle, Jdbi jdbi, MarquezConfig config, Managed openLineageWorker) {
+    if (config.hasDbRetentionPolicy()) {
+      lifecycle.manage(new DbRetentionJob(jdbi, config.getDbRetention()));
+    }
+    lifecycle.manage(new MaterializeViewRefresherJob(jdbi));
+    lifecycle.manage(openLineageWorker);
+  }
+
+  static void registerHealthChecks(
+      HealthCheckRegistry healthChecks, OpenLineageWorker openLineageWorker) {
+    healthChecks.register(
+        OpenLineageWorkerHealthCheck.NAME, new OpenLineageWorkerHealthCheck(openLineageWorker));
   }
 
   private boolean isSentryEnabled(MarquezConfig config) {
@@ -192,7 +219,9 @@ public final class MarquezApp extends Application<MarquezConfig> {
             .installPlugin(new PostgresPlugin())
             .installPlugin(new Jackson2Plugin());
     SqlLogger sqlLogger =
-        new DelegatingSqlLogger(new LabelledSqlLogger(), new InstrumentedSqlLogger(env.metrics()));
+        new DelegatingSqlLogger(
+            new LabelledSqlLogger(),
+            new InstrumentedSqlLogger(env.metrics(), SqlStatementIdentity::statementName));
     if (isSentryEnabled(config)) {
       sqlLogger = new TracingSQLLogger(sqlLogger);
     }

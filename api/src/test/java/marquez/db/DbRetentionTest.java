@@ -23,7 +23,10 @@ import static marquez.db.models.DbModelGenerator.newRunRowWith;
 import static marquez.db.models.DbModelGenerator.newRunRowsWith;
 import static marquez.db.models.DbModelGenerator.newSourceRow;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 import static org.assertj.core.api.Assertions.fail;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 import io.openlineage.client.OpenLineage;
 import java.net.URI;
@@ -36,10 +39,13 @@ import marquez.db.models.DatasetVersionRow;
 import marquez.db.models.JobRow;
 import marquez.db.models.JobVersionRow;
 import marquez.db.models.NamespaceRow;
+import marquez.db.models.OpenLineageQueueRow;
 import marquez.db.models.RunArgsRow;
 import marquez.db.models.RunRow;
 import marquez.db.models.SourceRow;
 import org.jdbi.v3.core.Handle;
+import org.jdbi.v3.core.Jdbi;
+import org.jdbi.v3.core.transaction.TransactionIsolationLevel;
 import org.jdbi.v3.jackson2.Jackson2Plugin;
 import org.jdbi.v3.postgres.PostgresPlugin;
 import org.jdbi.v3.sqlobject.SqlObjectPlugin;
@@ -93,6 +99,26 @@ public class DbRetentionTest {
   public static void setUpOnce() {
     // Wrap jdbi configured for running container.
     DB = TestingDb.newInstance(jdbiExtension.getJdbi());
+  }
+
+  @Test
+  public void testRetentionRejectsNonPositiveArgumentsBeforeDatabaseAccess() {
+    final Jdbi jdbi = mock(Jdbi.class);
+
+    assertThatIllegalArgumentException()
+        .isThrownBy(() -> DbRetention.retentionOnDbOrError(jdbi, 0, RETENTION_DAYS, DRY_RUN))
+        .withMessage("numberOfRowsPerBatch must be positive");
+    assertThatIllegalArgumentException()
+        .isThrownBy(() -> DbRetention.retentionOnDbOrError(jdbi, -1, RETENTION_DAYS))
+        .withMessage("numberOfRowsPerBatch must be positive");
+    assertThatIllegalArgumentException()
+        .isThrownBy(
+            () -> DbRetention.retentionOnDbOrError(jdbi, NUMBER_OF_ROWS_PER_BATCH, 0, DRY_RUN))
+        .withMessage("retentionDays must be positive");
+    assertThatIllegalArgumentException()
+        .isThrownBy(() -> DbRetention.retentionOnDbOrError(jdbi, NUMBER_OF_ROWS_PER_BATCH, -1))
+        .withMessage("retentionDays must be positive");
+    verifyNoInteractions(jdbi);
   }
 
   @Test
@@ -313,6 +339,116 @@ public class DbRetentionTest {
       try (final Handle handle = DB.open()) {
         assertThat(DbTestUtils.rowsExist(handle, rowsOlderThanXDays)).isFalse();
         assertThat(DbTestUtils.rowsExist(handle, rowsLastXDays)).isTrue();
+      }
+    } catch (DbRetentionException e) {
+      fail("failed to apply retention policy", e);
+    }
+  }
+
+  @Test
+  public void testRetentionKeepsAnOldParentUntilItsChildIsEligible() {
+    final NamespaceRow namespaceRow = DB.upsert(newNamespaceRow());
+    final JobRow parentJob =
+        DB.upsert(newJobRowWith(namespaceRow.getUuid(), namespaceRow.getName()));
+    final JobVersionRow parentJobVersion =
+        DB.upsert(
+            newJobVersionRowWith(
+                namespaceRow.getUuid(),
+                namespaceRow.getName(),
+                parentJob.getUuid(),
+                parentJob.getName(),
+                ImmutableSet.of(),
+                ImmutableSet.of()));
+    final JobRow childJob =
+        DB.upsert(newJobRowWith(namespaceRow.getUuid(), namespaceRow.getName()));
+    final JobVersionRow childJobVersion =
+        DB.upsert(
+            newJobVersionRowWith(
+                namespaceRow.getUuid(),
+                namespaceRow.getName(),
+                childJob.getUuid(),
+                childJob.getName(),
+                ImmutableSet.of(),
+                ImmutableSet.of()));
+    final RunArgsRow runArgsRow = DB.upsert(newRunArgRow());
+    final RunRow parent =
+        DB.upsert(
+            newRunRowWith(
+                OLDER_THAN_X_DAYS,
+                parentJob.getUuid(),
+                parentJobVersion.getUuid(),
+                runArgsRow.getUuid()));
+    final RunRow child =
+        DB.upsert(
+            newRunRowWith(
+                LAST_X_DAYS, childJob.getUuid(), childJobVersion.getUuid(), runArgsRow.getUuid()));
+    jdbiExtension
+        .getJdbi()
+        .useHandle(
+            handle -> {
+              handle
+                  .createUpdate("UPDATE jobs SET updated_at = :old WHERE uuid = :jobUuid")
+                  .bind("old", OLDER_THAN_X_DAYS)
+                  .bind("jobUuid", parentJob.getUuid())
+                  .execute();
+              handle
+                  .createUpdate(
+                      "UPDATE job_versions SET created_at = :old WHERE uuid = :jobVersionUuid")
+                  .bind("old", OLDER_THAN_X_DAYS)
+                  .bind("jobVersionUuid", parentJobVersion.getUuid())
+                  .execute();
+              handle
+                  .createUpdate(
+                      """
+                      UPDATE runs
+                         SET parent_run_uuid = :parentRunUuid
+                       WHERE uuid = :childRunUuid
+                      """)
+                  .bind("parentRunUuid", parent.getUuid())
+                  .bind("childRunUuid", child.getUuid())
+                  .execute();
+            });
+
+    try {
+      DbRetention.retentionOnDbOrError(
+          jdbiExtension.getJdbi(), NUMBER_OF_ROWS_PER_BATCH, RETENTION_DAYS);
+      try (final Handle handle = DB.open()) {
+        assertThat(DbTestUtils.rowExists(handle, parentJob)).isTrue();
+        assertThat(DbTestUtils.rowExists(handle, parentJobVersion)).isTrue();
+        assertThat(DbTestUtils.rowExists(handle, parent)).isTrue();
+        assertThat(DbTestUtils.rowExists(handle, childJob)).isTrue();
+        assertThat(DbTestUtils.rowExists(handle, childJobVersion)).isTrue();
+        assertThat(DbTestUtils.rowExists(handle, child)).isTrue();
+      }
+
+      jdbiExtension
+          .getJdbi()
+          .useHandle(
+              handle ->
+                  handle
+                      .createUpdate("UPDATE runs SET updated_at = :updatedAt WHERE uuid = :runUuid")
+                      .bind("updatedAt", OLDER_THAN_X_DAYS)
+                      .bind("runUuid", child.getUuid())
+                      .execute());
+      DbRetention.retentionOnDbOrError(
+          jdbiExtension.getJdbi(), NUMBER_OF_ROWS_PER_BATCH, RETENTION_DAYS);
+      try (final Handle handle = DB.open()) {
+        assertThat(DbTestUtils.rowExists(handle, parent)).isFalse();
+        assertThat(DbTestUtils.rowExists(handle, child)).isFalse();
+        // Job and job-version retention ran before the child became deletable in this invocation.
+        assertThat(DbTestUtils.rowExists(handle, parentJob)).isTrue();
+        assertThat(DbTestUtils.rowExists(handle, parentJobVersion)).isTrue();
+        assertThat(DbTestUtils.rowExists(handle, childJob)).isTrue();
+        assertThat(DbTestUtils.rowExists(handle, childJobVersion)).isTrue();
+      }
+
+      DbRetention.retentionOnDbOrError(
+          jdbiExtension.getJdbi(), NUMBER_OF_ROWS_PER_BATCH, RETENTION_DAYS);
+      try (final Handle handle = DB.open()) {
+        assertThat(DbTestUtils.rowExists(handle, parentJob)).isFalse();
+        assertThat(DbTestUtils.rowExists(handle, parentJobVersion)).isFalse();
+        assertThat(DbTestUtils.rowExists(handle, childJob)).isTrue();
+        assertThat(DbTestUtils.rowExists(handle, childJobVersion)).isTrue();
       }
     } catch (DbRetentionException e) {
       fail("failed to apply retention policy", e);
@@ -725,5 +861,114 @@ public class DbRetentionTest {
     } catch (DbRetentionException e) {
       fail("failed to apply retention policy", e);
     }
+  }
+
+  @Test
+  public void testRetentionOnDbOrErrorPurgesOneDeadLetterBatchOnly() throws DbRetentionException {
+    final int deadLetterBatchSize = 2;
+    final OpenLineageQueueDao queueDao =
+        jdbiExtension.getJdbi().onDemand(OpenLineageQueueDao.class);
+    final long firstOldDeadLetter = deadLetterAt(queueDao, OLDER_THAN_X_DAYS.minusSeconds(2));
+    final long secondOldDeadLetter = deadLetterAt(queueDao, OLDER_THAN_X_DAYS.minusSeconds(1));
+    final long thirdOldDeadLetter = deadLetterAt(queueDao, OLDER_THAN_X_DAYS);
+    final long recentDeadLetter = deadLetterAt(queueDao, LAST_X_DAYS);
+    final UUID liveOrderingKey = UUID.randomUUID();
+    final long liveEvent = queueDao.enqueue(liveOrderingKey, "{\"state\":\"live\"}");
+    final String liveEventBeforeRetention = queueRowAsJson(liveOrderingKey, liveEvent);
+    final String liveHeadBeforeRetention = queueHeadAsJson(liveOrderingKey);
+
+    DbRetention.retentionOnDbOrError(
+        jdbiExtension.getJdbi(), deadLetterBatchSize, RETENTION_DAYS, DRY_RUN);
+
+    assertThat(deadLetterExists(firstOldDeadLetter)).isTrue();
+    assertThat(deadLetterExists(secondOldDeadLetter)).isTrue();
+    assertThat(deadLetterExists(thirdOldDeadLetter)).isTrue();
+    assertThat(deadLetterExists(recentDeadLetter)).isTrue();
+    assertThat(queueRowAsJson(liveOrderingKey, liveEvent)).isEqualTo(liveEventBeforeRetention);
+    assertThat(queueHeadAsJson(liveOrderingKey)).isEqualTo(liveHeadBeforeRetention);
+
+    DbRetention.retentionOnDbOrError(jdbiExtension.getJdbi(), deadLetterBatchSize, RETENTION_DAYS);
+
+    assertThat(deadLetterExists(firstOldDeadLetter)).isFalse();
+    assertThat(deadLetterExists(secondOldDeadLetter)).isFalse();
+    assertThat(deadLetterExists(thirdOldDeadLetter)).isTrue();
+    assertThat(deadLetterExists(recentDeadLetter)).isTrue();
+    assertThat(queueRowAsJson(liveOrderingKey, liveEvent)).isEqualTo(liveEventBeforeRetention);
+    assertThat(queueHeadAsJson(liveOrderingKey)).isEqualTo(liveHeadBeforeRetention);
+  }
+
+  private static long deadLetterAt(OpenLineageQueueDao queueDao, Instant deadAt) {
+    final UUID orderingKey = UUID.randomUUID();
+    final long id = queueDao.enqueue(orderingKey, "{\"state\":\"dead\"}");
+    jdbiExtension
+        .getJdbi()
+        .useTransaction(
+            TransactionIsolationLevel.READ_COMMITTED,
+            handle -> {
+              final OpenLineageQueueDao transactionalQueueDao =
+                  handle.attach(OpenLineageQueueDao.class);
+              final OpenLineageQueueRow row = transactionalQueueDao.lockNextDue().orElseThrow();
+              assertThat(row.id()).isEqualTo(id);
+              transactionalQueueDao.deadLetterLocked(
+                  row.orderingKey(), row.id(), row.attemptCount(), "test dead letter");
+            });
+    final int updated =
+        jdbiExtension
+            .getJdbi()
+            .withHandle(
+                handle ->
+                    handle
+                        .createUpdate(
+                            "UPDATE open_lineage_dead_letters "
+                                + "SET dead_at = :deadAt WHERE id = :id")
+                        .bind("deadAt", deadAt)
+                        .bind("id", id)
+                        .execute());
+    assertThat(updated).isEqualTo(1);
+    return id;
+  }
+
+  private static boolean deadLetterExists(long id) {
+    return jdbiExtension
+        .getJdbi()
+        .withHandle(
+            handle ->
+                handle
+                    .createQuery(
+                        "SELECT EXISTS (SELECT 1 FROM open_lineage_dead_letters WHERE id = :id)")
+                    .bind("id", id)
+                    .mapTo(Boolean.class)
+                    .one());
+  }
+
+  private static String queueRowAsJson(UUID orderingKey, long id) {
+    return jdbiExtension
+        .getJdbi()
+        .withHandle(
+            handle ->
+                handle
+                    .createQuery(
+                        "SELECT to_jsonb(queued)::text "
+                            + "FROM open_lineage_queue AS queued "
+                            + "WHERE ordering_key = :orderingKey AND id = :id")
+                    .bind("orderingKey", orderingKey)
+                    .bind("id", id)
+                    .mapTo(String.class)
+                    .one());
+  }
+
+  private static String queueHeadAsJson(UUID orderingKey) {
+    return jdbiExtension
+        .getJdbi()
+        .withHandle(
+            handle ->
+                handle
+                    .createQuery(
+                        "SELECT to_jsonb(head)::text "
+                            + "FROM open_lineage_queue_heads AS head "
+                            + "WHERE ordering_key = :orderingKey")
+                    .bind("orderingKey", orderingKey)
+                    .mapTo(String.class)
+                    .one());
   }
 }

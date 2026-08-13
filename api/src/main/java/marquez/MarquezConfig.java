@@ -5,6 +5,7 @@
 
 package marquez;
 
+import com.fasterxml.jackson.annotation.JsonMerge;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.collect.ImmutableSet;
 import io.dropwizard.Configuration;
@@ -28,12 +29,19 @@ public class MarquezConfig extends Configuration {
   private static final boolean DEFAULT_MIGRATE_ON_STARTUP = true;
   private static final ImmutableSet<Tag> DEFAULT_TAGS = ImmutableSet.of();
 
+  private static DataSourceFactory defaultDataSourceFactory() {
+    DataSourceFactory dataSourceFactory = new DataSourceFactory();
+    dataSourceFactory.setAutoCommentsEnabled(false);
+    return dataSourceFactory;
+  }
+
   @Getter private boolean migrateOnStartup = DEFAULT_MIGRATE_ON_STARTUP;
   @Getter private ImmutableSet<Tag> tags = DEFAULT_TAGS;
 
   @Getter
+  @JsonMerge
   @JsonProperty("db")
-  private final DataSourceFactory dataSourceFactory = new DataSourceFactory();
+  private final DataSourceFactory dataSourceFactory = defaultDataSourceFactory();
 
   @Getter
   @JsonProperty("flyway")
@@ -58,6 +66,7 @@ public class MarquezConfig extends Configuration {
 
   @Getter
   @Setter
+  @Valid
   @JsonProperty("dbRetention")
   private DbRetentionConfig dbRetention; // OPTIONAL
 

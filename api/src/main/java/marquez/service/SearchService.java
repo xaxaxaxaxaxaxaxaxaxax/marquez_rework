@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -18,6 +19,7 @@ import java.util.UUID;
 import javax.validation.Valid;
 import javax.validation.constraints.NotNull;
 import lombok.extern.slf4j.Slf4j;
+import marquez.common.Utils;
 import marquez.search.SearchConfig;
 import marquez.service.models.LineageEvent;
 import org.apache.http.HttpHost;
@@ -42,6 +44,8 @@ import org.opensearch.client.transport.rest_client.RestClientTransport;
 
 @Slf4j
 public class SearchService {
+  private static final Base64.Encoder ID_COMPONENT_ENCODER =
+      Base64.getUrlEncoder().withoutPadding();
 
   String[] DATASET_FIELDS = {
     "run_id",
@@ -168,12 +172,30 @@ public class SearchService {
         ObjectNode.class);
   }
 
-  public void indexEvent(@Valid @NotNull LineageEvent event) {
+  public boolean indexEvent(@Valid @NotNull LineageEvent event) {
+    if (indexingDisabled()) {
+      return true;
+    }
+    return indexEventWithRunUuid(event, runUuidFromEvent(event.getRun()));
+  }
+
+  /** Indexes a queued event with the run identity resolved by its committed projection. */
+  boolean indexEvent(@Valid @NotNull LineageEvent event, @NotNull UUID effectiveRunUuid) {
+    if (indexingDisabled()) {
+      return true;
+    }
+    return indexEventWithRunUuid(event, effectiveRunUuid);
+  }
+
+  private boolean indexingDisabled() {
     if (!searchConfig.isEnabled()) {
       log.debug("Search is disabled, skipping indexing");
-      return;
+      return true;
     }
-    UUID runUuid = runUuidFromEvent(event.getRun());
+    return false;
+  }
+
+  private boolean indexEventWithRunUuid(LineageEvent event, UUID runUuid) {
     log.debug("Indexing event for run {}", runUuid);
 
     int operationCount = 1;
@@ -192,60 +214,55 @@ public class SearchService {
     try {
       BulkResponse response = openSearchClient.bulk(BulkRequest.of(b -> b.operations(operations)));
       throwIfBulkFailed(response);
+      return true;
     } catch (IOException e) {
       // Search is a best-effort side effect. Preserve intake when its transport is unavailable.
       log.error("Failed to index event; OpenSearch is not available.", e);
+      return false;
     }
   }
 
   private UUID runUuidFromEvent(LineageEvent.Run run) {
-    UUID runUuid;
-    try {
-      runUuid = UUID.fromString(run.getRunId());
-    } catch (Exception e) {
-      runUuid = UUID.nameUUIDFromBytes(run.getRunId().getBytes(StandardCharsets.UTF_8));
-    }
-    return runUuid;
+    return Utils.openLineageRunUuid(run.getRunId());
   }
 
-  private Map<String, Object> buildJobIndexRequest(UUID runUuid, LineageEvent event) {
+  private Map<String, Object> buildJobIndexRequest(
+      UUID runUuid, LineageEvent event, String canonicalNamespace) {
     Map<String, Object> jsonMap = new HashMap<>();
 
     jsonMap.put("run_id", runUuid.toString());
     jsonMap.put("eventType", event.getEventType());
     jsonMap.put("name", event.getJob().getName());
     jsonMap.put("type", event.getJob().isStreamingJob() ? "STREAM" : "BATCH");
-    jsonMap.put("namespace", event.getJob().getNamespace());
+    jsonMap.put("namespace", canonicalNamespace);
     jsonMap.put("facets", event.getJob().getFacets());
     jsonMap.put("runFacets", event.getRun().getFacets());
     return jsonMap;
   }
 
   private Map<String, Object> buildDatasetIndexRequest(
-      UUID runUuid, LineageEvent.Dataset dataset, LineageEvent event) {
+      UUID runUuid, LineageEvent.Dataset dataset, LineageEvent event, String canonicalNamespace) {
     Map<String, Object> jsonMap = new HashMap<>();
     jsonMap.put("run_id", runUuid.toString());
     jsonMap.put("eventType", event.getEventType());
     jsonMap.put("name", dataset.getName());
     jsonMap.put("inputFacets", dataset.getInputFacets());
     jsonMap.put("outputFacets", dataset.getOutputFacets());
-    jsonMap.put("namespace", dataset.getNamespace());
+    jsonMap.put("namespace", canonicalNamespace);
     jsonMap.put("facets", dataset.getFacets());
     return jsonMap;
   }
 
   private BulkOperation buildJobIndexOperation(UUID runUuid, LineageEvent event) {
+    String canonicalNamespace = Utils.sanitizeOpenLineageNamespace(event.getJob().getNamespace());
     return BulkOperation.of(
         operation ->
             operation.index(
                 index ->
                     index
                         .index("jobs")
-                        .id(
-                            String.format(
-                                "JOB:%s:%s",
-                                event.getJob().getNamespace(), event.getJob().getName()))
-                        .document(buildJobIndexRequest(runUuid, event))));
+                        .id(indexDocumentId("JOB", canonicalNamespace, event.getJob().getName()))
+                        .document(buildJobIndexRequest(runUuid, event, canonicalNamespace))));
   }
 
   private void addDatasetOperations(
@@ -257,7 +274,9 @@ public class SearchService {
       return;
     }
     for (LineageEvent.Dataset dataset : datasets) {
-      Map<String, Object> document = buildDatasetIndexRequest(runUuid, dataset, event);
+      String canonicalNamespace = Utils.sanitizeOpenLineageNamespace(dataset.getNamespace());
+      Map<String, Object> document =
+          buildDatasetIndexRequest(runUuid, dataset, event, canonicalNamespace);
       operations.add(
           BulkOperation.of(
               operation ->
@@ -265,11 +284,17 @@ public class SearchService {
                       index ->
                           index
                               .index("datasets")
-                              .id(
-                                  String.format(
-                                      "DATASET:%s:%s", dataset.getNamespace(), dataset.getName()))
+                              .id(indexDocumentId("DATASET", canonicalNamespace, dataset.getName()))
                               .document(document))));
     }
+  }
+
+  private static String indexDocumentId(String kind, String canonicalNamespace, String name) {
+    return kind + "." + encodeIdComponent(canonicalNamespace) + "." + encodeIdComponent(name);
+  }
+
+  private static String encodeIdComponent(String value) {
+    return ID_COMPONENT_ENCODER.encodeToString(value.getBytes(StandardCharsets.UTF_8));
   }
 
   private void throwIfBulkFailed(BulkResponse response) {
