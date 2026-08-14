@@ -29,20 +29,27 @@ import org.jdbi.v3.sqlobject.transaction.Transactional;
 public interface OpenLineageQueueDao extends Transactional<OpenLineageQueueDao> {
   String LOCK_NEXT_DUE_SQL =
       """
+      WITH candidate AS MATERIALIZED (
+        SELECT head.ordering_key,
+               head.event_id,
+               head.attempt_count,
+               head.last_error
+        FROM open_lineage_queue_heads AS head
+        WHERE head.available_at <= statement_timestamp()
+        ORDER BY head.available_at
+        FOR UPDATE OF head SKIP LOCKED
+        LIMIT 1
+      )
       SELECT queued.id,
              queued.ordering_key,
              queued.event AS event_json,
              queued.enqueued_at,
-             LEAST(head.attempt_count::BIGINT + 1, 2147483647)::INTEGER AS attempt_count,
-             head.last_error
-      FROM open_lineage_queue_heads AS head
+             LEAST(candidate.attempt_count::BIGINT + 1, 2147483647)::INTEGER AS attempt_count,
+             candidate.last_error
+      FROM candidate
       JOIN open_lineage_queue AS queued
-        ON queued.ordering_key = head.ordering_key
-       AND queued.id = head.event_id
-      WHERE head.available_at <= statement_timestamp()
-      ORDER BY head.available_at
-      FOR UPDATE OF head SKIP LOCKED
-      LIMIT 1
+        ON queued.ordering_key = candidate.ordering_key
+       AND queued.id = candidate.event_id
       """;
 
   /** A fully validated queue admission serialized exactly once. */

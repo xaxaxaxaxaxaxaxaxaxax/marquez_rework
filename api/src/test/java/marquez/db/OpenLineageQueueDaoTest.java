@@ -660,7 +660,14 @@ class OpenLineageQueueDaoTest {
         .doesNotContain("available_at");
     assertThat(updateTargetList(refreshingSql)).contains("available_at");
     assertThat(OpenLineageQueueDao.LOCK_NEXT_DUE_SQL.toLowerCase(Locale.ROOT))
-        .contains("for update of head skip locked", "order by head.available_at", "limit 1");
+        .contains(
+            "with candidate as materialized",
+            "from open_lineage_queue_heads as head",
+            "for update of head skip locked",
+            "order by head.available_at",
+            "limit 1",
+            "from candidate",
+            "join open_lineage_queue as queued");
   }
 
   @Test
@@ -797,20 +804,27 @@ class OpenLineageQueueDaoTest {
     }
 
     List<JsonNode> claimNodes = planNodes(claimPlan);
+    JsonNode candidateLimit = planNodeWithValue(claimNodes, "Subplan Name", "CTE candidate");
     JsonNode dueIndex =
         planNodeWithValue(claimNodes, "Index Name", "open_lineage_queue_heads_due_idx");
+    JsonNode payloadIndex = planNodeWithValue(claimNodes, "Index Name", "open_lineage_queue_pkey");
     JsonNode lockRows = planNodeWithValue(claimNodes, "Node Type", "LockRows");
 
-    assertThat(claimPlan.path("Node Type").asText()).isEqualTo("Limit");
     assertThat(claimPlan.path("Actual Rows").asLong()).isEqualTo(1);
+    assertThat(candidateLimit.path("Node Type").asText()).isEqualTo("Limit");
+    assertThat(candidateLimit.path("Actual Rows").asLong()).isEqualTo(1);
     assertThat(lockRows.path("Actual Rows").asLong()).isEqualTo(1);
     assertThat(dueIndex.path("Node Type").asText()).isEqualTo("Index Scan");
     assertThat(dueIndex.path("Actual Loops").asLong()).isEqualTo(1);
     assertThat(dueIndex.path("Actual Rows").asLong())
         .as("one-row capacity examines only locked predecessors plus the winner")
         .isBetween(1L, lockedHeadCount + 1L);
+    assertThat(payloadIndex.path("Actual Loops").asLong())
+        .as("the locked candidate drives exactly one payload lookup")
+        .isEqualTo(1);
+    assertThat(payloadIndex.path("Actual Rows").asLong()).isEqualTo(1);
     assertThat(planValues(claimNodes, "Node Type"))
-        .contains("Limit", "LockRows", "Nested Loop")
+        .contains("Limit", "LockRows", "CTE Scan", "Nested Loop")
         .doesNotContain("Sort", "Incremental Sort", "Seq Scan");
     assertThat(planValues(claimNodes, "Index Name"))
         .contains("open_lineage_queue_heads_due_idx", "open_lineage_queue_pkey");
