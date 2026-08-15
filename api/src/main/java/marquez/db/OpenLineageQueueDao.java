@@ -7,6 +7,7 @@ package marquez.db;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -79,6 +80,51 @@ public interface OpenLineageQueueDao extends Transactional<OpenLineageQueueDao> 
     return enqueue(event.orderingKey(), event.eventJson());
   }
 
+  /** Atomically enqueues an ordered batch of events already validated and serialized. */
+  default int enqueueAll(List<PreparedEvent> events) {
+    if (events == null) {
+      throw new IllegalArgumentException("prepared events are required");
+    }
+
+    List<PreparedEvent> inputs = new ArrayList<>(events.size());
+    for (PreparedEvent event : events) {
+      if (event == null) {
+        throw new IllegalArgumentException("prepared event is required");
+      }
+      inputs.add(event);
+    }
+    if (inputs.isEmpty()) {
+      return 0;
+    }
+
+    UUID[] orderingKeys = new UUID[inputs.size()];
+    String[] eventJsons = new String[inputs.size()];
+    for (int index = 0; index < inputs.size(); index++) {
+      PreparedEvent event = inputs.get(index);
+      orderingKeys[index] = event.orderingKey();
+      eventJsons[index] = event.eventJson();
+    }
+
+    if (isInTransaction()) {
+      requireReadCommittedIsolation("OpenLineage bulk enqueue");
+    }
+    return inTransaction(
+        transactional -> {
+          transactional.requireReadCommittedIsolation("OpenLineage bulk enqueue");
+          transactional.acquireOrderingKeyLocks(orderingKeys);
+          long inserted =
+              transactional.insertEventsAndMaybeHeadsAfterLocks(orderingKeys, eventJsons);
+          if (inserted != inputs.size()) {
+            throw new IllegalStateException(
+                "Expected to enqueue "
+                    + inputs.size()
+                    + " OpenLineage events, but inserted "
+                    + inserted);
+          }
+          return inputs.size();
+        });
+  }
+
   /** Trusted low-level enqueue; callers must supply application-serialized JSON. */
   default long enqueue(UUID orderingKey, String eventJson) {
     requireOrderingKey(orderingKey);
@@ -108,6 +154,30 @@ public interface OpenLineageQueueDao extends Transactional<OpenLineageQueueDao> 
       ) AS ordering_key_lock
       """)
   int acquireOrderingKeyLock(@Bind("orderingKey") UUID orderingKey);
+
+  /** Acquires every effective ordering-lane lock in one deterministic global order. */
+  @SqlQuery(
+      """
+      WITH ordered_lock_keys AS MATERIALIZED (
+        SELECT DISTINCT
+               hashtextextended(
+                   'open_lineage_queue:' || CAST(requested.ordering_key AS TEXT),
+                   0) AS lock_key
+        FROM unnest(CAST(:orderingKeys AS uuid[])) AS requested(ordering_key)
+        ORDER BY lock_key
+      ), acquired AS MATERIALIZED (
+        SELECT pg_advisory_xact_lock(ordered.lock_key) AS ordering_key_lock
+        FROM (
+          SELECT lock_key
+          FROM ordered_lock_keys
+          ORDER BY lock_key
+          OFFSET 0
+        ) AS ordered
+      )
+      SELECT count(*)
+      FROM acquired
+      """)
+  int acquireOrderingKeyLocks(@Bind("orderingKeys") UUID[] orderingKeys);
 
   /**
    * Acquires the lane lock and reads the scheduling state of the exact head locked by the caller.
@@ -163,6 +233,46 @@ public interface OpenLineageQueueDao extends Transactional<OpenLineageQueueDao> 
       """)
   long insertEventAndMaybeHeadAfterLock(
       @Bind("orderingKey") UUID orderingKey, @Bind("eventJson") String eventJson);
+
+  /**
+   * Inserts immutable payloads in request order and creates one head for each newly nonempty lane.
+   * The caller must already hold every corresponding ordering-lane lock on the same handle.
+   */
+  @SqlQuery(
+      """
+      WITH inserted AS (
+        INSERT INTO open_lineage_queue (ordering_key, event)
+        SELECT ordered.ordering_key, ordered.event_json
+        FROM (
+          SELECT requested.ordering_key,
+                 requested.event_json,
+                 requested.ordinality
+          FROM unnest(
+              CAST(:orderingKeys AS uuid[]),
+              CAST(:eventJsons AS varchar[])
+          ) WITH ORDINALITY AS requested(ordering_key, event_json, ordinality)
+          ORDER BY requested.ordinality
+          OFFSET 0
+        ) AS ordered
+        RETURNING ordering_key, id
+      ), created_heads AS (
+        INSERT INTO open_lineage_queue_heads (ordering_key, event_id)
+        SELECT inserted.ordering_key, min(inserted.id)
+        FROM inserted
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM open_lineage_queue_heads AS head
+          WHERE head.ordering_key = inserted.ordering_key
+        )
+        GROUP BY inserted.ordering_key
+        ORDER BY inserted.ordering_key
+        RETURNING event_id
+      )
+      SELECT count(*)
+      FROM inserted
+      """)
+  long insertEventsAndMaybeHeadsAfterLocks(
+      @Bind("orderingKeys") UUID[] orderingKeys, @Bind("eventJsons") String[] eventJsons);
 
   /** Locks one due lane head and returns its proposed attempt in the caller's transaction. */
   default Optional<OpenLineageQueueRow> lockNextDue() {

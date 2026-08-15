@@ -45,6 +45,8 @@ class OpenLineageOpenApiContractTest {
         .isEqualTo(publicSpec.at("/paths/~1lineage/post/description"));
     assertThat(documentationSpec.at("/paths/~1lineage/post/responses"))
         .isEqualTo(publicSpec.at("/paths/~1lineage/post/responses"));
+    assertThat(documentationSpec.at("/paths/~1lineage~1batch/post"))
+        .isEqualTo(publicSpec.at("/paths/~1lineage~1batch/post"));
     for (String schemaName : REQUEST_SCHEMAS) {
       assertThat(documentationSpec.at("/components/schemas/" + schemaName))
           .as(schemaName)
@@ -165,6 +167,67 @@ class OpenLineageOpenApiContractTest {
             "Any 5xx response during queue admission is commit-indeterminate",
             "Clients that retry must tolerate duplicate events",
             post.at("/responses/500/description").asText());
+  }
+
+  @Test
+  void batchRequestIsBoundedAndDocumentsAtomicDurableAdmission() throws Exception {
+    JsonNode spec = readRepoYaml("spec/openapi.yml");
+    JsonNode post = spec.at("/paths/~1lineage~1batch/post");
+    JsonNode requestSchema = post.at("/requestBody/content/application~1json/schema");
+
+    assertThat(post.at("/requestBody/required").asBoolean()).isTrue();
+    assertThat(requestSchema.has("$ref")).isFalse();
+    assertThat(requestSchema.path("type").asText()).isEqualTo("array");
+    assertThat(requestSchema.path("minItems").asInt()).isEqualTo(1);
+    assertThat(OpenLineageResource.MAX_BATCH_SIZE).isEqualTo(1000);
+    assertThat(requestSchema.path("maxItems").asInt())
+        .isEqualTo(OpenLineageResource.MAX_BATCH_SIZE);
+    assertThat(requestSchema.at("/items/$ref").asText())
+        .isEqualTo("#/components/schemas/OpenLineageEventRequest");
+
+    assertThat(fieldNames(post.path("responses")))
+        .containsExactlyInAnyOrder("204", "400", "422", "500");
+    assertThat(post.at("/responses/204/content").isMissingNode()).isTrue();
+
+    String operationDescription = post.path("description").asText();
+    assertThat(operationDescription)
+        .contains(
+            "between 1 and 1000 events",
+            "All events are validated and prepared before queue admission",
+            "Admission is atomic",
+            "the whole batch is committed in one queue transaction or none of it is committed",
+            "a batch is never partially admitted",
+            "A 204 response confirms only that the entire batch was committed to the intake queue",
+            "lineage projections are processed asynchronously",
+            "best effort",
+            "Any 5xx response during queue admission is commit-indeterminate",
+            "the entire queue transaction may already have committed",
+            "duplicate events for every event in the batch");
+    assertThat(post.at("/responses/204/description").asText())
+        .isEqualTo(
+            "No-content response confirming only that the entire batch was atomically committed to the durable intake queue");
+    assertThat(post.at("/responses/400/description").asText())
+        .contains("Malformed lineage batch JSON", "no events were admitted");
+    assertThat(post.at("/responses/422/description").asText())
+        .contains(
+            "Batch is empty", "more than 1000 events", "null item", "no events were admitted");
+    assertThat(post.at("/responses/500/description").asText())
+        .contains(
+            "commit outcome is indeterminate",
+            "atomic transaction",
+            "committed the entire batch",
+            "a retry can duplicate every event");
+
+    String generatedPage =
+        Files.readString(repoRoot().resolve("docs/docs/api/record-lineage-batch.api.mdx"));
+    assertThat(generatedPage)
+        .contains(
+            operationDescription,
+            post.at("/responses/204/description").asText(),
+            post.at("/responses/500/description").asText(),
+            "OpenLineageRunEventRequest",
+            "OpenLineageDatasetEventRequest",
+            "OpenLineageJobEventRequest");
   }
 
   private static void assertExampleContainsRequired(JsonNode schema) {

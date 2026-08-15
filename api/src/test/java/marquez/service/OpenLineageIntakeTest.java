@@ -11,12 +11,15 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.same;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 import java.net.URI;
 import java.time.ZonedDateTime;
+import java.util.List;
 import java.util.UUID;
 import marquez.db.OpenLineageQueueDao;
 import marquez.db.OpenLineageQueueDao.PreparedEvent;
@@ -31,6 +34,8 @@ class OpenLineageIntakeTest {
   private final Runnable wakeUp = mock(Runnable.class);
   private final OpenLineageIntake intake = new OpenLineageIntake(queueDao, wakeUp);
   private final PreparedEvent prepared = new PreparedEvent(UUID.randomUUID(), "{}");
+  private final PreparedEvent secondPrepared = new PreparedEvent(UUID.randomUUID(), "{}");
+  private final List<PreparedEvent> batch = List.of(prepared, secondPrepared);
 
   @Test
   void enqueueCommitsBeforeWakingWorker() {
@@ -63,6 +68,56 @@ class OpenLineageIntakeTest {
     assertSame(failure, assertThrows(IllegalStateException.class, () -> intake.enqueue(prepared)));
     verify(queueDao).enqueue(prepared);
     verifyNoInteractions(wakeUp);
+  }
+
+  @Test
+  void enqueueAllCommitsBeforeWakingWorkerOnce() {
+    when(queueDao.enqueueAll(same(batch))).thenReturn(2);
+
+    assertEquals(2, intake.enqueueAll(batch));
+
+    InOrder inOrder = inOrder(queueDao, wakeUp);
+    inOrder.verify(queueDao).enqueueAll(same(batch));
+    inOrder.verify(wakeUp).run();
+    verifyNoMoreInteractions(queueDao, wakeUp);
+  }
+
+  @Test
+  void enqueueAllRemainsSuccessfulWhenWakeUpFails() {
+    when(queueDao.enqueueAll(same(batch))).thenReturn(2);
+    doThrow(new IllegalStateException("stopped")).when(wakeUp).run();
+
+    assertEquals(2, intake.enqueueAll(batch));
+
+    InOrder inOrder = inOrder(queueDao, wakeUp);
+    inOrder.verify(queueDao).enqueueAll(same(batch));
+    inOrder.verify(wakeUp).run();
+    verifyNoMoreInteractions(queueDao, wakeUp);
+  }
+
+  @Test
+  void batchCommitIndeterminateFailureIsPropagatedWithoutRetryOrWakeUp() {
+    IllegalStateException failure = new IllegalStateException("batch commit response lost");
+    when(queueDao.enqueueAll(same(batch))).thenThrow(failure);
+
+    assertSame(failure, assertThrows(IllegalStateException.class, () -> intake.enqueueAll(batch)));
+    verify(queueDao).enqueueAll(same(batch));
+    verifyNoMoreInteractions(queueDao);
+    verifyNoInteractions(wakeUp);
+  }
+
+  @Test
+  void emptyBatchReturnsZeroWithoutQueueOrWakeUp() {
+    assertEquals(0, intake.enqueueAll(List.of()));
+
+    verifyNoInteractions(queueDao, wakeUp);
+  }
+
+  @Test
+  void nullBatchIsRejectedWithoutQueueOrWakeUp() {
+    assertThrows(NullPointerException.class, () -> intake.enqueueAll(null));
+
+    verifyNoInteractions(queueDao, wakeUp);
   }
 
   @Test

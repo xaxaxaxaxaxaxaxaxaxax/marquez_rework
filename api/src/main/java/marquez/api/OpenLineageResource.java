@@ -14,11 +14,13 @@ import com.codahale.metrics.annotation.ResponseMetered;
 import com.codahale.metrics.annotation.Timed;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import io.dropwizard.jersey.jsr310.ZonedDateTimeParam;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import javax.validation.Valid;
 import javax.validation.constraints.Min;
 import javax.validation.constraints.NotNull;
+import javax.validation.constraints.Size;
 import javax.ws.rs.Consumes;
 import javax.ws.rs.DefaultValue;
 import javax.ws.rs.GET;
@@ -47,6 +49,7 @@ import marquez.service.models.NodeId;
 @Path("/api/v1")
 public class OpenLineageResource extends BaseResource {
   private static final String DEFAULT_DEPTH = "20";
+  static final int MAX_BATCH_SIZE = 1000;
 
   private final OpenLineageDao openLineageDao;
   private final OpenLineageIntake openLineageIntake;
@@ -68,21 +71,14 @@ public class OpenLineageResource extends BaseResource {
   @Produces(APPLICATION_JSON)
   @Path("/lineage")
   public Response create(@Valid @NotNull BaseEvent event) {
-    if (!(event instanceof LineageEvent)
-        && !(event instanceof DatasetEvent)
-        && !(event instanceof JobEvent)) {
+    if (!isSupported(event)) {
       log.warn("Unsupported event type {}. Skipping without error", event.getClass().getName());
       return Response.status(200).entity(event).build();
     }
 
     final PreparedEvent prepared;
     try {
-      prepared = OpenLineageQueueDao.prepare(event);
-      if (event instanceof LineageEvent lineageEvent) {
-        OpenLineageDao.validateDatasetIds(lineageEvent.getInputs());
-      } else if (event instanceof JobEvent jobEvent) {
-        OpenLineageDao.validateDatasetIds(jobEvent.getInputs());
-      }
+      prepared = prepare(event);
     } catch (IllegalArgumentException invalidArgument) {
       log.warn("Invalid OpenLineage event: {}", invalidArgument.getMessage());
       return Response.status(BAD_REQUEST).build();
@@ -90,6 +86,50 @@ public class OpenLineageResource extends BaseResource {
 
     openLineageIntake.enqueue(prepared);
     return Response.status(CREATED).build();
+  }
+
+  @Timed
+  @ResponseMetered
+  @ExceptionMetered
+  @POST
+  @Consumes(APPLICATION_JSON)
+  @Produces(APPLICATION_JSON)
+  @Path("/lineage/batch")
+  public Response createBatch(
+      @NotNull @Size(min = 1, max = MAX_BATCH_SIZE) List<@NotNull @Valid BaseEvent> events) {
+    final List<PreparedEvent> preparedEvents = new ArrayList<>(events.size());
+    try {
+      for (BaseEvent event : events) {
+        if (!isSupported(event)) {
+          log.warn("Unsupported batch event type {}", event.getClass().getName());
+          return Response.status(BAD_REQUEST).build();
+        }
+
+        preparedEvents.add(prepare(event));
+      }
+    } catch (IllegalArgumentException invalidArgument) {
+      log.warn("Invalid OpenLineage batch: {}", invalidArgument.getMessage());
+      return Response.status(BAD_REQUEST).build();
+    }
+
+    openLineageIntake.enqueueAll(preparedEvents);
+    return Response.noContent().build();
+  }
+
+  private static boolean isSupported(BaseEvent event) {
+    return event instanceof LineageEvent
+        || event instanceof DatasetEvent
+        || event instanceof JobEvent;
+  }
+
+  private static PreparedEvent prepare(BaseEvent event) {
+    PreparedEvent prepared = OpenLineageQueueDao.prepare(event);
+    if (event instanceof LineageEvent lineageEvent) {
+      OpenLineageDao.validateDatasetIds(lineageEvent.getInputs());
+    } else if (event instanceof JobEvent jobEvent) {
+      OpenLineageDao.validateDatasetIds(jobEvent.getInputs());
+    }
+    return prepared;
   }
 
   @Timed

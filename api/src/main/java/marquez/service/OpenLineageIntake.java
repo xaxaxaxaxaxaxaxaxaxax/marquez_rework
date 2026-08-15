@@ -5,6 +5,7 @@
 
 package marquez.service;
 
+import java.util.List;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 import marquez.db.OpenLineageQueueDao;
@@ -43,5 +44,27 @@ public final class OpenLineageIntake {
           wakeFailure);
     }
     return queueId;
+  }
+
+  /**
+   * Atomically enqueues an ordered batch already validated and serialized by durable admission.
+   * Returns the admitted count after the batch commits. Waking the worker remains a best-effort
+   * optimization because polling and restart recovery make every committed event visible.
+   */
+  public int enqueueAll(@NonNull final List<PreparedEvent> events) {
+    if (events.isEmpty()) {
+      return 0;
+    }
+
+    final int admitted = queueDao.enqueueAll(events);
+    try {
+      wakeUp.run();
+    } catch (RuntimeException wakeFailure) {
+      log.warn(
+          "OpenLineage batch ({} event(s)) was queued, but the worker could not be woken",
+          admitted,
+          wakeFailure);
+    }
+    return admitted;
   }
 }

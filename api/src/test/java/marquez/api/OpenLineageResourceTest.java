@@ -11,11 +11,13 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -25,6 +27,8 @@ import io.dropwizard.testing.junit5.DropwizardExtensionsSupport;
 import io.dropwizard.testing.junit5.ResourceExtension;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import javax.ws.rs.client.Entity;
 import javax.ws.rs.core.MediaType;
@@ -97,6 +101,8 @@ class OpenLineageResourceTest {
   void setUpOpenLineageIntake() {
     reset(OPEN_LINEAGE_DAO, OPEN_LINEAGE_INTAKE);
     when(OPEN_LINEAGE_INTAKE.enqueue(any(PreparedEvent.class))).thenReturn(1L);
+    when(OPEN_LINEAGE_INTAKE.enqueueAll(anyList()))
+        .thenAnswer(invocation -> ((List<?>) invocation.getArgument(0)).size());
   }
 
   @Test
@@ -255,6 +261,113 @@ class OpenLineageResourceTest {
   }
 
   @Test
+  void testCreateBatch() throws IOException {
+    BaseEvent lineageEvent = eventFrom("/open_lineage/event_required_only.json");
+    BaseEvent datasetEvent = eventFrom("/open_lineage/event_dataset_event.json");
+    BaseEvent jobEvent = eventFrom("/open_lineage/event_job_event.json");
+
+    Response response = RESOURCE.createBatch(List.of(lineageEvent, datasetEvent, jobEvent));
+
+    assertEquals(204, response.getStatus());
+    assertFalse(response.hasEntity());
+    verify(OPEN_LINEAGE_INTAKE)
+        .enqueueAll(
+            List.of(
+                OpenLineageQueueDao.prepare(lineageEvent),
+                OpenLineageQueueDao.prepare(datasetEvent),
+                OpenLineageQueueDao.prepare(jobEvent)));
+    verifyNoMoreInteractions(OPEN_LINEAGE_INTAKE);
+  }
+
+  @Test
+  void testCreateBatchPreparesEveryEventBeforeIntake() throws IOException {
+    BaseEvent valid = eventFrom("/open_lineage/event_required_only.json");
+    LineageEvent invalid = (LineageEvent) eventFrom("/open_lineage/event_simple.json");
+    invalid.getInputs().get(0).setNamespace(INVALID_NAMESPACE);
+
+    Response response = RESOURCE.createBatch(List.of(valid, invalid));
+
+    assertEquals(400, response.getStatus());
+    assertFalse(response.hasEntity());
+    verifyNoInteractions(OPEN_LINEAGE_INTAKE);
+  }
+
+  @Test
+  void testCreateBatchRejectsUnsupportedEvent() throws IOException {
+    BaseEvent valid = eventFrom("/open_lineage/event_required_only.json");
+
+    Response response = RESOURCE.createBatch(List.of(valid, new BaseEvent()));
+
+    assertEquals(400, response.getStatus());
+    assertFalse(response.hasEntity());
+    verifyNoInteractions(OPEN_LINEAGE_INTAKE);
+  }
+
+  @Test
+  void testCreateBatchEmptyArrayFailsValidationBeforeIntake() {
+    try (Response response = postBatch("[]")) {
+      assertEquals(422, response.getStatus());
+    }
+    verifyNoInteractions(OPEN_LINEAGE_INTAKE);
+  }
+
+  @Test
+  void testCreateBatchTooLargeFailsValidationBeforeIntake() throws IOException {
+    String event = eventJsonFrom("/open_lineage/event_required_only.json");
+    String batch =
+        "["
+            + String.join(",", Collections.nCopies(OpenLineageResource.MAX_BATCH_SIZE + 1, event))
+            + "]";
+
+    try (Response response = postBatch(batch)) {
+      assertEquals(422, response.getStatus());
+    }
+    verifyNoInteractions(OPEN_LINEAGE_INTAKE);
+  }
+
+  @Test
+  void testCreateBatchNullEventFailsValidationBeforeIntake() throws IOException {
+    String event = eventJsonFrom("/open_lineage/event_required_only.json");
+
+    try (Response response = postBatch("[" + event + ",null]")) {
+      assertEquals(422, response.getStatus());
+    }
+    verifyNoInteractions(OPEN_LINEAGE_INTAKE);
+  }
+
+  @Test
+  void testCreateBatchNestedValidationFailureBeforeIntake() throws IOException {
+    String valid = eventJsonFrom("/open_lineage/event_required_only.json");
+    String invalid =
+        "{\"eventTime\": \"2021-11-03T10:53:52.427343Z\", \"eventType\": \"COMPLETE\", "
+            + "\"inputs\": [], \"job\": {\"name\": \"child\", \"namespace\": \"namespace\"}, "
+            + "\"outputs\": [], \"producer\": \"me\", "
+            + "\"run\": {\"runId\": \"dae0d60a-6010-4c37-980e-c5270f5a6be4\", "
+            + "\"facets\": {\"parent\": {\"_producer\": \"https://me\", "
+            + "\"_schemaURL\": \"https://me\", \"run\": {\"runId\": \"\u2003\u00a0\"}, "
+            + "\"job\": {\"namespace\": \"parent-ns\", \"name\": \"parent\"}}}}}";
+
+    try (Response response = postBatch("[" + valid + "," + invalid + "]")) {
+      assertEquals(422, response.getStatus());
+    }
+    verifyNoInteractions(OPEN_LINEAGE_INTAKE);
+  }
+
+  @Test
+  void testCreateBatchAdmissionIllegalArgumentReturnsInternalServerError() throws IOException {
+    String event = eventJsonFrom("/open_lineage/event_required_only.json");
+    when(OPEN_LINEAGE_INTAKE.enqueueAll(anyList()))
+        .thenThrow(new IllegalArgumentException("password=do-not-return"));
+
+    try (Response response = postBatch("[" + event + "]")) {
+      assertEquals(500, response.getStatus());
+      assertFalse(response.getHeaders().containsKey("Retry-After"));
+      assertFalse(response.readEntity(String.class).contains("password=do-not-return"));
+    }
+    verify(OPEN_LINEAGE_INTAKE).enqueueAll(anyList());
+  }
+
+  @Test
   void testGetLineage() {
     final Lineage lineage =
         UNDER_TEST
@@ -288,5 +401,12 @@ class OpenLineageResourceTest {
     return new String(
         OpenLineageResourceTest.class.getResourceAsStream(resourceName).readAllBytes(),
         StandardCharsets.UTF_8);
+  }
+
+  private Response postBatch(String batch) {
+    return UNDER_TEST
+        .target("/api/v1/lineage/batch")
+        .request()
+        .post(Entity.entity(batch, MediaType.APPLICATION_JSON_TYPE));
   }
 }

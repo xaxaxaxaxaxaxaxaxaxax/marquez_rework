@@ -1,6 +1,6 @@
 # Cumulative performance profile
 
-Profile date: 2026-08-13
+Profile date: 2026-08-15
 
 This is an indicative, correctness-gated PostgreSQL 14 profile of the rework against the
 unmodified repository at `/tmp/marquez-rework-upstream`. It is not a production capacity test.
@@ -357,6 +357,50 @@ reclamation of the remaining rows; vacuum/refill reuse; real worker sensitivity;
 and drain; and one JFR diagnostic. Bulk reclamation is explicitly excluded from throughput and WAL
 comparisons. Results are recorded only after the fail-closed source manifest and DAO/schema/worker
 adapter review match the production files.
+
+### Batch admission throughput
+
+The opt-in `OpenLineageBatchThroughputBenchmark` compares the actual HTTP admission paths with
+four closed-loop clients. Each cell submits 16,384 small required-only RunEvents with distinct run
+IDs, so every event exercises a distinct ordering lock and creates a distinct queue head. The
+single cell sends one event per `POST /lineage`; the batch cell sends 128 events per
+`POST /lineage/batch`. Request construction is outside the timed interval. New heads are scheduled
+at infinity during each cell so the asynchronous projector cannot consume CPU or database capacity;
+this is an admission-throughput measurement, not projection throughput.
+
+The Java 17/PostgreSQL 14 run used 8,192 warm-up events per path followed by seven measured cells
+per path. Cell order alternated, the queue was truncated between cells, and every response status,
+queue row, unique-lane head, and zero-dead-letter invariant was checked.
+
+| Events/request | HTTP route | Median events/s | Cell range | Median requests/s |
+|---:|---|---:|---:|---:|
+| 1 | `POST /lineage` | 3,084.5 | 2,216.6–3,154.4 | 3,084.5 |
+| 128 | `POST /lineage/batch` | 42,223.0 | 39,721.5–44,812.4 | 329.9 |
+
+The median paired throughput gain was **13.88x**. The first single-event cell was colder at 2,216.6
+events/s; the other six were 3,009.5–3,154.4 events/s, so the seven-cell median is not driven by
+that outlier. Batch throughput varied by about +/-6% around its median.
+
+The smallest useful throughput model is:
+
+```text
+event throughput = request throughput * events per request
+```
+
+Batching does not approach the theoretical 128x ceiling because parsing, validation,
+serialization, identity allocation, queue-row writes, and per-lane lock/head work remain
+per-event. It nevertheless removes 127 HTTP exchanges and 127 queue transactions per 128 events.
+This fixture deliberately uses all-distinct lanes; repeated events for the same run deduplicate
+advisory-lock and head work and can have a different throughput profile. Results are indicative for
+one local machine and do not establish production capacity.
+
+Run the benchmark explicitly; it is disabled in normal test execution:
+
+```text
+JAVA_TOOL_OPTIONS=-DrunOpenLineageBatchThroughputBenchmark=true \
+  ./gradlew --rerun-tasks :api:testIntegration \
+  --tests marquez.OpenLineageBatchThroughputBenchmark
+```
 
 ## Caveats
 

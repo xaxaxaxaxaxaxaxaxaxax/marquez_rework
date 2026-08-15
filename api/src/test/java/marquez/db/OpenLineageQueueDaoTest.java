@@ -155,10 +155,72 @@ class OpenLineageQueueDaoTest {
   }
 
   @Test
+  void bulkAdmissionPreservesExactJsonLaneOrderAndHeads() {
+    UUID firstLane = UUID.randomUUID();
+    UUID secondLane = UUID.randomUUID();
+    UUID thirdLane = UUID.randomUUID();
+    String first = "{ \"last\" : 2, \"first\" : 1 }";
+    String second = "{\"literalNulEscape\":\"\\\\u0000\"}";
+    String third = "{\n  \"third\" : true\n}";
+    String duplicate = "{ \"duplicate\" : true }";
+
+    int inserted =
+        dao.enqueueAll(
+            List.of(
+                new PreparedEvent(firstLane, first),
+                new PreparedEvent(secondLane, second),
+                new PreparedEvent(firstLane, third),
+                new PreparedEvent(thirdLane, duplicate),
+                new PreparedEvent(secondLane, duplicate),
+                new PreparedEvent(firstLane, duplicate)));
+
+    assertThat(inserted).isEqualTo(6);
+    assertThat(lanePayloads(firstLane)).containsExactly(first, third, duplicate);
+    assertThat(lanePayloads(secondLane)).containsExactly(second, duplicate);
+    assertThat(lanePayloads(thirdLane)).containsExactly(duplicate);
+    assertThat(headId(firstLane)).isEqualTo(laneIds(firstLane).get(0));
+    assertThat(headId(secondLane)).isEqualTo(laneIds(secondLane).get(0));
+    assertThat(headId(thirdLane)).isEqualTo(laneIds(thirdLane).get(0));
+    assertThat(headCount()).isEqualTo(3);
+    assertQueueIntegrity();
+  }
+
+  @Test
+  void bulkAdmissionValidatesAllBeforeWritingAndEmptyIsNoOp() {
+    UUID key = UUID.randomUUID();
+    List<PreparedEvent> containsNull = new ArrayList<>();
+    containsNull.add(new PreparedEvent(key, payloadJson(1)));
+    containsNull.add(null);
+
+    assertThatThrownBy(() -> dao.enqueueAll(null))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("prepared events are required");
+    assertThatThrownBy(() -> dao.enqueueAll(containsNull))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("prepared event is required");
+
+    try (Handle handle = jdbi.open()) {
+      handle.setTransactionIsolationLevel(TransactionIsolationLevel.REPEATABLE_READ);
+      assertThat(handle.attach(OpenLineageQueueDao.class).enqueueAll(List.of())).isZero();
+      assertThat(handle.isInTransaction()).isFalse();
+    }
+
+    assertThat(queueIds()).isEmpty();
+    assertThat(headCount()).isZero();
+  }
+
+  @Test
   void sameLaneEnqueueFollowsCommitOrderAndRecoversFromRollback() throws Exception {
     assertConcurrentEnqueueAfterFirstTransaction(true);
     clearQueue();
     assertConcurrentEnqueueAfterFirstTransaction(false);
+  }
+
+  @Test
+  void sameLaneBulkEnqueueUsesFreshSnapshotAfterPredecessorCommitOrRollback() throws Exception {
+    assertConcurrentBulkEnqueueAfterFirstTransaction(true);
+    clearQueue();
+    assertConcurrentBulkEnqueueAfterFirstTransaction(false);
   }
 
   @Test
@@ -186,6 +248,109 @@ class OpenLineageQueueDaoTest {
 
     assertThat(queueIds()).isEmpty();
     assertThat(headCount()).isZero();
+  }
+
+  @Test
+  void bulkEnqueueJoinsOuterReadCommittedTransactionAndRejectsRepeatableRead() {
+    UUID firstKey = UUID.randomUUID();
+    UUID secondKey = UUID.randomUUID();
+    List<PreparedEvent> batch =
+        List.of(
+            new PreparedEvent(firstKey, payloadJson(1)),
+            new PreparedEvent(secondKey, payloadJson(2)),
+            new PreparedEvent(firstKey, payloadJson(3)));
+
+    assertThatThrownBy(
+            () ->
+                jdbi.useTransaction(
+                    TransactionIsolationLevel.READ_COMMITTED,
+                    handle -> {
+                      assertThat(handle.attach(OpenLineageQueueDao.class).enqueueAll(batch))
+                          .isEqualTo(3);
+                      throw new IllegalStateException("force bulk rollback");
+                    }))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessage("force bulk rollback");
+
+    assertThatThrownBy(
+            () ->
+                jdbi.useTransaction(
+                    TransactionIsolationLevel.REPEATABLE_READ,
+                    handle -> handle.attach(OpenLineageQueueDao.class).enqueueAll(batch)))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessage("OpenLineage bulk enqueue requires READ COMMITTED isolation");
+
+    try (Handle handle = jdbi.open()) {
+      handle.setTransactionIsolationLevel(TransactionIsolationLevel.REPEATABLE_READ);
+      OpenLineageQueueDao repeatableRead = handle.attach(OpenLineageQueueDao.class);
+
+      assertThatThrownBy(() -> repeatableRead.enqueueAll(batch))
+          .isInstanceOf(IllegalStateException.class)
+          .hasMessage("OpenLineage bulk enqueue requires READ COMMITTED isolation");
+      assertThat(handle.isInTransaction()).isFalse();
+    }
+
+    assertThat(queueIds()).isEmpty();
+    assertThat(headCount()).isZero();
+  }
+
+  @Test
+  void overlappingReverseLaneBatchesDoNotDeadlockOrReorderWithinLanes() throws Exception {
+    UUID firstLane = UUID.randomUUID();
+    UUID secondLane = UUID.randomUUID();
+    String firstA = "{\"batch\":1,\"lane\":\"a\",\"position\":1}";
+    String firstB = "{\"batch\":1,\"lane\":\"b\",\"position\":1}";
+    String secondA = "{\"batch\":1,\"lane\":\"a\",\"position\":2}";
+    String secondB = "{\"batch\":1,\"lane\":\"b\",\"position\":2}";
+    String thirdB = "{\"batch\":2,\"lane\":\"b\",\"position\":1}";
+    String thirdA = "{\"batch\":2,\"lane\":\"a\",\"position\":1}";
+    String fourthB = "{\"batch\":2,\"lane\":\"b\",\"position\":2}";
+    String fourthA = "{\"batch\":2,\"lane\":\"a\",\"position\":2}";
+    List<PreparedEvent> forward =
+        List.of(
+            new PreparedEvent(firstLane, firstA),
+            new PreparedEvent(secondLane, firstB),
+            new PreparedEvent(firstLane, secondA),
+            new PreparedEvent(secondLane, secondB));
+    List<PreparedEvent> reverse =
+        List.of(
+            new PreparedEvent(secondLane, thirdB),
+            new PreparedEvent(firstLane, thirdA),
+            new PreparedEvent(secondLane, fourthB),
+            new PreparedEvent(firstLane, fourthA));
+
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+    CountDownLatch ready = new CountDownLatch(2);
+    CountDownLatch start = new CountDownLatch(1);
+    try {
+      Future<Integer> forwardResult =
+          executor.submit(() -> enqueueBulkAfterSignal(forward, ready, start));
+      Future<Integer> reverseResult =
+          executor.submit(() -> enqueueBulkAfterSignal(reverse, ready, start));
+      assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue();
+      start.countDown();
+
+      assertThat(forwardResult.get(5, TimeUnit.SECONDS)).isEqualTo(4);
+      assertThat(reverseResult.get(5, TimeUnit.SECONDS)).isEqualTo(4);
+    } finally {
+      start.countDown();
+      executor.shutdownNow();
+    }
+
+    List<String> firstLanePayloads = lanePayloads(firstLane);
+    List<String> secondLanePayloads = lanePayloads(secondLane);
+    boolean forwardFirst =
+        firstLanePayloads.equals(List.of(firstA, secondA, thirdA, fourthA))
+            && secondLanePayloads.equals(List.of(firstB, secondB, thirdB, fourthB));
+    boolean reverseFirst =
+        firstLanePayloads.equals(List.of(thirdA, fourthA, firstA, secondA))
+            && secondLanePayloads.equals(List.of(thirdB, fourthB, firstB, secondB));
+    assertThat(forwardFirst || reverseFirst)
+        .as("both lanes should contain the same two internally ordered batch segments")
+        .isTrue();
+    assertThat(headId(firstLane)).isEqualTo(laneIds(firstLane).get(0));
+    assertThat(headId(secondLane)).isEqualTo(laneIds(secondLane).get(0));
+    assertQueueIntegrity();
   }
 
   @Test
@@ -671,13 +836,22 @@ class OpenLineageQueueDaoTest {
   }
 
   @Test
-  void sqlObjectAdmissionKeepsSeparateMetricIdentifiedLockAndInsertStatements() throws Exception {
+  void sqlObjectAdmissionsKeepSeparateMetricIdentifiedLockAndInsertStatements() throws Exception {
     Method acquire = OpenLineageQueueDao.class.getMethod("acquireOrderingKeyLock", UUID.class);
     Method insert =
         OpenLineageQueueDao.class.getMethod(
             "insertEventAndMaybeHeadAfterLock", UUID.class, String.class);
+    Method bulkAcquire =
+        OpenLineageQueueDao.class.getMethod("acquireOrderingKeyLocks", UUID[].class);
+    Method bulkInsert =
+        OpenLineageQueueDao.class.getMethod(
+            "insertEventsAndMaybeHeadsAfterLocks", UUID[].class, String[].class);
     String acquireSql = acquire.getAnnotation(SqlQuery.class).value().toLowerCase(Locale.ROOT);
     String insertSql = insert.getAnnotation(SqlQuery.class).value().toLowerCase(Locale.ROOT);
+    String bulkAcquireSql =
+        bulkAcquire.getAnnotation(SqlQuery.class).value().toLowerCase(Locale.ROOT);
+    String bulkInsertSql =
+        bulkInsert.getAnnotation(SqlQuery.class).value().toLowerCase(Locale.ROOT);
 
     assertThat(acquireSql)
         .contains("pg_advisory_xact_lock", "open_lineage_queue:")
@@ -690,6 +864,29 @@ class OpenLineageQueueDaoTest {
             "select id",
             "from inserted")
         .doesNotContain("pg_advisory_xact_lock");
+    assertThat(bulkAcquireSql)
+        .contains(
+            "ordered_lock_keys as materialized",
+            "select distinct",
+            "hashtextextended",
+            "order by lock_key",
+            "pg_advisory_xact_lock",
+            "select count(*)",
+            "from acquired")
+        .doesNotContain("insert into");
+    assertThat(bulkInsertSql)
+        .contains(
+            "insert into open_lineage_queue (ordering_key, event)",
+            "unnest(",
+            "with ordinality",
+            "order by requested.ordinality",
+            "offset 0",
+            "insert into open_lineage_queue_heads (ordering_key, event_id)",
+            "min(inserted.id)",
+            "group by inserted.ordering_key",
+            "select count(*)",
+            "from inserted")
+        .doesNotContain("pg_advisory_xact_lock", "jsonb");
   }
 
   @Test
@@ -1009,6 +1206,67 @@ class OpenLineageQueueDaoTest {
     }
   }
 
+  private static void assertConcurrentBulkEnqueueAfterFirstTransaction(boolean commit)
+      throws Exception {
+    UUID key = UUID.randomUUID();
+    List<PreparedEvent> batch =
+        List.of(new PreparedEvent(key, payloadJson(2)), new PreparedEvent(key, payloadJson(3)));
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    try (Handle firstHandle = jdbi.open();
+        Handle observer = jdbi.open()) {
+      firstHandle.begin();
+      OpenLineageQueueDao firstDao = firstHandle.attach(OpenLineageQueueDao.class);
+      firstDao.acquireOrderingKeyLock(key);
+      firstDao.insertEventAndMaybeHeadAfterLock(key, payloadJson(1));
+
+      AtomicInteger backendPid = new AtomicInteger();
+      CountDownLatch ready = new CountDownLatch(1);
+      Future<Integer> admitted =
+          executor.submit(
+              () -> {
+                try (Handle bulkHandle = jdbi.open()) {
+                  backendPid.set(
+                      bulkHandle.createQuery("SELECT pg_backend_pid()").mapTo(Integer.class).one());
+                  ready.countDown();
+                  return bulkHandle.attach(OpenLineageQueueDao.class).enqueueAll(batch);
+                }
+              });
+
+      assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue();
+      awaitAdvisoryLockWait(observer, backendPid.get());
+      assertThat(queueIds(observer)).isEmpty();
+
+      if (commit) {
+        firstHandle.commit();
+      } else {
+        firstHandle.rollback();
+      }
+      assertThat(admitted.get(5, TimeUnit.SECONDS)).isEqualTo(2);
+
+      assertThat(lanePayloads(observer, key))
+          .containsExactlyElementsOf(
+              commit
+                  ? List.of(payloadJson(1), payloadJson(2), payloadJson(3))
+                  : List.of(payloadJson(2), payloadJson(3)));
+      assertThat(headId(observer, key)).isEqualTo(laneIds(observer, key).get(0));
+      assertQueueIntegrity(observer);
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  private static int enqueueBulkAfterSignal(
+      List<PreparedEvent> batch, CountDownLatch ready, CountDownLatch start) throws Exception {
+    try (Handle handle = jdbi.open()) {
+      OpenLineageQueueDao transactional = handle.attach(OpenLineageQueueDao.class);
+      ready.countDown();
+      if (!start.await(5, TimeUnit.SECONDS)) {
+        throw new IllegalStateException("timed out waiting to start concurrent bulk enqueue");
+      }
+      return transactional.enqueueAll(batch);
+    }
+  }
+
   private static void awaitAdvisoryLockWait(Handle observer, int backendPid) {
     long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
     boolean waiting;
@@ -1258,6 +1516,30 @@ class OpenLineageQueueDaoTest {
 
   private static String eventJson(long id) {
     return jdbi.withHandle(handle -> eventJson(handle, id));
+  }
+
+  private static List<Long> laneIds(UUID orderingKey) {
+    return jdbi.withHandle(handle -> laneIds(handle, orderingKey));
+  }
+
+  private static List<Long> laneIds(Handle handle, UUID orderingKey) {
+    return handle
+        .createQuery("SELECT id FROM open_lineage_queue WHERE ordering_key = :key ORDER BY id")
+        .bind("key", orderingKey)
+        .mapTo(Long.class)
+        .list();
+  }
+
+  private static List<String> lanePayloads(UUID orderingKey) {
+    return jdbi.withHandle(handle -> lanePayloads(handle, orderingKey));
+  }
+
+  private static List<String> lanePayloads(Handle handle, UUID orderingKey) {
+    return handle
+        .createQuery("SELECT event FROM open_lineage_queue WHERE ordering_key = :key ORDER BY id")
+        .bind("key", orderingKey)
+        .mapTo(String.class)
+        .list();
   }
 
   private static void setDeadAt(long id, Instant deadAt) {
