@@ -402,6 +402,50 @@ JAVA_TOOL_OPTIONS=-DrunOpenLineageBatchThroughputBenchmark=true \
   --tests marquez.OpenLineageBatchThroughputBenchmark
 ```
 
+## Native bespoke stats-query profile
+
+The bounded `/api/v1/stats/query` path was measured on Java 17 and PostgreSQL 14 with 100,000
+lineage events, 5,000 jobs, 20,000 datasets, and 1,000 sources. Each case returned 732 fixed
+12-hour buckets across the maximum 366-day range. One warm-up preceded seven alternating-order
+measurements, and every result passed a SHA-256 stability checksum before its timing was printed.
+
+| Query shape | Median | Seven-run range |
+|---|---:|---:|
+| Lineage, global | 12.82 ms | 12.03–14.13 ms |
+| Lineage, hot namespace | 13.34 ms | 12.14–14.23 ms |
+| Lineage, rare job | 2.38 ms | 1.55–3.04 ms |
+| Lineage, rare run | 2.21 ms | 1.21–3.09 ms |
+| Jobs, global | 3.12 ms | 2.23–4.35 ms |
+| Jobs, hot namespace | 3.15 ms | 2.36–4.78 ms |
+| Datasets, global | 4.75 ms | 3.97–5.61 ms |
+| Datasets, hot namespace | 5.33 ms | 4.73–5.86 ms |
+| Sources, global | 2.47 ms | 1.83–2.77 ms |
+
+An independent deterministic verification runs every production SQL shape through `EXPLAIN
+(ANALYZE, BUFFERS)` and checks one bucket generator, one physical scan of the selected base
+relation with one loop, at most 1,000 output rows, and no temporary spill. It also compares every
+series to a Java oracle across exact boundaries, empty/cold scopes, a clipped one-bucket range,
+1,000 buckets, and 366 days. No schema, index, materialized-view, or ingestion write was added.
+
+For `B <= 1000` output buckets, `R` candidate lineage rows visited by the chosen bounded plan, and
+`N` retained rows visited in the selected stock relation, the implementation model is:
+
+```text
+flow query work   = O(R + B)
+stock query work  = O(N + B)
+aggregation state = O(B)
+SQL statements    = 1
+```
+
+These are warm-cache, single-client figures. They verify large headroom beneath the five-second
+statement timeout for this fixture, not production capacity or connection-pool behavior under
+concurrency. Run the opt-in benchmark explicitly:
+
+```text
+JAVA_TOOL_OPTIONS="-DrunStatsQueryBenchmark=true -Dapi.version=1.40" \
+  ./gradlew :api:test --tests marquez.db.StatsQueryBenchmark
+```
+
 ## Caveats
 
 - Latencies are warm-cache, single-client medians from one machine, not confidence intervals over

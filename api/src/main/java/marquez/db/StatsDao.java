@@ -5,17 +5,233 @@
 
 package marquez.db;
 
+import java.time.Instant;
 import java.util.List;
+import java.util.UUID;
 import marquez.db.mappers.IntervalMetricRowMapper;
 import marquez.db.mappers.LineageMetricRowMapper;
+import marquez.db.mappers.MetricPointRowMapper;
 import marquez.db.models.IntervalMetric;
 import marquez.db.models.LineageMetric;
+import marquez.db.models.MetricPoint;
 import org.jdbi.v3.sqlobject.config.RegisterRowMapper;
+import org.jdbi.v3.sqlobject.customizer.QueryTimeOut;
 import org.jdbi.v3.sqlobject.statement.SqlQuery;
 
 @RegisterRowMapper(LineageMetricRowMapper.class)
 @RegisterRowMapper(IntervalMetricRowMapper.class)
+@RegisterRowMapper(MetricPointRowMapper.class)
 public interface StatsDao extends BaseDao {
+
+  String SERIES_SQL =
+      """
+      WITH params AS (
+          SELECT CAST(:startAt AS TIMESTAMPTZ) AS start_at,
+                 CAST(:endAt AS TIMESTAMPTZ) AS end_at,
+                 CAST(:bucketMillis AS DOUBLE PRECISION)
+                     * INTERVAL '1 millisecond' AS bucket_width
+      ),
+      buckets AS (
+          SELECT generated.start_at,
+                 LEAST(generated.start_at + p.bucket_width, p.end_at) AS end_at
+          FROM params AS p
+          CROSS JOIN LATERAL generate_series(
+              p.start_at, p.end_at, p.bucket_width) AS generated(start_at)
+          WHERE generated.start_at < p.end_at
+      )
+      """;
+
+  String FLOW_SQL_PREFIX =
+      SERIES_SQL
+          + """
+            , bucket_counts AS (
+                SELECT date_bin(p.bucket_width, le.event_time, p.start_at) AS start_at,
+                       COUNT(*)::BIGINT AS value
+                FROM lineage_events AS le
+                CROSS JOIN params AS p
+                WHERE le.event_time >= p.start_at
+                  AND le.event_time < p.end_at
+                  AND le.event_type = :eventType
+            """;
+
+  String FLOW_SQL_SUFFIX =
+      """
+          GROUP BY date_bin(p.bucket_width, le.event_time, p.start_at)
+      )
+      SELECT b.start_at,
+             b.end_at,
+             COALESCE(c.value, 0)::BIGINT AS value
+      FROM buckets AS b
+      LEFT JOIN bucket_counts AS c ON c.start_at = b.start_at
+      ORDER BY b.start_at
+      """;
+
+  String QUERY_LINEAGE_EVENTS_GLOBAL_SQL = FLOW_SQL_PREFIX + FLOW_SQL_SUFFIX;
+
+  String QUERY_LINEAGE_EVENTS_NAMESPACE_SQL =
+      FLOW_SQL_PREFIX
+          + """
+              AND le.job_namespace = :namespace
+            """
+          + FLOW_SQL_SUFFIX;
+
+  String QUERY_LINEAGE_EVENTS_JOB_SQL =
+      FLOW_SQL_PREFIX
+          + """
+              AND le.job_namespace = :namespace
+              AND le.job_name = :jobName
+            """
+          + FLOW_SQL_SUFFIX;
+
+  String QUERY_LINEAGE_EVENTS_RUN_SQL =
+      FLOW_SQL_PREFIX
+          + """
+              AND le.run_uuid = :runId
+            """
+          + FLOW_SQL_SUFFIX;
+
+  String STOCK_SQL_SUFFIX =
+      """
+      , bucket_counts AS MATERIALIZED (
+          SELECT CASE
+                     WHEN o.observed_at < p.start_at THEN NULL::TIMESTAMPTZ
+                     ELSE date_bin(p.bucket_width, o.observed_at, p.start_at)
+                 END AS start_at,
+                 COUNT(*)::BIGINT AS value
+          FROM observations AS o
+          CROSS JOIN params AS p
+          GROUP BY CASE
+                       WHEN o.observed_at < p.start_at THEN NULL::TIMESTAMPTZ
+                       ELSE date_bin(p.bucket_width, o.observed_at, p.start_at)
+                   END
+      ),
+      baseline AS (
+          SELECT COALESCE(MAX(value), 0)::BIGINT AS value
+          FROM bucket_counts
+          WHERE start_at IS NULL
+      )
+      SELECT b.start_at,
+             b.end_at,
+             CAST(
+                 baseline.value
+                   + SUM(COALESCE(d.value, 0)) OVER (
+                       ORDER BY b.start_at
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                 AS BIGINT) AS value
+      FROM buckets AS b
+      CROSS JOIN baseline
+      LEFT JOIN bucket_counts AS d ON d.start_at = b.start_at
+      ORDER BY b.start_at
+      """;
+
+  String QUERY_JOBS_GLOBAL_SQL =
+      SERIES_SQL
+          + """
+            , observations AS NOT MATERIALIZED (
+                SELECT entity.created_at AS observed_at
+                FROM jobs AS entity
+                CROSS JOIN params AS p
+                WHERE entity.created_at < p.end_at
+            )
+            """
+          + STOCK_SQL_SUFFIX;
+
+  String QUERY_JOBS_NAMESPACE_SQL =
+      SERIES_SQL
+          + """
+            , observations AS NOT MATERIALIZED (
+                SELECT entity.created_at AS observed_at
+                FROM jobs AS entity
+                CROSS JOIN params AS p
+                WHERE entity.created_at < p.end_at
+                  AND entity.namespace_name = :namespace
+            )
+            """
+          + STOCK_SQL_SUFFIX;
+
+  String QUERY_DATASETS_GLOBAL_SQL =
+      SERIES_SQL
+          + """
+            , observations AS NOT MATERIALIZED (
+                SELECT entity.created_at AS observed_at
+                FROM datasets AS entity
+                CROSS JOIN params AS p
+                WHERE entity.created_at < p.end_at
+            )
+            """
+          + STOCK_SQL_SUFFIX;
+
+  String QUERY_DATASETS_NAMESPACE_SQL =
+      SERIES_SQL
+          + """
+            , observations AS NOT MATERIALIZED (
+                SELECT entity.created_at AS observed_at
+                FROM datasets AS entity
+                CROSS JOIN params AS p
+                WHERE entity.created_at < p.end_at
+                  AND entity.namespace_name = :namespace
+            )
+            """
+          + STOCK_SQL_SUFFIX;
+
+  String QUERY_SOURCES_GLOBAL_SQL =
+      SERIES_SQL
+          + """
+            , observations AS NOT MATERIALIZED (
+                SELECT entity.created_at AS observed_at
+                FROM sources AS entity
+                CROSS JOIN params AS p
+                WHERE entity.created_at < p.end_at
+            )
+            """
+          + STOCK_SQL_SUFFIX;
+
+  @SqlQuery(QUERY_LINEAGE_EVENTS_GLOBAL_SQL)
+  @QueryTimeOut(5)
+  List<MetricPoint> queryLineageEventsGlobal(
+      String eventType, Instant startAt, Instant endAt, long bucketMillis);
+
+  @SqlQuery(QUERY_LINEAGE_EVENTS_NAMESPACE_SQL)
+  @QueryTimeOut(5)
+  List<MetricPoint> queryLineageEventsForNamespace(
+      String eventType, String namespace, Instant startAt, Instant endAt, long bucketMillis);
+
+  @SqlQuery(QUERY_LINEAGE_EVENTS_JOB_SQL)
+  @QueryTimeOut(5)
+  List<MetricPoint> queryLineageEventsForJob(
+      String eventType,
+      String namespace,
+      String jobName,
+      Instant startAt,
+      Instant endAt,
+      long bucketMillis);
+
+  @SqlQuery(QUERY_LINEAGE_EVENTS_RUN_SQL)
+  @QueryTimeOut(5)
+  List<MetricPoint> queryLineageEventsForRun(
+      String eventType, UUID runId, Instant startAt, Instant endAt, long bucketMillis);
+
+  @SqlQuery(QUERY_JOBS_GLOBAL_SQL)
+  @QueryTimeOut(5)
+  List<MetricPoint> queryJobsGlobal(Instant startAt, Instant endAt, long bucketMillis);
+
+  @SqlQuery(QUERY_JOBS_NAMESPACE_SQL)
+  @QueryTimeOut(5)
+  List<MetricPoint> queryJobsForNamespace(
+      String namespace, Instant startAt, Instant endAt, long bucketMillis);
+
+  @SqlQuery(QUERY_DATASETS_GLOBAL_SQL)
+  @QueryTimeOut(5)
+  List<MetricPoint> queryDatasetsGlobal(Instant startAt, Instant endAt, long bucketMillis);
+
+  @SqlQuery(QUERY_DATASETS_NAMESPACE_SQL)
+  @QueryTimeOut(5)
+  List<MetricPoint> queryDatasetsForNamespace(
+      String namespace, Instant startAt, Instant endAt, long bucketMillis);
+
+  @SqlQuery(QUERY_SOURCES_GLOBAL_SQL)
+  @QueryTimeOut(5)
+  List<MetricPoint> querySourcesGlobal(Instant startAt, Instant endAt, long bucketMillis);
 
   @SqlQuery(
       """

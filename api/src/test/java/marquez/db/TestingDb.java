@@ -24,6 +24,7 @@ import marquez.db.models.IntervalMetric;
 import marquez.db.models.JobRow;
 import marquez.db.models.JobVersionRow;
 import marquez.db.models.LineageMetric;
+import marquez.db.models.MetricPoint;
 import marquez.db.models.NamespaceRow;
 import marquez.db.models.RunArgsRow;
 import marquez.db.models.RunRow;
@@ -280,5 +281,64 @@ final class TestingDb {
 
   List<IntervalMetric> lastWeekSourceMetrics(String timezone) {
     return delegate.onDemand(StatsDao.class).getLastWeekSources(timezone);
+  }
+
+  List<MetricPoint> queryLineageEventsGlobal(
+      String eventType, Instant startAt, Instant endAt, long bucketMillis) {
+    return delegate
+        .onDemand(StatsDao.class)
+        .queryLineageEventsGlobal(eventType, startAt, endAt, bucketMillis);
+  }
+
+  List<MetricPoint> queryLineageEventsForNamespace(
+      String eventType, String namespace, Instant startAt, Instant endAt, long bucketMillis) {
+    return delegate
+        .onDemand(StatsDao.class)
+        .queryLineageEventsForNamespace(eventType, namespace, startAt, endAt, bucketMillis);
+  }
+
+  List<MetricPoint> queryLineageEventsForJob(
+      String eventType,
+      String namespace,
+      String jobName,
+      Instant startAt,
+      Instant endAt,
+      long bucketMillis) {
+    return delegate
+        .onDemand(StatsDao.class)
+        .queryLineageEventsForJob(eventType, namespace, jobName, startAt, endAt, bucketMillis);
+  }
+
+  List<MetricPoint> queryLineageEventsForRun(
+      String eventType, UUID runId, Instant startAt, Instant endAt, long bucketMillis) {
+    return delegate
+        .onDemand(StatsDao.class)
+        .queryLineageEventsForRun(eventType, runId, startAt, endAt, bucketMillis);
+  }
+
+  List<MetricPoint> queryJobsGlobal(Instant startAt, Instant endAt, long bucketMillis) {
+    return delegate.onDemand(StatsDao.class).queryJobsGlobal(startAt, endAt, bucketMillis);
+  }
+
+  List<MetricPoint> queryJobsForNamespace(
+      String namespace, Instant startAt, Instant endAt, long bucketMillis) {
+    return delegate
+        .onDemand(StatsDao.class)
+        .queryJobsForNamespace(namespace, startAt, endAt, bucketMillis);
+  }
+
+  List<MetricPoint> queryDatasetsGlobal(Instant startAt, Instant endAt, long bucketMillis) {
+    return delegate.onDemand(StatsDao.class).queryDatasetsGlobal(startAt, endAt, bucketMillis);
+  }
+
+  List<MetricPoint> queryDatasetsForNamespace(
+      String namespace, Instant startAt, Instant endAt, long bucketMillis) {
+    return delegate
+        .onDemand(StatsDao.class)
+        .queryDatasetsForNamespace(namespace, startAt, endAt, bucketMillis);
+  }
+
+  List<MetricPoint> querySourcesGlobal(Instant startAt, Instant endAt, long bucketMillis) {
+    return delegate.onDemand(StatsDao.class).querySourcesGlobal(startAt, endAt, bucketMillis);
   }
 }

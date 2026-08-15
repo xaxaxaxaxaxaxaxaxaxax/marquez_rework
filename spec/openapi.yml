@@ -741,6 +741,115 @@ paths:
               schema:
                 $ref: '#/components/schemas/TagList'
 
+  /stats/query:
+    get:
+      operationId: queryStats
+      summary: Query a native metric time series
+      description: >-
+        Returns one bounded, dense metric series in ascending interval order. Intervals use
+        half-open `[startAt, endAt)` semantics and fixed elapsed-time rollups anchored at
+        `startAt`; the final interval is clipped to `endAt`. `endAt` defaults to the current server
+        time, `startAt` defaults to 24 hours before `endAt`, `scope` defaults to `GLOBAL`, and
+        `rollup` defaults to `PT1H`. Rollups must be ISO-8601 durations between `PT1M` and `P30D`.
+        Durations must have whole-millisecond precision, and timestamps must have whole-microsecond
+        precision. The requested range must not exceed 366 elapsed days or 1000 buckets. `GLOBAL`
+        accepts no selector, `NAMESPACE` requires `namespace`,
+        `JOB` requires `namespace` and `jobName`, and `RUN` requires `runId`; selectors not used by
+        the selected scope are rejected. Lineage-event metrics support every scope, job and dataset
+        totals support `GLOBAL` and `NAMESPACE`, and source totals support only `GLOBAL`.
+        Lineage-event buckets use the producer-reported `event_time`; `NAMESPACE` and `JOB` match
+        exact, case-sensitive reported identities, while `RUN` matches the stored `run_uuid`. Only
+        committed raw events are visible; queue admission alone does not count. Duplicate submissions
+        count independently, late arrivals can revise earlier buckets, and retention can make old
+        ranges indistinguishable from zero. Each
+        asset-total bucket is a cumulative count of currently retained physical rows with
+        `created_at < bucket end`, including hidden, deleted, or symlink rows; deletion and
+        visibility history is not reconstructed. Buckets have no timezone or calendar-day
+        semantics.
+      tags:
+        - Stats
+      parameters:
+        - name: metric
+          in: query
+          description: The native metric to query.
+          required: true
+          schema:
+            $ref: '#/components/schemas/StatsMetric'
+        - name: scope
+          in: query
+          description: The exact scope in which to evaluate the metric.
+          required: false
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/StatsScope'
+            default: GLOBAL
+        - name: namespace
+          in: query
+          description: The exact namespace for `NAMESPACE` or `JOB` scope.
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 1024
+        - name: jobName
+          in: query
+          description: The exact job name for `JOB` scope.
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 1024
+        - name: runId
+          in: query
+          description: The stored Marquez run ID for `RUN` scope.
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - name: startAt
+          in: query
+          description: Inclusive range start. Defaults to 24 hours before the effective `endAt`.
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: endAt
+          in: query
+          description: Exclusive range end. Defaults to the current server time.
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: rollup
+          in: query
+          description: >-
+            Fixed elapsed-time ISO-8601 duration between `PT1M` and `P30D`, inclusive. Values are
+            canonicalized in the response.
+          required: false
+          schema:
+            type: string
+            default: PT1H
+            example: PT15M
+      responses:
+        '200':
+          description: A canonical, bounded metric series.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatsQueryResult'
+        '400':
+          description: Invalid metric, scope, selector, timestamp, rollup, range, or bucket count.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatsError'
+        '500':
+          description: The metric query failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatsError'
+
   /search:
     get:
       operationId: search
@@ -996,6 +1105,105 @@ components:
           - job
 
   schemas:
+    StatsMetric:
+      type: string
+      enum:
+        - LINEAGE_EVENTS_START
+        - LINEAGE_EVENTS_COMPLETE
+        - LINEAGE_EVENTS_FAIL
+        - LINEAGE_EVENTS_ABORT
+        - JOBS_TOTAL
+        - DATASETS_TOTAL
+        - SOURCES_TOTAL
+
+    StatsScope:
+      type: string
+      enum:
+        - GLOBAL
+        - NAMESPACE
+        - JOB
+        - RUN
+
+    StatsPoint:
+      type: object
+      required:
+        - startInterval
+        - endInterval
+        - value
+      properties:
+        startInterval:
+          description: Inclusive start of this interval.
+          type: string
+          format: date-time
+        endInterval:
+          description: Exclusive end of this interval.
+          type: string
+          format: date-time
+        value:
+          description: The metric value for this interval.
+          type: integer
+          format: int64
+          minimum: 0
+
+    StatsQueryResult:
+      type: object
+      required:
+        - metric
+        - scope
+        - startAt
+        - endAt
+        - rollup
+        - points
+      properties:
+        metric:
+          $ref: '#/components/schemas/StatsMetric'
+        scope:
+          $ref: '#/components/schemas/StatsScope'
+        namespace:
+          description: The namespace selector when the effective scope uses one.
+          type: string
+          minLength: 1
+          maxLength: 1024
+        jobName:
+          description: The job selector when the effective scope is `JOB`.
+          type: string
+          minLength: 1
+          maxLength: 1024
+        runId:
+          description: The run selector when the effective scope is `RUN`.
+          type: string
+          format: uuid
+        startAt:
+          description: Inclusive effective range start, normalized to UTC.
+          type: string
+          format: date-time
+        endAt:
+          description: Exclusive effective range end, normalized to UTC.
+          type: string
+          format: date-time
+        rollup:
+          description: Canonical fixed elapsed-time ISO-8601 duration.
+          type: string
+          example: PT1H
+        points:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items:
+            $ref: '#/components/schemas/StatsPoint'
+
+    StatsError:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: integer
+          format: int32
+        message:
+          type: string
+
     CreatedNamespace:
       type: object
       properties:

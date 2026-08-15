@@ -153,6 +153,9 @@ public final class Columns {
   public static final String FAIL = "fail";
   public static final String ABORT = "abort";
   public static final String COUNT = "count";
+  public static final String START_AT = "start_at";
+  public static final String END_AT = "end_at";
+  public static final String VALUE = "value";
 
   public static UUID uuidOrNull(final ResultSet results, final String column) throws SQLException {
     if (results.getObject(column) == null) {
@@ -212,6 +215,11 @@ public final class Columns {
   public static int intOrThrow(final ResultSet results, final String column) throws SQLException {
     checkNotNull(results, column);
     return results.getInt(column);
+  }
+
+  public static long longOrThrow(final ResultSet results, final String column) throws SQLException {
+    checkNotNull(results, column);
+    return results.getLong(column);
   }
 
   public static PGInterval pgIntervalOrThrow(final ResultSet results, final String column)
