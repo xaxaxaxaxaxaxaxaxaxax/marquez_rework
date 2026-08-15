@@ -47,8 +47,12 @@ public final class OpenLineageIntake {
   }
 
   /**
-   * Atomically enqueues an ordered batch already validated and serialized by durable admission.
-   * Returns the admitted count after the batch commits. Waking the worker remains a best-effort
+   * Atomically enqueues an ordered batch already validated and serialized by durable admission. The
+   * queue retains this call's membership under one internal nullable BIGINT admission ID; the
+   * unchanged singleton path uses NULL. Existing durable queue IDs carry input order without a
+   * separate admission ordinal. Workers may consume only currently ready members in one or more
+   * bounded subsets, so this admission boundary is not a whole-batch projection barrier. Returns
+   * the admitted count after the batch commits. Waking the worker remains a best-effort
    * optimization because polling and restart recovery make every committed event visible.
    */
   public int enqueueAll(@NonNull final List<PreparedEvent> events) {

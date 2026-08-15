@@ -20,20 +20,23 @@ The durable intake worker publishes Codahale metrics under
 |---------------|------|-------------|
 | `running`, `coordinator_alive` | _gauge_ | Local coordinator run-loop state and thread liveness. A fatal coordinator error sets both to zero while durable HTTP admission remains available. |
 | `processor_capacity`, `available_processor_capacity` | _gauge_ | Configured processor slots and slots not currently assigned a drain task. |
-| `in_flight` | _counter_ | Processor drain tasks currently running. A task can process several events sequentially, with one transaction and one locked head at a time. |
-| `selected`, `succeeded`, `retried`, `dead_lettered` | _meter_ | `selected` is marked after a due head is locked. The other meters are marked only after the corresponding success, retry, or dead-letter transaction commits. |
+| `in_flight` | _counter_ | Processor drain tasks currently running. Each task owns at most one bounded claim transaction at a time. |
+| `claim_size` | _histogram_ | Events returned by each nonempty database claim. The configured projection batch size bounds the total, including an optional same-lane follower. Same-transaction fallback does not record another claim. |
+| `selected`, `succeeded`, `retried`, `dead_lettered` | _meter_ | `selected` is marked for each event after a claim locks its work. The other meters are marked per event only after the corresponding projection, retry, or dead-letter transaction commits. |
+| `batch_fallback` | _meter_ | Multi-event fast paths rolled back after a caught projection failure and replayed per event under savepoints in the same claim transaction. A completed fallback is healthy forward progress, not a worker-health failure. |
 | `poll_failed`, `task_failed`, `coordinator_failed`, `state_transition_failed`, `post_commit_failed` | _meter_ | Failures requiring operator attention. `task_failed` means a fatal processor-task error escaped. If a row was selected, its transaction may have rolled back, or its commit result may be indeterminate if the database connection failed while returning it. `coordinator_failed` records a fatal local run-loop failure; the worker deliberately does not restart itself. `post_commit_failed` counts failed best-effort search-index or run-transition-listener callbacks after queue acknowledgement; these side effects have no durable delivery guarantee, may be missing, concurrent, or out of order, and are not retried by the intake queue. A fatal post-commit callback increments both `post_commit_failed` and `task_failed`. |
 | `forced_shutdown`, `shutdown_incomplete` | _meter_ | `forced_shutdown` counts escalation from graceful drain to task interruption and synchronous JDBC connection abort. `shutdown_incomplete` counts a stop that returns after its two deadline-bounded executor waits with a coordinator or processor thread, registered connection, or connection-abort failure still present. Synchronous driver abort between the waits has no application-enforced deadline. |
-| `poll_empty` | _counter_ | Polls for which no due, unlocked head was selected. |
-| `poll_duration`, `processing_duration`, `post_commit_duration` | _timer_ | Head-selection query latency, processing work while the head is locked (ending before the outer commit), and best-effort post-commit publishing latency. |
+| `poll_empty` | _counter_ | Claim attempts for which no eligible due, unlocked work was selected. |
+| `poll_duration`, `processing_duration`, `post_commit_duration` | _timer_ | Claim-selection query latency, processing work for one claim while it is locked (ending before the outer commit), and best-effort post-commit publishing latency for one committed claim. |
 
 These are Codahale metric names without labels. Do not treat the suffixes as a labeled Prometheus
 family. The exporter normalizes each registered name and adds its type-specific suffixes.
-`selected` can exceed `succeeded + retried + dead_lettered`: cancellation, a confirmed
-whole-transaction rollback, or process loss can occur after selection without an exported committed
-outcome. A connection failure while returning a commit result is indeterminate: projection and queue
-acknowledgement may already be committed even though no success meter was published. A process can
-also disappear before exporting the corresponding failure.
+`selected` can exceed `succeeded + retried + dead_lettered`: a retry can leave a claimed same-lane
+follower unprocessed, and cancellation, a confirmed whole-transaction rollback, or process loss can
+occur after selection without an exported committed outcome. A connection failure while returning a
+commit result is indeterminate: projection and queue acknowledgement may already be committed even
+though no success meter was published. A process can also disappear before exporting the
+corresponding failure.
 
 These worker metrics are per application instance; use a sum for event rates and failures, but
 inspect lifecycle and capacity gauges per instance.
@@ -41,9 +44,10 @@ inspect lifecycle and capacity gauges per instance.
 The Dropwizard health check named `open-lineage-worker` is healthy only after the worker starts and
 while its coordinator is live and draining is enabled, no fatal task or coordinator failure has
 occurred, and queue polling has not failed three consecutive times. A successful poll clears the
-persistent-poll condition; a caught projection failure that commits retry or dead-letter state is a
-healthy worker outcome. Shutdown makes the check unhealthy. Durable HTTP admission can still
-succeed while this check is unhealthy, so alert on it before backlog age grows.
+persistent-poll condition. A completed batch fallback and a caught singleton projection failure
+that commits retry or dead-letter state are healthy worker outcomes. Shutdown makes the check
+unhealthy. Durable HTTP admission can still succeed while this check is unhealthy, so alert on it
+before backlog age grows.
 
 Database backlog and storage observations are intentionally not collected during application
 requests or Prometheus scrapes. Run the following PostgreSQL queries at low frequency, preferably
@@ -126,12 +130,24 @@ omits `available_at` from its update and sets `refresh_due_on_advance`; the next
 promotion refreshes `available_at` to millisecond-floored database time and clears the bit. Retry
 also refreshes the clock and clears the bit. Acknowledgement and dead-letter advancement use the
 same alternation. The clock is therefore refreshed no later than every second successful
-promotion; this is a write quantum, not a guarantee that another lane runs between promotions.
+promotion; this is a write quantum, not a guarantee that another lane runs between promotions. A
+q2-aware batch slice may include at most one immediate same-lane follower after its head while
+preserving lane FIFO. That follower consumes one of the configured projection-batch slots, so this
+optimization cannot make a claim exceed its configured bound.
 
-Each poll requests one head (`B = 1`) with `FOR UPDATE SKIP LOCKED`. If `L` earlier due heads are
-locked by other transactions, the live-candidate scan is `O(B + L)`, or `O(1 + L)`. With `W`
-processors holding at most one head each, `L <= W - 1`. Dead or invisible index entries add
-physical work beyond this live-row bound, so compare low-frequency deltas from the due index:
+`POST /api/v1/lineage/batch` assigns its queued rows one nullable, database-generated `BIGINT`
+admission ID. A multi-event claim contains eligible work from only one such admission. Rows from
+the singular endpoint, legacy queue rows, and pre-migration rows have a NULL admission ID and
+remain singleton claims. Admission IDs are internal grouping data and must not be used as metric
+labels.
+
+Let `B` be `openLineage.projectionBatchSize` (default 8, valid range 1-64), including any optional
+same-lane follower. Each claim requests at most `B` events using due heads locked with `FOR UPDATE
+SKIP LOCKED`; it does not wait for a batch to fill. If `L` earlier eligible due heads are locked by
+other transactions, the live-candidate scan is `O(B + L)`. With `W` processors holding at most `B`
+events each, a conservative live-head bound is `L <= B * (W - 1)`. Dead, invisible, or
+admission-ineligible index entries add physical work beyond this live-row bound, so compare
+low-frequency deltas from the due index:
 
 ```sql
 SELECT indexrelname,
@@ -196,14 +212,27 @@ waiting; `pg_stat_activity`, `pg_blocking_pids`, and transaction age are the aut
 operational signals. Reading other sessions' full query text may require `pg_read_all_stats` or
 equivalent privileges.
 
-Selection, relational projection, and acknowledgement or failure transition share one
-READ COMMITTED transaction and one locked head. A caught projection failure rolls back to its
-savepoint, then commits a retry or dead letter and increments the persisted caught-failure count
-once. A confirmed whole transaction rollback, including connection loss before commit or a database
-crash that aborts the transaction, consumes no `maxAttempts` attempt and makes the unchanged head
-eligible again after PostgreSQL releases it. If the connection fails while returning the commit
-result, the outcome is indeterminate: projection and acknowledgement may already be committed, and
+Selection, relational projection, and acknowledgement share one READ COMMITTED transaction for a
+bounded claim. A successful multi-event transaction publishes its per-event side effects only after
+the entire claim commits. If a caught projection failure invalidates the multi-event fast path, the
+claim rolls back to its batch savepoint and the worker records `batch_fallback` before replaying the
+locked rows per event under savepoints in the same transaction. The fallback path rolls a caught
+event failure back to its savepoint, then commits a retry or dead letter and increments the persisted
+caught-failure count once. Speculative batch work therefore consumes no attempt before fallback
+failure handling commits.
+
+A confirmed whole-transaction rollback, including connection loss before commit or a database crash
+that aborts the transaction, consumes no `maxAttempts` attempt and makes unchanged work eligible
+again after PostgreSQL releases its locks. If the connection fails while returning a commit result,
+the outcome is indeterminate: projection and acknowledgements may already have committed, and
 operators must inspect durable state rather than infer replay eligibility from `task_failed`.
+
+Each active processor still pins one JDBC connection, but it can hold queue and metadata locks for
+up to `B` events. The per-replica event and lock footprint is therefore bounded by approximately
+`workerThreads * B`, while database-connection concurrency remains `workerThreads`. At the defaults,
+that is eight worker connections and at most 64 events in active claim transactions. Larger values
+can increase transaction age, rollback work, memory use, admission contention, and the burst of
+best-effort post-commit callbacks.
 
 Live queued events are never deleted by age. When `dbRetention` is configured, each completed
 retention invocation that reaches the dead-letter phase removes at most one

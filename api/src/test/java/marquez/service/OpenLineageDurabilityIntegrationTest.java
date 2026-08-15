@@ -219,12 +219,144 @@ class OpenLineageDurabilityIntegrationTest {
   }
 
   @Test
+  void q2AwareProjectionBatchStaysWithinOneAdmission() {
+    UUID runX = UUID.randomUUID();
+    UUID runY = UUID.randomUUID();
+    UUID runZ = UUID.randomUUID();
+    UUID otherAdmissionRun = UUID.randomUUID();
+    LineageEvent x1 = runEvent(runX, "START", EVENT_TIME, "q2-batch-x");
+    LineageEvent x2 = runEvent(runX, "OTHER", EVENT_TIME.plusSeconds(1), "q2-batch-x");
+    LineageEvent x3 = runEvent(runX, "COMPLETE", EVENT_TIME.plusSeconds(2), "q2-batch-x");
+    LineageEvent y1 = runEvent(runY, "START", EVENT_TIME, "q2-batch-y");
+    LineageEvent y2 = runEvent(runY, "COMPLETE", EVENT_TIME.plusSeconds(1), "q2-batch-y");
+    LineageEvent z1 = runEvent(runZ, "START", EVENT_TIME, "q2-batch-z");
+    LineageEvent other = runEvent(otherAdmissionRun, "START", EVENT_TIME, "q2-other-admission");
+
+    assertThat(
+            queueDao.enqueueAll(
+                List.of(x1, x2, x3, y1, y2, z1).stream()
+                    .map(OpenLineageQueueDao::prepare)
+                    .toList()))
+        .isEqualTo(6);
+    List<Long> firstAdmissionIds = liveEventIds();
+    assertThat(queueDao.enqueueAll(List.of(OpenLineageQueueDao.prepare(other)))).isEqualTo(1);
+    long otherAdmissionId = liveEventIds().get(6);
+
+    UUID keyX = OpenLineageQueueDao.orderingKeyFor(x1);
+    UUID keyY = OpenLineageQueueDao.orderingKeyFor(y1);
+    UUID keyZ = OpenLineageQueueDao.orderingKeyFor(z1);
+    UUID otherKey = OpenLineageQueueDao.orderingKeyFor(other);
+    Instant firstDue = Instant.parse("2000-01-01T00:00:00Z");
+    setScheduleAt(keyX, firstDue);
+    setScheduleAt(keyY, firstDue);
+    setScheduleAt(keyZ, firstDue);
+    setScheduleAt(otherKey, Instant.parse("2001-01-01T00:00:00Z"));
+    setRefreshDueOnAdvance(keyY, true);
+
+    List<OpenLineageQueueRow> claimed = processNextBatchSuccess(newService(), 8);
+
+    assertThat(claimed)
+        .extracting(OpenLineageQueueRow::id)
+        .containsExactly(
+            firstAdmissionIds.get(0),
+            firstAdmissionIds.get(1),
+            firstAdmissionIds.get(3),
+            firstAdmissionIds.get(5));
+    assertThat(claimed).allSatisfy(row -> assertThat(row.attemptCount()).isEqualTo(1));
+    assertThat(claimed)
+        .extracting(OpenLineageQueueRow::admissionId)
+        .doesNotContainNull()
+        .containsOnly(claimed.get(0).admissionId());
+    assertThat(claimed)
+        .extracting(OpenLineageQueueRow::id)
+        .doesNotContain(firstAdmissionIds.get(2), firstAdmissionIds.get(4), otherAdmissionId);
+
+    assertThat(rawEventTypes(runX)).containsExactly("START", "OTHER");
+    assertThat(rawEventTypes(runY)).containsExactly("START");
+    assertThat(rawEventTypes(runZ)).containsExactly("START");
+    assertThat(rawEventCount(otherAdmissionRun)).isZero();
+    assertThat(liveEventIds())
+        .containsExactly(firstAdmissionIds.get(2), firstAdmissionIds.get(4), otherAdmissionId);
+    assertThat(queueSchedule(keyX).eventId()).isEqualTo(firstAdmissionIds.get(2));
+    assertThat(queueSchedule(keyX).refreshDueOnAdvance()).isFalse();
+    assertThat(queueSchedule(keyY).eventId()).isEqualTo(firstAdmissionIds.get(4));
+    assertThat(queueSchedule(keyY).refreshDueOnAdvance()).isFalse();
+    assertThat(head(otherKey)).isEqualTo(new HeadState(otherAdmissionId, 0, null));
+    assertThat(headCount()).isEqualTo(3);
+    assertThat(deadLetterCount()).isZero();
+  }
+
+  @Test
+  void failedProjectionBatchRollsBackItsAdmissionAndLeavesAnotherAdmissionIndependent() {
+    UUID goodRun = UUID.randomUUID();
+    UUID failingRun = UUID.randomUUID();
+    UUID independentRun = UUID.randomUUID();
+    LineageEvent good = runEvent(goodRun, "START", EVENT_TIME, "batch-rollback-good");
+    LineageEvent failing =
+        runEvent(failingRun, "START", EVENT_TIME.plusSeconds(1), "batch-rollback-failing");
+    LineageEvent independent =
+        runEvent(independentRun, "START", EVENT_TIME, "batch-rollback-independent");
+    UUID goodKey = OpenLineageQueueDao.orderingKeyFor(good);
+    UUID failingKey = OpenLineageQueueDao.orderingKeyFor(failing);
+    UUID independentKey = OpenLineageQueueDao.orderingKeyFor(independent);
+
+    assertThat(
+            queueDao.enqueueAll(
+                List.of(good, failing).stream().map(OpenLineageQueueDao::prepare).toList()))
+        .isEqualTo(2);
+    List<Long> failedAdmissionIds = liveEventIds();
+    assertThat(queueDao.enqueueAll(List.of(OpenLineageQueueDao.prepare(independent)))).isEqualTo(1);
+    long independentId = liveEventIds().get(2);
+    setScheduleAt(goodKey, Instant.parse("2000-01-01T00:00:00Z"));
+    setScheduleAt(failingKey, Instant.parse("2000-01-01T00:00:00Z"));
+    setScheduleAt(independentKey, Instant.parse("2001-01-01T00:00:00Z"));
+    OpenLineageService failingService =
+        new FailAfterProjectionService(
+            baseDao(), runService(), failingRun, "START", "batch projection failure");
+
+    assertThatThrownBy(() -> processNextBatchSuccess(failingService, 8))
+        .isInstanceOf(RuntimeException.class)
+        .hasMessage("batch projection failure");
+
+    assertThat(liveEventIds())
+        .containsExactly(failedAdmissionIds.get(0), failedAdmissionIds.get(1), independentId);
+    assertThat(head(goodKey)).isEqualTo(new HeadState(failedAdmissionIds.get(0), 0, null));
+    assertThat(head(failingKey)).isEqualTo(new HeadState(failedAdmissionIds.get(1), 0, null));
+    assertThat(head(independentKey)).isEqualTo(new HeadState(independentId, 0, null));
+    assertThat(rawEventCount(goodRun)).isZero();
+    assertThat(rawEventCount(failingRun)).isZero();
+    assertThat(rawEventCount(independentRun)).isZero();
+    assertThat(deadLetterCount()).isZero();
+
+    setScheduleAt(goodKey, Instant.parse("2100-01-01T00:00:00Z"));
+    setScheduleAt(failingKey, Instant.parse("2100-01-01T00:00:00Z"));
+    setScheduleAt(independentKey, Instant.parse("2000-01-01T00:00:00Z"));
+    TransactionResult projected = processNext(newService(), 3, 0);
+    assertThat(projected.outcome()).isEqualTo(TransactionOutcome.SUCCESS);
+    assertThat(projected.row().id()).isEqualTo(independentId);
+    assertThat(rawEventCount(independentRun)).isEqualTo(1);
+    assertThat(rawEventCount(goodRun)).isZero();
+    assertThat(rawEventCount(failingRun)).isZero();
+    assertThat(liveEventIds())
+        .containsExactly(failedAdmissionIds.get(0), failedAdmissionIds.get(1));
+  }
+
+  @Test
   void backendTerminationAfterProjectionRollsBackWithoutCountingAttempt() throws Exception {
-    UUID runId = UUID.randomUUID();
-    LineageEvent event = runEvent(runId, "START", EVENT_TIME, "terminated-projection-job");
-    UUID queueKey = OpenLineageQueueDao.orderingKeyFor(event);
-    String eventJson = Utils.toJson(event);
-    long eventId = queueDao.enqueue(event);
+    UUID firstRunId = UUID.randomUUID();
+    UUID secondRunId = UUID.randomUUID();
+    LineageEvent first = runEvent(firstRunId, "START", EVENT_TIME, "terminated-projection-job-a");
+    LineageEvent second =
+        runEvent(secondRunId, "START", EVENT_TIME.plusSeconds(1), "terminated-projection-job-b");
+    UUID firstQueueKey = OpenLineageQueueDao.orderingKeyFor(first);
+    UUID secondQueueKey = OpenLineageQueueDao.orderingKeyFor(second);
+    String firstEventJson = Utils.toJson(first);
+    String secondEventJson = Utils.toJson(second);
+    assertThat(
+            queueDao.enqueueAll(
+                List.of(first, second).stream().map(OpenLineageQueueDao::prepare).toList()))
+        .isEqualTo(2);
+    List<Long> eventIds = liveEventIds();
 
     long advisoryKey = 0x4f4c5f54584eL;
     CountDownLatch projected = new CountDownLatch(1);
@@ -233,7 +365,7 @@ class OpenLineageDurabilityIntegrationTest {
         new AdvisoryBlockedAfterProjectionService(
             baseDao(), runService(), projected, processingPid, advisoryKey);
     ExecutorService processingThread = Executors.newSingleThreadExecutor();
-    CompletableFuture<TransactionResult> result;
+    CompletableFuture<List<OpenLineageQueueRow>> result;
     try (Handle blocker = jdbi.open()) {
       int blockerPid = blocker.createQuery("SELECT pg_backend_pid()").mapTo(Integer.class).one();
       blocker
@@ -242,7 +374,9 @@ class OpenLineageDurabilityIntegrationTest {
           .map((resultSet, context) -> true)
           .one();
 
-      result = CompletableFuture.supplyAsync(() -> processNext(service, 3, 0), processingThread);
+      result =
+          CompletableFuture.supplyAsync(
+              () -> processNextBatchSuccess(service, 8), processingThread);
       awaitLatch(projected, "projection before backend termination");
       awaitBlockedBy(processingPid.get(), blockerPid);
       boolean terminated =
@@ -261,21 +395,26 @@ class OpenLineageDurabilityIntegrationTest {
       assertThat(processingThread.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
     }
 
-    assertThat(liveEventIds()).containsExactly(eventId);
-    assertThat(queuedEventJson(queueKey, eventId)).isEqualTo(eventJson);
-    assertThat(head(queueKey)).isEqualTo(new HeadState(eventId, 0, null));
-    assertThat(headClock(queueKey).scheduleDue()).isTrue();
-    assertThat(rawEventCount(runId)).isZero();
-    assertThat(runCount(runId)).isZero();
+    assertThat(liveEventIds()).containsExactlyElementsOf(eventIds);
+    assertThat(queuedEventJson(firstQueueKey, eventIds.get(0))).isEqualTo(firstEventJson);
+    assertThat(queuedEventJson(secondQueueKey, eventIds.get(1))).isEqualTo(secondEventJson);
+    assertThat(head(firstQueueKey)).isEqualTo(new HeadState(eventIds.get(0), 0, null));
+    assertThat(head(secondQueueKey)).isEqualTo(new HeadState(eventIds.get(1), 0, null));
+    assertThat(headClock(firstQueueKey).scheduleDue()).isTrue();
+    assertThat(headClock(secondQueueKey).scheduleDue()).isTrue();
+    assertThat(rawEventCount(firstRunId)).isZero();
+    assertThat(rawEventCount(secondRunId)).isZero();
+    assertThat(runCount(firstRunId)).isZero();
+    assertThat(runCount(secondRunId)).isZero();
     assertThat(deadLetterCount()).isZero();
 
-    TransactionResult recovered = processNext(newService(), 3, 0);
-    assertThat(recovered.outcome()).isEqualTo(TransactionOutcome.SUCCESS);
-    assertThat(recovered.row().id()).isEqualTo(eventId);
-    assertThat(recovered.row().attemptCount()).isEqualTo(1);
+    List<OpenLineageQueueRow> recovered = processNextBatchSuccess(newService(), 8);
+    assertThat(recovered).extracting(OpenLineageQueueRow::id).containsExactlyElementsOf(eventIds);
+    assertThat(recovered).allSatisfy(row -> assertThat(row.attemptCount()).isEqualTo(1));
     assertThat(liveEventIds()).isEmpty();
     assertThat(headCount()).isZero();
-    assertThat(rawEventCount(runId)).isEqualTo(1);
+    assertThat(rawEventCount(firstRunId)).isEqualTo(1);
+    assertThat(rawEventCount(secondRunId)).isEqualTo(1);
   }
 
   @Test
@@ -1341,6 +1480,37 @@ class OpenLineageDurabilityIntegrationTest {
         });
   }
 
+  private List<OpenLineageQueueRow> processNextBatchSuccess(
+      OpenLineageService service, int maxEvents) {
+    return jdbi.inTransaction(
+        TransactionIsolationLevel.READ_COMMITTED,
+        handle -> {
+          OpenLineageQueueDao transactionalQueue = handle.attach(OpenLineageQueueDao.class);
+          List<OpenLineageQueueRow> rows = transactionalQueue.lockNextDueBatch(maxEvents);
+          if (rows.isEmpty()) {
+            return List.of();
+          }
+
+          List<OpenLineageService.QueuedEvent> queuedEvents = new ArrayList<>(rows.size());
+          for (OpenLineageQueueRow row : rows) {
+            try {
+              queuedEvents.add(
+                  new OpenLineageService.QueuedEvent(
+                      row.id(),
+                      Utils.getMapper().readValue(row.eventJson(), BaseEvent.class),
+                      row.eventJson()));
+            } catch (IOException failure) {
+              throw new IllegalArgumentException(
+                  "test queue payload could not be deserialized", failure);
+            }
+          }
+          service.processQueuedBatchInTransaction(
+              queuedEvents, handle.attach(OpenLineageDao.class));
+          transactionalQueue.ackLockedAll(rows);
+          return List.copyOf(rows);
+        });
+  }
+
   private static Savepoint projectionSavepoint(Connection connection) {
     try {
       return connection.setSavepoint("open_lineage_projection");
@@ -2230,6 +2400,21 @@ class OpenLineageDurabilityIntegrationTest {
                             + "SET available_at = :availableAt "
                             + "WHERE ordering_key = :orderingKey")
                     .bind("availableAt", Timestamp.from(availableAt))
+                    .bind("orderingKey", orderingKey)
+                    .execute());
+    assertThat(updated).isEqualTo(1);
+  }
+
+  private void setRefreshDueOnAdvance(UUID orderingKey, boolean refreshDueOnAdvance) {
+    int updated =
+        jdbi.withHandle(
+            handle ->
+                handle
+                    .createUpdate(
+                        "UPDATE open_lineage_queue_heads "
+                            + "SET refresh_due_on_advance = :refreshDueOnAdvance "
+                            + "WHERE ordering_key = :orderingKey")
+                    .bind("refreshDueOnAdvance", refreshDueOnAdvance)
                     .bind("orderingKey", orderingKey)
                     .execute());
     assertThat(updated).isEqualTo(1);

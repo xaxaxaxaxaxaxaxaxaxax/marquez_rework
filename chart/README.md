@@ -78,6 +78,7 @@ helm delete marquez
 | `marquez.port`               | API host port                                                                 | `5000`                   |
 | `marquez.adminPort`          | Heath/Liveness host port                                                      | `5001`                   |
 | `marquez.openLineage.workerThreads` | Concurrent OpenLineage event processors per Marquez replica            | `8`                      |
+| `marquez.openLineage.projectionBatchSize` | Maximum events from one durable batch admission projected per transaction; valid range 1-64, with 1 selecting singleton projection | `8` |
 | `marquez.openLineage.pollIntervalMillis` | Delay between database polls when no due work is found              | `1000`                   |
 | `marquez.openLineage.maxAttempts` | Maximum committed caught-failure count; the failure reaching it is dead-lettered | `10`              |
 | `marquez.openLineage.retryInitialDelayMillis` | Initial retry-backoff bound for processing failures             | `1000`                   |
@@ -93,6 +94,17 @@ With `marquez.db.autoCommentsEnabled: false`, SQL statements no longer include a
 `/* DAO.method */` prefixes in PostgreSQL logs and `pg_stat_statements` query text. Set it to `true`
 when those prefixes are operationally required; SQL behavior is otherwise unchanged.
 
+`marquez.openLineage.projectionBatchSize` is independent of the HTTP batch admission limit of
+1000. A projection transaction never waits for a batch to fill and includes at most the configured
+number of events, including an optional same-lane follower selected to preserve the queue's
+scheduling quantum. Rows admitted through the singular endpoint and legacy queued rows have no
+batch admission ID and remain singleton claims; batch admission IDs are nullable
+database-generated `BIGINT` values and are not an API or configuration value. Larger projection
+batches hold more queue and metadata
+locks and can create a larger post-commit publication burst. Monitor `claim_size`,
+`batch_fallback`, and transaction age when tuning this value, and increase shutdown grace if
+representative transactions can exceed the configured worker drain window.
+
 Set `marquez.terminationGracePeriodSeconds` to more than twice
 `marquez.openLineage.shutdownGracePeriodMillis` (after converting milliseconds to seconds),
 with additional time for the remaining application lifecycle to stop. The defaults reserve 90 seconds
@@ -101,13 +113,13 @@ After the first window, Marquez interrupts remaining tasks and synchronously abo
 JDBC connections before waiting for the second window. The two executor waits have deadlines, but
 the synchronous driver abort calls between them do not; Kubernetes termination grace is the
 external bound if a driver call blocks. A completed abort rolls back its open projection transaction
-and releases its row lock; a connection loss before commit or a database crash that aborts the
-transaction does not consume `maxAttempts`. A lost commit response is indeterminate and may mean
-projection plus acknowledgement already committed.
+and releases its queue and metadata locks; a connection loss before commit or a database crash that
+aborts the transaction does not consume `maxAttempts`. A lost commit response is indeterminate and
+may mean projections plus acknowledgements already committed.
 Monitor the `open-lineage-worker` health check and the `forced_shutdown` and `shutdown_incomplete`
 worker meters. The health check is unhealthy after a fatal task or coordinator failure, or after
 three consecutive poll failures; a successful poll clears the persistent-poll condition, while a
-committed retry or dead letter remains a healthy worker outcome.
+completed batch fallback, committed retry, or dead letter remains a healthy worker outcome.
 The chart uses Dropwizard's aggregate `/healthcheck` endpoint for both readiness and liveness, so an
 unhealthy worker removes the Pod from service and, after Kubernetes probe thresholds are exceeded,
 restarts it. Durable queued events survive that restart, but the API is briefly unavailable and

@@ -61,6 +61,11 @@ helm template marquez "${chart_dir}" \
 
 helm template marquez "${chart_dir}" \
   --values "${chart_dir}/ci/ci-values.yaml" \
+  --set marquez.openLineage.projectionBatchSize=16 \
+  >"${render_dir}/projection-batch-size-changed.yaml"
+
+helm template marquez "${chart_dir}" \
+  --values "${chart_dir}/ci/ci-values.yaml" \
   --set marquez.db.autoCommentsEnabled=true \
   >"${render_dir}/auto-comments-enabled.yaml"
 
@@ -102,10 +107,14 @@ default_checksum="$({ sed -n 's/^        checksum\/marquez-config: "\([^"]*\)"$/
   "${render_dir}/default.yaml" || true; } | head -n 1)"
 changed_checksum="$({ sed -n 's/^        checksum\/marquez-config: "\([^"]*\)"$/\1/p' \
   "${render_dir}/changed.yaml" || true; } | head -n 1)"
+projection_batch_size_changed_checksum="$({ sed -n \
+  's/^        checksum\/marquez-config: "\([^"]*\)"$/\1/p' \
+  "${render_dir}/projection-batch-size-changed.yaml" || true; } | head -n 1)"
 auto_comments_enabled_checksum="$({ sed -n 's/^        checksum\/marquez-config: "\([^"]*\)"$/\1/p' \
   "${render_dir}/auto-comments-enabled.yaml" || true; } | head -n 1)"
 
 if [[ -z "${default_checksum}" || -z "${changed_checksum}" \
+    || -z "${projection_batch_size_changed_checksum}" \
     || -z "${auto_comments_enabled_checksum}" ]]; then
   echo "rendered Deployment is missing checksum/marquez-config on the Pod template" >&2
   exit 1
@@ -113,6 +122,11 @@ fi
 
 if [[ "${default_checksum}" == "${changed_checksum}" ]]; then
   echo "ConfigMap checksum did not change with the rendered OpenLineage configuration" >&2
+  exit 1
+fi
+
+if [[ "${default_checksum}" == "${projection_batch_size_changed_checksum}" ]]; then
+  echo "ConfigMap checksum did not change with the projection batch size" >&2
   exit 1
 fi
 
@@ -161,5 +175,16 @@ fi
 
 if ! grep -Fq '      pollIntervalMillis: 2000' "${render_dir}/changed.yaml"; then
   echo "OpenLineage override was not rendered into the Marquez ConfigMap" >&2
+  exit 1
+fi
+
+if ! grep -Fq '      projectionBatchSize: 8' "${render_dir}/default.yaml"; then
+  echo "default OpenLineage projection batch size was not rendered as 8" >&2
+  exit 1
+fi
+
+if ! grep -Fq '      projectionBatchSize: 16' \
+    "${render_dir}/projection-batch-size-changed.yaml"; then
+  echo "OpenLineage projection batch size override was not rendered" >&2
   exit 1
 fi

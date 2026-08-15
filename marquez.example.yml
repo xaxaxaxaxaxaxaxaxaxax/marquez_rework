@@ -90,6 +90,11 @@ logging:
 openLineage:
   # Concurrent event processors per application instance; total database concurrency scales with replicas.
   workerThreads: ${OPEN_LINEAGE_WORKER_THREADS:-8}
+  # Maximum events from one durable batch admission projected in one transaction (1-64). This
+  # includes an optional same-lane follower selected to preserve the queue's scheduling quantum.
+  # Set to 1 for singleton projection. This is independent of the HTTP batch limit of 1000 and the
+  # worker never waits for a batch to fill.
+  projectionBatchSize: ${OPEN_LINEAGE_PROJECTION_BATCH_SIZE:-8}
   # Delay between database polls while no due work is found.
   pollIntervalMillis: ${OPEN_LINEAGE_POLL_INTERVAL_MILLIS:-1000}
   # Maximum committed caught-failure count; the failure reaching this count is dead-lettered. A

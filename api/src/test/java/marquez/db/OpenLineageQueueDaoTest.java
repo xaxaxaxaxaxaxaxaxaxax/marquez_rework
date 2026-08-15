@@ -186,6 +186,27 @@ class OpenLineageQueueDaoTest {
   }
 
   @Test
+  void bulkAdmissionUsesOneInternalAdmissionAndSingletonsRemainUnmarked() {
+    long singleton = dao.enqueue(UUID.randomUUID(), payloadJson(0));
+    dao.enqueueAll(
+        List.of(
+            new PreparedEvent(UUID.randomUUID(), payloadJson(1)),
+            new PreparedEvent(UUID.randomUUID(), payloadJson(2)),
+            new PreparedEvent(UUID.randomUUID(), payloadJson(3))));
+    dao.enqueueAll(List.of(new PreparedEvent(UUID.randomUUID(), payloadJson(4))));
+
+    List<Long> ids = queueIds();
+    assertThat(ids).hasSize(5);
+    assertThat(admissionId(singleton)).isNull();
+    Long firstAdmission = admissionId(ids.get(1));
+    assertThat(firstAdmission).isPositive();
+    assertThat(admissionId(ids.get(2))).isEqualTo(firstAdmission);
+    assertThat(admissionId(ids.get(3))).isEqualTo(firstAdmission);
+    assertThat(admissionId(ids.get(4))).isPositive().isNotEqualTo(firstAdmission);
+    assertQueueIntegrity();
+  }
+
+  @Test
   void bulkAdmissionValidatesAllBeforeWritingAndEmptyIsNoOp() {
     UUID key = UUID.randomUUID();
     List<PreparedEvent> containsNull = new ArrayList<>();
@@ -445,6 +466,186 @@ class OpenLineageQueueDaoTest {
   }
 
   @Test
+  void batchClaimLocksHeadsBeforeFillingQ2CreditAndReturnsAdmissionOrder() {
+    UUID firstLane = UUID.randomUUID();
+    UUID secondLane = UUID.randomUUID();
+    UUID thirdLane = UUID.randomUUID();
+    dao.enqueueAll(
+        List.of(
+            new PreparedEvent(firstLane, payloadJson(1)),
+            new PreparedEvent(secondLane, payloadJson(2)),
+            new PreparedEvent(firstLane, payloadJson(3)),
+            new PreparedEvent(thirdLane, payloadJson(4))));
+    List<Long> expectedIds = queueIds();
+
+    List<OpenLineageQueueRow> claimed =
+        jdbi.inTransaction(
+            TransactionIsolationLevel.READ_COMMITTED,
+            handle -> handle.attach(OpenLineageQueueDao.class).lockNextDueBatch(4));
+
+    assertThat(claimed).extracting(OpenLineageQueueRow::id).containsExactlyElementsOf(expectedIds);
+    assertThat(claimed).extracting(OpenLineageQueueRow::admissionId).doesNotContainNull();
+    assertThat(claimed)
+        .extracting(OpenLineageQueueRow::admissionId)
+        .containsOnly(admissionId(expectedIds.get(0)));
+    assertThat(claimed)
+        .filteredOn(row -> row.orderingKey().equals(firstLane))
+        .extracting(OpenLineageQueueRow::refreshDueOnAdvance)
+        .containsExactly(false, true);
+    assertThat(claimed.get(2).attemptCount()).isEqualTo(1);
+    assertQueueIntegrity();
+  }
+
+  @Test
+  void batchClaimLimitOneUsesTheLegacyClaimAndValidatesBounds() {
+    long eventId = dao.enqueue(UUID.randomUUID(), payloadJson(1));
+    OpenLineageQueueRow legacy;
+    List<OpenLineageQueueRow> bounded;
+    try (Handle handle = jdbi.open()) {
+      handle.begin();
+      legacy = handle.attach(OpenLineageQueueDao.class).lockNextDue().orElseThrow();
+      handle.rollback();
+      handle.begin();
+      bounded = handle.attach(OpenLineageQueueDao.class).lockNextDueBatch(1);
+      handle.rollback();
+    }
+
+    assertThat(legacy.id()).isEqualTo(eventId);
+    assertThat(bounded).containsExactly(legacy);
+    assertThatThrownBy(() -> dao.lockNextDueBatch(0))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("maxEvents must be positive");
+    assertThatThrownBy(() -> dao.lockNextDueBatch(1001))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("maxEvents must not exceed 1000");
+  }
+
+  @Test
+  void olderPredecessorBlocksOnlyItsLaneFromTheAdmissionFrontier() {
+    UUID blockedLane = UUID.randomUUID();
+    UUID readyLane = UUID.randomUUID();
+    long predecessor = dao.enqueue(blockedLane, payloadJson(0));
+    dao.enqueueAll(
+        List.of(
+            new PreparedEvent(blockedLane, payloadJson(1)),
+            new PreparedEvent(readyLane, payloadJson(2))));
+    setHeadAvailableAt(blockedLane, Instant.parse("2100-01-01T00:00:00Z"));
+
+    List<OpenLineageQueueRow> claimed =
+        jdbi.inTransaction(
+            TransactionIsolationLevel.READ_COMMITTED,
+            handle -> handle.attach(OpenLineageQueueDao.class).lockNextDueBatch(8));
+
+    assertThat(claimed).hasSize(1);
+    assertThat(claimed.get(0).orderingKey()).isEqualTo(readyLane);
+    assertThat(claimed.get(0).admissionId()).isNotNull();
+    assertThat(headId(blockedLane)).isEqualTo(predecessor);
+    assertQueueIntegrity();
+  }
+
+  @Test
+  void bulkAcknowledgementConsumesExactlyOneQ2CreditPerLane() {
+    UUID lane = UUID.randomUUID();
+    dao.enqueueAll(
+        List.of(
+            new PreparedEvent(lane, payloadJson(1)),
+            new PreparedEvent(lane, payloadJson(2)),
+            new PreparedEvent(lane, payloadJson(3))));
+    List<Long> ids = queueIds();
+    setHeadAvailableAt(lane, Instant.parse("2000-01-01T00:00:00.321Z"));
+    String originalSchedule = headAvailableAtBytes(lane);
+
+    jdbi.useTransaction(
+        TransactionIsolationLevel.READ_COMMITTED,
+        handle -> {
+          OpenLineageQueueDao transactional = handle.attach(OpenLineageQueueDao.class);
+          List<OpenLineageQueueRow> claimed = transactional.lockNextDueBatch(8);
+          assertThat(claimed)
+              .extracting(OpenLineageQueueRow::id)
+              .containsExactly(ids.get(0), ids.get(1));
+          transactional.ackLockedAll(claimed);
+        });
+
+    HeadState state = headState(lane);
+    assertThat(state.eventId()).isEqualTo(ids.get(2));
+    assertThat(state.refreshDueOnAdvance()).isFalse();
+    assertThat(headAvailableAtBytes(lane)).isNotEqualTo(originalSchedule);
+    assertThat(queueIds()).containsExactly(ids.get(2));
+    assertQueueIntegrity();
+  }
+
+  @Test
+  void bulkAcknowledgementUsesAFreshSnapshotAfterWaitingForSameLaneEnqueue() throws Exception {
+    UUID lane = UUID.randomUUID();
+    dao.enqueueAll(List.of(new PreparedEvent(lane, payloadJson(1))));
+    long acknowledgedId = queueIds().get(0);
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    try (Handle enqueueHandle = jdbi.open();
+        Handle observer = jdbi.open()) {
+      enqueueHandle.begin();
+      OpenLineageQueueDao enqueueDao = enqueueHandle.attach(OpenLineageQueueDao.class);
+      enqueueDao.acquireOrderingKeyLock(lane);
+      long follower = enqueueDao.insertEventAndMaybeHeadAfterLock(lane, payloadJson(2));
+
+      AtomicInteger backendPid = new AtomicInteger();
+      CountDownLatch claimed = new CountDownLatch(1);
+      Future<?> acknowledgement =
+          executor.submit(
+              () -> {
+                try (Handle acknowledgeHandle = jdbi.open()) {
+                  acknowledgeHandle.begin();
+                  backendPid.set(
+                      acknowledgeHandle
+                          .createQuery("SELECT pg_backend_pid()")
+                          .mapTo(Integer.class)
+                          .one());
+                  OpenLineageQueueDao transactional =
+                      acknowledgeHandle.attach(OpenLineageQueueDao.class);
+                  List<OpenLineageQueueRow> rows = transactional.lockNextDueBatch(8);
+                  assertThat(rows)
+                      .extracting(OpenLineageQueueRow::id)
+                      .containsExactly(acknowledgedId);
+                  claimed.countDown();
+                  transactional.ackLockedAll(rows);
+                  acknowledgeHandle.commit();
+                }
+              });
+
+      assertThat(claimed.await(5, TimeUnit.SECONDS)).isTrue();
+      awaitAdvisoryLockWait(observer, backendPid.get());
+      enqueueHandle.commit();
+      acknowledgement.get(5, TimeUnit.SECONDS);
+
+      assertThat(queueIds(observer)).containsExactly(follower);
+      assertThat(headId(observer, lane)).isEqualTo(follower);
+      assertQueueIntegrity(observer);
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  void trueQ2HeadDoesNotClaimAnotherSameAdmissionFollower() {
+    UUID lane = UUID.randomUUID();
+    dao.enqueueAll(
+        List.of(
+            new PreparedEvent(lane, payloadJson(1)),
+            new PreparedEvent(lane, payloadJson(2)),
+            new PreparedEvent(lane, payloadJson(3))));
+    OpenLineageQueueRow first = ackNext();
+
+    List<OpenLineageQueueRow> claimed =
+        jdbi.inTransaction(
+            TransactionIsolationLevel.READ_COMMITTED,
+            handle -> handle.attach(OpenLineageQueueDao.class).lockNextDueBatch(8));
+
+    assertThat(claimed).hasSize(1);
+    assertThat(claimed.get(0).id()).isNotEqualTo(first.id());
+    assertThat(claimed.get(0).refreshDueOnAdvance()).isTrue();
+    assertQueueIntegrity();
+  }
+
+  @Test
   void rowLockRollbackRestoresExactHeadPointerScheduleAttemptAndPayload() {
     UUID key = UUID.randomUUID();
     long first = dao.enqueue(key, payloadJson(1));
@@ -628,6 +829,53 @@ class OpenLineageQueueDaoTest {
     fallbackCalls.verify(fallingBack).advanceLockedHeadPreservingDue(key, eventId);
     fallbackCalls.verify(fallingBack).advanceLockedHeadRefreshingDue(key, eventId);
     fallbackCalls.verify(fallingBack).deleteEvent(key, eventId);
+  }
+
+  @Test
+  void afterLaneLockTransitionsDoNotAcquireTheAdvisoryLockAgain() {
+    UUID key = UUID.randomUUID();
+    long eventId = 43L;
+
+    OpenLineageQueueDao acknowledged = transactionalQueueDaoMock();
+    doReturn(1).when(acknowledged).advanceLockedHeadPreservingDue(key, eventId);
+    doReturn(1).when(acknowledged).deleteEvent(key, eventId);
+    acknowledged.ackLockedAfterLaneLock(key, eventId, false);
+
+    verify(acknowledged, never()).acquireOrderingKeyLockAndReadRefreshDue(key, eventId);
+    verify(acknowledged).advanceLockedHeadPreservingDue(key, eventId);
+    verify(acknowledged).deleteEvent(key, eventId);
+
+    OpenLineageQueueDao dead = transactionalQueueDaoMock();
+    doReturn(1).when(dead).insertDeadLetterLocked(key, eventId, 2, "poison");
+    doReturn(1).when(dead).advanceLockedHeadRefreshingDue(key, eventId);
+    doReturn(1).when(dead).deleteEvent(key, eventId);
+    dead.deadLetterLockedAfterLaneLock(key, eventId, 2, "poison", true);
+
+    verify(dead, never()).acquireOrderingKeyLockAndReadRefreshDue(key, eventId);
+    verify(dead).insertDeadLetterLocked(key, eventId, 2, "poison");
+    verify(dead).advanceLockedHeadRefreshingDue(key, eventId);
+    verify(dead).deleteEvent(key, eventId);
+  }
+
+  @Test
+  void deadLetterPreservesTheBatchAdmissionForDiagnosis() {
+    UUID key = UUID.randomUUID();
+    dao.enqueueAll(List.of(new PreparedEvent(key, payloadJson(1))));
+    long eventId = queueIds().get(0);
+    Long admissionId = admissionId(eventId);
+
+    jdbi.useTransaction(
+        TransactionIsolationLevel.READ_COMMITTED,
+        handle -> {
+          OpenLineageQueueDao transactional = handle.attach(OpenLineageQueueDao.class);
+          OpenLineageQueueRow row = transactional.lockNextDue().orElseThrow();
+          transactional.deadLetterLocked(
+              row.orderingKey(), row.id(), row.attemptCount(), "diagnostic");
+        });
+
+    assertThat(deadAdmissionId(eventId)).isEqualTo(admissionId);
+    assertThat(queueIds()).isEmpty();
+    assertQueueIntegrity();
   }
 
   @Test
@@ -876,7 +1124,9 @@ class OpenLineageQueueDaoTest {
         .doesNotContain("insert into");
     assertThat(bulkInsertSql)
         .contains(
-            "insert into open_lineage_queue (ordering_key, event)",
+            "admission as materialized",
+            "nextval('open_lineage_queue_admission_id_seq')",
+            "insert into open_lineage_queue (ordering_key, event, admission_id)",
             "unnest(",
             "with ordinality",
             "order by requested.ordinality",
@@ -887,6 +1137,43 @@ class OpenLineageQueueDaoTest {
             "select count(*)",
             "from inserted")
         .doesNotContain("pg_advisory_xact_lock", "jsonb");
+  }
+
+  @Test
+  void batchClaimAndAcknowledgementSqlKeepTheirBoundedLockingContracts() throws Exception {
+    Method claim = OpenLineageQueueDao.class.getMethod("lockNextDueBatchRows", int.class);
+    Method acknowledge =
+        OpenLineageQueueDao.class.getMethod(
+            "acknowledgeLockedPrefixesAfterLaneLocks", UUID[].class, long[].class);
+    String claimSql = claim.getAnnotation(SqlQuery.class).value().toLowerCase(Locale.ROOT);
+    String acknowledgeSql =
+        acknowledge.getAnnotation(SqlQuery.class).value().toLowerCase(Locale.ROOT);
+
+    assertThat(claimSql)
+        .contains(
+            "seed as materialized",
+            "peer_heads as materialized",
+            "for update of head skip locked",
+            "limit greatest(cast(:maxevents as integer) - 1, 0)",
+            "locked_heads as materialized",
+            "locked_count as materialized",
+            "cross join lateral",
+            "queued.id > locked.event_id",
+            "locked.refresh_due_on_advance = false",
+            "follower.admission_id = locked.admission_id",
+            "order by claimed.id")
+        .doesNotContain("pg_advisory_xact_lock");
+    assertThat(acknowledgeSql)
+        .contains(
+            "acknowledged as materialized",
+            "current_prefix.event_ids = lane.event_ids",
+            "case when head.refresh_due_on_advance then 1 else 2 end",
+            "preserved as (",
+            "refreshed as (",
+            "emptied as (",
+            "transition_summary as materialized",
+            "delete from open_lineage_queue as queued")
+        .doesNotContain("pg_advisory_xact_lock");
   }
 
   @Test
@@ -917,6 +1204,53 @@ class OpenLineageQueueDaoTest {
 
     assertThat(dao.purgeDeadBefore(cutoff, 2)).isEqualTo(1);
     assertThat(deadIds()).containsExactly(created.get(3));
+  }
+
+  @Test
+  void batchClaimUsesTheNarrowAdmissionIndexAtUnrelatedBacklog() throws Exception {
+    List<PreparedEvent> batch = new ArrayList<>();
+    for (int index = 0; index < 32; index++) {
+      batch.add(new PreparedEvent(UUID.randomUUID(), payloadJson(index)));
+    }
+    dao.enqueueAll(batch);
+    jdbi.useHandle(
+        handle -> {
+          handle.execute(
+              "UPDATE open_lineage_queue_heads "
+                  + "SET available_at = TIMESTAMPTZ '2000-01-01 00:00:00+00'");
+          handle.execute(
+              """
+              WITH source AS MATERIALIZED (
+                SELECT md5('unrelated:' || value)::uuid AS ordering_key
+                FROM generate_series(1, 4096) AS generated(value)
+              ), inserted AS (
+                INSERT INTO open_lineage_queue (ordering_key, event)
+                SELECT ordering_key, '{"unrelated":true}'
+                FROM source
+                RETURNING ordering_key, id
+              )
+              INSERT INTO open_lineage_queue_heads (ordering_key, event_id, available_at)
+              SELECT ordering_key, id, TIMESTAMPTZ '2100-01-01 00:00:00+00'
+              FROM inserted
+              """);
+          handle.execute("ANALYZE open_lineage_queue");
+          handle.execute("ANALYZE open_lineage_queue_heads");
+        });
+
+    JsonNode claimPlan;
+    try (Handle handle = jdbi.open()) {
+      handle.begin();
+      claimPlan = explainAnalyzedLockNextDueBatch(handle, 32);
+      handle.rollback();
+    }
+
+    List<JsonNode> nodes = planNodes(claimPlan);
+    JsonNode admissionIndex =
+        planNodeWithValue(nodes, "Index Name", "open_lineage_queue_admission_idx");
+    assertThat(admissionIndex.path("Node Type").asText()).contains("Index");
+    assertThat(admissionIndex.path("Actual Rows").asLong()).isBetween(1L, 32L);
+    assertThat(claimPlan.path("Actual Rows").asLong()).isEqualTo(32);
+    assertQueueIntegrity();
   }
 
   @Test
@@ -1344,6 +1678,19 @@ class OpenLineageQueueDaoTest {
     return Utils.getMapper().readTree(planJson).path(0).path("Plan");
   }
 
+  private static JsonNode explainAnalyzedLockNextDueBatch(Handle handle, int maxEvents)
+      throws Exception {
+    String planJson =
+        handle
+            .createQuery(
+                "EXPLAIN (ANALYZE, FORMAT JSON, COSTS OFF, TIMING OFF, SUMMARY OFF) "
+                    + OpenLineageQueueDao.LOCK_NEXT_DUE_BATCH_SQL)
+            .bind("maxEvents", maxEvents)
+            .mapTo(String.class)
+            .one();
+    return Utils.getMapper().readTree(planJson).path(0).path("Plan");
+  }
+
   private static String explainAnalyzedFollowerLookup(Handle handle, UUID key) {
     return String.join(
         "\n",
@@ -1516,6 +1863,26 @@ class OpenLineageQueueDaoTest {
 
   private static String eventJson(long id) {
     return jdbi.withHandle(handle -> eventJson(handle, id));
+  }
+
+  private static Long admissionId(long id) {
+    return jdbi.withHandle(
+        handle ->
+            handle
+                .createQuery("SELECT admission_id FROM open_lineage_queue WHERE id = :id")
+                .bind("id", id)
+                .map((resultSet, context) -> (Long) resultSet.getObject("admission_id"))
+                .one());
+  }
+
+  private static Long deadAdmissionId(long id) {
+    return jdbi.withHandle(
+        handle ->
+            handle
+                .createQuery("SELECT admission_id FROM open_lineage_dead_letters WHERE id = :id")
+                .bind("id", id)
+                .map((resultSet, context) -> (Long) resultSet.getObject("admission_id"))
+                .one());
   }
 
   private static List<Long> laneIds(UUID orderingKey) {

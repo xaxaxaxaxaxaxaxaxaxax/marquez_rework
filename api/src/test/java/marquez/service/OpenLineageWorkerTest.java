@@ -8,11 +8,15 @@ package marquez.service;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doCallRealMethod;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
@@ -28,6 +32,7 @@ import java.sql.Savepoint;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
@@ -46,6 +51,8 @@ import marquez.db.OpenLineageDao;
 import marquez.db.OpenLineageQueueDao;
 import marquez.db.models.OpenLineageQueueRow;
 import marquez.db.models.UpdateLineageRow;
+import marquez.service.OpenLineageService.ProjectedEvent;
+import marquez.service.OpenLineageService.QueuedEvent;
 import marquez.service.models.BaseEvent;
 import marquez.service.models.LineageEvent;
 import org.jdbi.v3.core.Handle;
@@ -61,6 +68,8 @@ import org.slf4j.MDC;
 class OpenLineageWorkerTest {
   private static final Instant NOW = Instant.parse("2026-08-13T00:00:00Z");
   private static final UUID KEY = UUID.fromString("7a93475f-cf51-416e-af32-a25c5c39d72b");
+  private static final UUID OTHER_KEY = UUID.fromString("2799fb9d-4936-44aa-ab14-f67c007b45d5");
+  private static final UUID THIRD_KEY = UUID.fromString("93381aa0-6d6e-4c8b-bd56-3539d4ac627a");
 
   private Jdbi jdbi;
   private Handle handle;
@@ -94,6 +103,7 @@ class OpenLineageWorkerTest {
     transactionTrace = Collections.synchronizedList(new ArrayList<>());
 
     when(config.getWorkerThreads()).thenReturn(2);
+    when(config.getProjectionBatchSize()).thenReturn(8);
     when(config.getPollIntervalMillis()).thenReturn(10L);
     when(config.getMaxAttempts()).thenReturn(3);
     when(config.getRetryInitialDelayMillis()).thenReturn(1_000L);
@@ -106,11 +116,30 @@ class OpenLineageWorkerTest {
     when(handle.attach(OpenLineageQueueDao.class)).thenReturn(transactionalQueueDao);
     when(handle.attach(OpenLineageDao.class)).thenReturn(transactionalOpenLineageDao);
     when(transactionalQueueDao.lockNextDue()).thenReturn(Optional.empty());
+    when(transactionalQueueDao.lockNextDueBatch(anyInt()))
+        .thenAnswer(
+            invocation -> transactionalQueueDao.lockNextDue().map(List::of).orElseGet(List::of));
     when(openLineageService.processQueuedInTransaction(
             any(BaseEvent.class), any(String.class), eq(transactionalOpenLineageDao)))
         .thenReturn(update);
+    when(openLineageService.processQueuedBatchInTransaction(
+            anyList(), eq(transactionalOpenLineageDao)))
+        .thenAnswer(
+            invocation -> {
+              List<QueuedEvent> queuedEvents = invocation.getArgument(0);
+              List<ProjectedEvent> projected = new ArrayList<>(queuedEvents.size());
+              for (QueuedEvent queuedEvent : queuedEvents) {
+                UpdateLineageRow queuedUpdate =
+                    openLineageService.processQueuedInTransaction(
+                        queuedEvent.event(), queuedEvent.eventJson(), transactionalOpenLineageDao);
+                projected.add(
+                    new ProjectedEvent(queuedEvent.queueId(), queuedEvent.event(), queuedUpdate));
+              }
+              return List.copyOf(projected);
+            });
     when(openLineageService.publishQueuedEventBestEffort(any(BaseEvent.class), any()))
         .thenReturn(0);
+    when(openLineageService.publishQueuedEventsBestEffort(anyList())).thenReturn(0);
     when(jdbi.withHandle(any(HandleCallback.class)))
         .thenAnswer(
             invocation -> {
@@ -188,6 +217,176 @@ class OpenLineageWorkerTest {
   }
 
   @Test
+  void oneAdmissionClaimProjectsAndAcknowledgesInOneTransactionBeforeBatchPublication()
+      throws Exception {
+    long admissionId = 71L;
+    OpenLineageQueueRow first = batchRow(1, KEY, 1, false, admissionId);
+    OpenLineageQueueRow second = batchRow(2, OTHER_KEY, 1, false, admissionId);
+    doReturn(List.of(first, second)).when(transactionalQueueDao).lockNextDueBatch(anyInt());
+    when(openLineageService.publishQueuedEventsBestEffort(anyList()))
+        .thenAnswer(
+            invocation -> {
+              transactionTrace.add("publish-batch");
+              return 0;
+            });
+
+    OpenLineageWorker.TaskResult result = worker.processTask(allowEvents(1));
+
+    assertThat(result)
+        .isEqualTo(new OpenLineageWorker.TaskResult(2, OpenLineageWorker.EventOutcome.COMPLETED));
+    assertThat(transactionTrace).containsExactly("begin", "commit", "publish-batch");
+    verify(jdbi).withHandle(any(HandleCallback.class));
+    verify(handle).inTransaction(any(HandleCallback.class));
+    verify(transactionalQueueDao).lockNextDueBatch(8);
+    verify(connection).setSavepoint();
+    verify(connection).releaseSavepoint(savepoint);
+    verify(openLineageService)
+        .processQueuedBatchInTransaction(
+            argThat(
+                events ->
+                    events.size() == 2
+                        && events.get(0).queueId() == first.id()
+                        && events.get(0).eventJson().equals(first.eventJson())
+                        && events.get(1).queueId() == second.id()
+                        && events.get(1).eventJson().equals(second.eventJson())),
+            eq(transactionalOpenLineageDao));
+    verify(transactionalQueueDao).ackLockedAll(List.of(first, second));
+    verify(transactionalQueueDao, never()).ackLocked(any(), anyLong());
+    verify(openLineageService)
+        .publishQueuedEventsBestEffort(
+            argThat(
+                events ->
+                    events.size() == 2
+                        && events.get(0).queueId() == first.id()
+                        && events.get(1).queueId() == second.id()));
+    assertThat(metricCount("selected")).isEqualTo(2);
+    assertThat(metricCount("succeeded")).isEqualTo(2);
+    assertThat(metricRegistry.histogram(metricName("claim_size")).getCount()).isEqualTo(1);
+    assertThat(metricRegistry.histogram(metricName("claim_size")).getSnapshot().getMax())
+        .isEqualTo(2);
+  }
+
+  @Test
+  void failedBatchProjectionFallsBackInOrderAndRetryBlocksOnlyItsLane() throws Exception {
+    long admissionId = 72L;
+    OpenLineageQueueRow first = batchRow(1, KEY, 1, false, admissionId);
+    OpenLineageQueueRow retry = batchRow(2, OTHER_KEY, 1, false, admissionId);
+    OpenLineageQueueRow blockedFollower = batchRow(3, OTHER_KEY, 1, true, admissionId);
+    OpenLineageQueueRow independent = batchRow(4, THIRD_KEY, 1, false, admissionId);
+    doReturn(List.of(first, retry, blockedFollower, independent))
+        .when(transactionalQueueDao)
+        .lockNextDueBatch(anyInt());
+    when(openLineageService.processQueuedBatchInTransaction(
+            anyList(), eq(transactionalOpenLineageDao)))
+        .thenThrow(new IllegalStateException("speculative batch failure"));
+    when(openLineageService.processQueuedInTransaction(
+            any(BaseEvent.class), any(String.class), eq(transactionalOpenLineageDao)))
+        .thenAnswer(
+            invocation -> {
+              String eventJson = invocation.getArgument(1);
+              if (eventJson.equals(retry.eventJson())) {
+                throw new IllegalStateException("retry this lane");
+              }
+              return update;
+            });
+
+    OpenLineageWorker.TaskResult result = worker.processTask(allowEvents(1));
+
+    assertThat(result)
+        .isEqualTo(new OpenLineageWorker.TaskResult(3, OpenLineageWorker.EventOutcome.COMPLETED));
+    assertThat(transactionTrace).containsExactly("begin", "commit");
+    verify(transactionalQueueDao)
+        .acquireOrderingKeyLocks(
+            argThat(keys -> Arrays.equals(keys, new UUID[] {KEY, OTHER_KEY, THIRD_KEY})));
+    verify(transactionalQueueDao)
+        .ackLockedAfterLaneLock(KEY, first.id(), first.refreshDueOnAdvance());
+    verify(transactionalQueueDao)
+        .retryLocked(
+            OTHER_KEY,
+            retry.id(),
+            retry.attemptCount(),
+            "java.lang.IllegalStateException: retry this lane",
+            500L);
+    verify(transactionalQueueDao, never())
+        .ackLockedAfterLaneLock(eq(OTHER_KEY), eq(blockedFollower.id()), anyBoolean());
+    verify(transactionalQueueDao)
+        .ackLockedAfterLaneLock(THIRD_KEY, independent.id(), independent.refreshDueOnAdvance());
+    verify(transactionalQueueDao, never()).ackLockedAll(anyList());
+    verify(openLineageService, times(3))
+        .processQueuedInTransaction(
+            any(BaseEvent.class), any(String.class), eq(transactionalOpenLineageDao));
+    verify(openLineageService)
+        .publishQueuedEventsBestEffort(
+            argThat(
+                events ->
+                    events.size() == 2
+                        && events.get(0).queueId() == first.id()
+                        && events.get(1).queueId() == independent.id()));
+    assertThat(metricCount("batch_fallback")).isEqualTo(1);
+    assertThat(metricCount("selected")).isEqualTo(4);
+    assertThat(metricRegistry.histogram(metricName("claim_size")).getCount()).isEqualTo(1);
+    assertThat(metricRegistry.histogram(metricName("claim_size")).getSnapshot().getMax())
+        .isEqualTo(4);
+    assertThat(metricCount("succeeded")).isEqualTo(2);
+    assertThat(metricCount("retried")).isEqualTo(1);
+  }
+
+  @Test
+  void batchCancellationRollsBackTheWholeClaimWithoutFallingBack() throws Exception {
+    long admissionId = 73L;
+    OpenLineageQueueRow first = batchRow(1, KEY, 1, false, admissionId);
+    OpenLineageQueueRow second = batchRow(2, OTHER_KEY, 1, false, admissionId);
+    CancellationException cancelled = new CancellationException("batch cancelled");
+    doReturn(List.of(first, second)).when(transactionalQueueDao).lockNextDueBatch(anyInt());
+    when(openLineageService.processQueuedBatchInTransaction(
+            anyList(), eq(transactionalOpenLineageDao)))
+        .thenThrow(cancelled);
+
+    assertThatThrownBy(() -> worker.processTask(allowEvents(1)))
+        .isInstanceOf(RuntimeException.class)
+        .hasRootCause(cancelled);
+
+    assertThat(transactionTrace).containsExactly("begin", "rollback");
+    verify(connection, never()).rollback(savepoint);
+    verify(transactionalQueueDao, never()).acquireOrderingKeyLocks(any(UUID[].class));
+    verify(transactionalQueueDao, never()).ackLockedAll(anyList());
+    verify(openLineageService, never())
+        .processQueuedInTransaction(any(BaseEvent.class), any(String.class), any());
+    verifyNoPublication();
+    assertThat(metricCount("batch_fallback")).isZero();
+    assertThat(worker.healthStatus().failure()).isNotNull();
+  }
+
+  @Test
+  @SuppressWarnings({"rawtypes", "unchecked"})
+  void ambiguousBatchCommitNeverPublishesTheProjectedEvents() throws Exception {
+    long admissionId = 74L;
+    OpenLineageQueueRow first = batchRow(1, KEY, 1, false, admissionId);
+    OpenLineageQueueRow second = batchRow(2, OTHER_KEY, 1, false, admissionId);
+    IllegalStateException commitFailure = new IllegalStateException("commit outcome unknown");
+    doReturn(List.of(first, second)).when(transactionalQueueDao).lockNextDueBatch(anyInt());
+    doAnswer(
+            invocation -> {
+              HandleCallback callback = invocation.getArgument(0);
+              transactionTrace.add("begin");
+              callback.withHandle(handle);
+              transactionTrace.add("commit-attempt");
+              throw commitFailure;
+            })
+        .when(handle)
+        .inTransaction(any(HandleCallback.class));
+
+    assertThatThrownBy(() -> worker.processTask(allowEvents(1))).isSameAs(commitFailure);
+
+    assertThat(transactionTrace).containsExactly("begin", "commit-attempt");
+    verify(transactionalQueueDao).ackLockedAll(List.of(first, second));
+    verifyNoPublication();
+    assertThat(metricCount("succeeded")).isZero();
+    assertThat(metricCount("task_failed")).isEqualTo(1);
+    assertThat(worker.healthStatus().failure()).isSameAs(commitFailure);
+  }
+
+  @Test
   void repeatableReadTransactionFailsPollAtDaoGuardBeforeStorageOrProjection() {
     when(handle.getTransactionIsolationLevel())
         .thenReturn(TransactionIsolationLevel.REPEATABLE_READ);
@@ -241,6 +440,7 @@ class OpenLineageWorkerTest {
             metricName("task_failed"),
             metricName("state_transition_failed"),
             metricName("post_commit_failed"),
+            metricName("batch_fallback"),
             metricName("forced_shutdown"),
             metricName("shutdown_incomplete"));
     assertThat(metricRegistry.getTimers().keySet())
@@ -248,8 +448,8 @@ class OpenLineageWorkerTest {
             metricName("poll_duration"),
             metricName("processing_duration"),
             metricName("post_commit_duration"));
-    assertThat(metricRegistry.getHistograms()).isEmpty();
-    assertThat(metricRegistry.getMetrics()).hasSize(20);
+    assertThat(metricRegistry.getHistograms().keySet()).containsExactly(metricName("claim_size"));
+    assertThat(metricRegistry.getMetrics()).hasSize(22);
   }
 
   @Test
@@ -467,6 +667,9 @@ class OpenLineageWorkerTest {
         .isEqualTo(new OpenLineageWorker.TaskResult(8, OpenLineageWorker.EventOutcome.COMPLETED));
     verify(jdbi, times(8)).withHandle(any(HandleCallback.class));
     verify(transactionalQueueDao, times(8)).lockNextDue();
+    for (int remaining = 8; remaining >= 1; remaining--) {
+      verify(transactionalQueueDao).lockNextDueBatch(remaining);
+    }
     verify(transactionalQueueDao, times(8)).ackLocked(eq(KEY), anyLong());
     verify(openLineageService, times(8)).publishQueuedEventBestEffort(any(), eq(update));
     assertThat(transactionTrace).hasSize(16);
@@ -719,6 +922,7 @@ class OpenLineageWorkerTest {
     when(transactionHandle.attach(OpenLineageQueueDao.class)).thenReturn(transactionQueue);
     when(transactionHandle.attach(OpenLineageDao.class)).thenReturn(transactionOpenLineage);
     when(transactionQueue.lockNextDue()).thenReturn(Optional.of(lockedRow));
+    when(transactionQueue.lockNextDueBatch(anyInt())).thenReturn(List.of(lockedRow));
     when(transactionHandle.inTransaction(any(HandleCallback.class)))
         .thenAnswer(
             invocation -> {
@@ -768,6 +972,7 @@ class OpenLineageWorkerTest {
 
   private void verifyNoPublication() {
     verify(openLineageService, never()).publishQueuedEventBestEffort(any(), any());
+    verify(openLineageService, never()).publishQueuedEventsBestEffort(anyList());
   }
 
   private void awaitFailure(Throwable expected) {
@@ -804,6 +1009,19 @@ class OpenLineageWorkerTest {
 
   private static OpenLineageQueueRow row(long id, int attemptCount, String eventJson) {
     return new OpenLineageQueueRow(id, KEY, eventJson, NOW.minusSeconds(1), attemptCount, null);
+  }
+
+  private static OpenLineageQueueRow batchRow(
+      long id, UUID orderingKey, int attemptCount, boolean refreshDueOnAdvance, long admissionId) {
+    return new OpenLineageQueueRow(
+        id,
+        orderingKey,
+        eventJson(id),
+        NOW.minusSeconds(1),
+        attemptCount,
+        null,
+        refreshDueOnAdvance,
+        admissionId);
   }
 
   private static String eventJson(long id) {

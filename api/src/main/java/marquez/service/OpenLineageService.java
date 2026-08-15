@@ -11,6 +11,7 @@ import static marquez.tracing.SentryPropagating.withSentry;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -22,6 +23,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.RejectedExecutionException;
+import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 import marquez.common.Utils;
 import marquez.common.models.JobName;
@@ -72,6 +74,25 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
     this.runService = runService;
     this.searchService = searchService;
     this.executor = executor;
+  }
+
+  record QueuedEvent(long queueId, BaseEvent event, String eventJson) {
+    QueuedEvent {
+      if (queueId <= 0) {
+        throw new IllegalArgumentException("queueId must be positive");
+      }
+      Objects.requireNonNull(event, "event");
+      Objects.requireNonNull(eventJson, "eventJson");
+    }
+  }
+
+  record ProjectedEvent(long queueId, BaseEvent event, @Nullable UpdateLineageRow update) {
+    ProjectedEvent {
+      if (queueId <= 0) {
+        throw new IllegalArgumentException("queueId must be positive");
+      }
+      Objects.requireNonNull(event, "event");
+    }
   }
 
   /**
@@ -133,6 +154,27 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
         "Unsupported OpenLineage event type: " + event.getClass().getName());
   }
 
+  /**
+   * Persists an ordered batch through a caller-owned transaction.
+   *
+   * <p>This deliberately reuses the mature single-event projector. Any failure stops the batch and
+   * escapes so the caller can roll back its batch savepoint before retrying events individually.
+   */
+  List<ProjectedEvent> processQueuedBatchInTransaction(
+      List<QueuedEvent> queuedEvents, OpenLineageDao transactionalDao) {
+    Objects.requireNonNull(transactionalDao, "transactionalDao");
+    List<QueuedEvent> orderedEvents =
+        List.copyOf(Objects.requireNonNull(queuedEvents, "queuedEvents"));
+    List<ProjectedEvent> projectedEvents = new ArrayList<>(orderedEvents.size());
+    for (QueuedEvent queuedEvent : orderedEvents) {
+      UpdateLineageRow update =
+          processQueuedInTransaction(
+              queuedEvent.event(), queuedEvent.eventJson(), transactionalDao);
+      projectedEvents.add(new ProjectedEvent(queuedEvent.queueId(), queuedEvent.event(), update));
+    }
+    return List.copyOf(projectedEvents);
+  }
+
   private static java.time.ZonedDateTime eventTime(BaseEvent event) {
     if (event instanceof DatasetEvent datasetEvent) {
       return datasetEvent.getEventTime();
@@ -171,6 +213,55 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
       } catch (RuntimeException e) {
         failures++;
         log.error("Failed to notify listeners for queued OpenLineage event", e);
+      }
+    }
+    return failures;
+  }
+
+  /** Publishes an ordered batch after its queue transaction has committed. */
+  int publishQueuedEventsBestEffort(List<ProjectedEvent> committedEvents) {
+    List<ProjectedEvent> orderedEvents =
+        List.copyOf(Objects.requireNonNull(committedEvents, "committedEvents"));
+    int failures = 0;
+
+    if (searchService != null) {
+      List<SearchService.IndexEntry> indexEntries = new ArrayList<>(orderedEvents.size());
+      for (ProjectedEvent projectedEvent : orderedEvents) {
+        if (!(projectedEvent.event() instanceof LineageEvent lineageEvent)) {
+          continue;
+        }
+        try {
+          indexEntries.add(
+              new SearchService.IndexEntry(
+                  lineageEvent, effectiveRunUuid(projectedEvent.update())));
+        } catch (RuntimeException e) {
+          failures++;
+          log.error(
+              "Failed to prepare queued OpenLineage event {} for indexing",
+              projectedEvent.queueId(),
+              e);
+        }
+      }
+      if (!indexEntries.isEmpty()) {
+        failures += searchService.indexEventsBestEffort(List.copyOf(indexEntries));
+      }
+    }
+
+    for (ProjectedEvent projectedEvent : orderedEvents) {
+      if (!(projectedEvent.event() instanceof LineageEvent lineageEvent)
+          || lineageEvent.getEventType() == null) {
+        continue;
+      }
+      try {
+        if (runService.hasRunTransitionListeners()) {
+          failures += notifyListeners(lineageEvent, projectedEvent.update());
+        }
+      } catch (RuntimeException e) {
+        failures++;
+        log.error(
+            "Failed to notify listeners for queued OpenLineage event {}",
+            projectedEvent.queueId(),
+            e);
       }
     }
     return failures;

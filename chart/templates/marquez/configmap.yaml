@@ -49,6 +49,7 @@ data:
 
     openLineage:
       workerThreads: {{ .Values.marquez.openLineage.workerThreads }}
+      projectionBatchSize: {{ .Values.marquez.openLineage.projectionBatchSize }}
       pollIntervalMillis: {{ .Values.marquez.openLineage.pollIntervalMillis }}
       maxAttempts: {{ .Values.marquez.openLineage.maxAttempts }}
       retryInitialDelayMillis: {{ .Values.marquez.openLineage.retryInitialDelayMillis }}

@@ -8,8 +8,11 @@ package marquez.db;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import marquez.common.Utils;
 import marquez.db.models.OpenLineageQueueRow;
@@ -28,12 +31,15 @@ import org.jdbi.v3.sqlobject.transaction.Transactional;
 /** PostgreSQL-backed durable intake queue for OpenLineage events. */
 @RegisterConstructorMapper(OpenLineageQueueRow.class)
 public interface OpenLineageQueueDao extends Transactional<OpenLineageQueueDao> {
+  int MAX_ADMISSION_EVENTS = 1000;
+
   String LOCK_NEXT_DUE_SQL =
       """
       WITH candidate AS MATERIALIZED (
         SELECT head.ordering_key,
                head.event_id,
                head.attempt_count,
+               head.refresh_due_on_advance,
                head.last_error
         FROM open_lineage_queue_heads AS head
         WHERE head.available_at <= statement_timestamp()
@@ -46,11 +52,123 @@ public interface OpenLineageQueueDao extends Transactional<OpenLineageQueueDao> 
              queued.event AS event_json,
              queued.enqueued_at,
              LEAST(candidate.attempt_count::BIGINT + 1, 2147483647)::INTEGER AS attempt_count,
-             candidate.last_error
+             candidate.last_error,
+             candidate.refresh_due_on_advance,
+             queued.admission_id
       FROM candidate
       JOIN open_lineage_queue AS queued
         ON queued.ordering_key = candidate.ordering_key
        AND queued.id = candidate.event_id
+      """;
+
+  String LOCK_NEXT_DUE_BATCH_SQL =
+      """
+      WITH seed AS MATERIALIZED (
+        SELECT head.ordering_key,
+               head.event_id,
+               head.attempt_count,
+               head.refresh_due_on_advance,
+               head.last_error,
+               queued.admission_id
+        FROM open_lineage_queue_heads AS head
+        JOIN open_lineage_queue AS queued
+          ON queued.ordering_key = head.ordering_key
+         AND queued.id = head.event_id
+        WHERE head.available_at <= statement_timestamp()
+        ORDER BY head.available_at
+        FOR UPDATE OF head SKIP LOCKED
+        LIMIT 1
+      ), peer_heads AS MATERIALIZED (
+        SELECT head.ordering_key,
+               head.event_id,
+               head.attempt_count,
+               head.refresh_due_on_advance,
+               head.last_error,
+               queued.admission_id
+        FROM seed
+        JOIN open_lineage_queue AS queued
+          ON queued.admission_id = seed.admission_id
+        JOIN open_lineage_queue_heads AS head
+          ON head.ordering_key = queued.ordering_key
+         AND head.event_id = queued.id
+        WHERE seed.admission_id IS NOT NULL
+          AND (head.ordering_key <> seed.ordering_key OR head.event_id <> seed.event_id)
+          AND head.available_at <= statement_timestamp()
+        ORDER BY
+          hashtextextended(
+              'open_lineage_queue:' || CAST(head.ordering_key AS TEXT),
+              0),
+          head.ordering_key
+        FOR UPDATE OF head SKIP LOCKED
+        LIMIT GREATEST(CAST(:maxEvents AS INTEGER) - 1, 0)
+      ), locked_heads AS MATERIALIZED (
+        SELECT * FROM seed
+        UNION ALL
+        SELECT * FROM peer_heads
+      ), locked_count AS MATERIALIZED (
+        SELECT count(*) AS event_count
+        FROM locked_heads
+      ), head_events AS MATERIALIZED (
+        SELECT queued.id,
+               queued.ordering_key,
+               queued.event AS event_json,
+               queued.enqueued_at,
+               LEAST(locked.attempt_count::BIGINT + 1, 2147483647)::INTEGER
+                   AS attempt_count,
+               locked.last_error,
+               locked.refresh_due_on_advance,
+               queued.admission_id
+        FROM locked_heads AS locked
+        JOIN open_lineage_queue AS queued
+          ON queued.ordering_key = locked.ordering_key
+         AND queued.id = locked.event_id
+        CROSS JOIN locked_count
+      ), follower_candidates AS MATERIALIZED (
+        SELECT follower.id,
+               follower.ordering_key,
+               follower.event AS event_json,
+               follower.enqueued_at,
+               1 AS attempt_count,
+               CAST(NULL AS TEXT) AS last_error,
+               TRUE AS refresh_due_on_advance,
+               follower.admission_id
+        FROM locked_heads AS locked
+        CROSS JOIN locked_count
+        CROSS JOIN LATERAL (
+          SELECT queued.id,
+                 queued.ordering_key,
+                 queued.event,
+                 queued.enqueued_at,
+                 queued.admission_id
+          FROM open_lineage_queue AS queued
+          WHERE queued.ordering_key = locked.ordering_key
+            AND queued.id > locked.event_id
+          ORDER BY queued.id
+          LIMIT 1
+        ) AS follower
+        WHERE locked_count.event_count < :maxEvents
+          AND locked.admission_id IS NOT NULL
+          AND locked.refresh_due_on_advance = FALSE
+          AND follower.admission_id = locked.admission_id
+        ORDER BY follower.id
+        LIMIT GREATEST(
+            CAST(:maxEvents AS BIGINT) - (SELECT event_count FROM locked_count),
+            0)
+      )
+      SELECT claimed.id,
+             claimed.ordering_key,
+             claimed.event_json,
+             claimed.enqueued_at,
+             claimed.attempt_count,
+             claimed.last_error,
+             claimed.refresh_due_on_advance,
+             claimed.admission_id
+      FROM (
+        SELECT * FROM head_events
+        UNION ALL
+        SELECT * FROM follower_candidates
+      ) AS claimed
+      ORDER BY claimed.id
       """;
 
   /** A fully validated queue admission serialized exactly once. */
@@ -63,6 +181,9 @@ public interface OpenLineageQueueDao extends Transactional<OpenLineageQueueDao> 
       requireNoNulInSerializedEvent(eventJson);
     }
   }
+
+  /** Exact queue identity used to reject duplicate bulk-transition input before issuing SQL. */
+  public record LockedEventKey(UUID orderingKey, long eventId) {}
 
   public static PreparedEvent prepare(BaseEvent event) {
     UUID orderingKey = orderingKeyFor(event);
@@ -240,9 +361,13 @@ public interface OpenLineageQueueDao extends Transactional<OpenLineageQueueDao> 
    */
   @SqlQuery(
       """
-      WITH inserted AS (
-        INSERT INTO open_lineage_queue (ordering_key, event)
-        SELECT ordered.ordering_key, ordered.event_json
+      WITH admission AS MATERIALIZED (
+        SELECT nextval('open_lineage_queue_admission_id_seq') AS admission_id
+      ), inserted AS (
+        INSERT INTO open_lineage_queue (ordering_key, event, admission_id)
+        SELECT ordered.ordering_key,
+               ordered.event_json,
+               admission.admission_id
         FROM (
           SELECT requested.ordering_key,
                  requested.event_json,
@@ -254,6 +379,8 @@ public interface OpenLineageQueueDao extends Transactional<OpenLineageQueueDao> 
           ORDER BY requested.ordinality
           OFFSET 0
         ) AS ordered
+        CROSS JOIN admission
+        ORDER BY ordered.ordinality
         RETURNING ordering_key, id
       ), created_heads AS (
         INSERT INTO open_lineage_queue_heads (ordering_key, event_id)
@@ -283,12 +410,203 @@ public interface OpenLineageQueueDao extends Transactional<OpenLineageQueueDao> 
   @SqlQuery(LOCK_NEXT_DUE_SQL)
   Optional<OpenLineageQueueRow> lockNextDueHead();
 
+  /**
+   * Locks a bounded, request-aware due slice. A limit of one deliberately uses the legacy claim
+   * query unchanged. Larger claims contain one admission only, except that a null admission remains
+   * an implicit singleton.
+   */
+  default List<OpenLineageQueueRow> lockNextDueBatch(int maxEvents) {
+    requireClaimLimit(maxEvents);
+    if (maxEvents == 1) {
+      Optional<OpenLineageQueueRow> row = lockNextDue();
+      return row.isPresent() ? List.of(row.get()) : List.of();
+    }
+    requireAttachedReadCommittedTransaction("OpenLineage batch dequeue");
+    return lockNextDueBatchRows(maxEvents);
+  }
+
+  @SqlQuery(LOCK_NEXT_DUE_BATCH_SQL)
+  List<OpenLineageQueueRow> lockNextDueBatchRows(@Bind("maxEvents") int maxEvents);
+
+  /** Acknowledges an all-success claim with one lane-lock and one transition statement. */
+  default void ackLockedAll(List<OpenLineageQueueRow> rows) {
+    requireAttachedReadCommittedTransaction("OpenLineage batch acknowledgement");
+    if (rows == null) {
+      throw new IllegalArgumentException("locked rows are required");
+    }
+    if (rows.isEmpty()) {
+      throw new IllegalArgumentException("locked rows must not be empty");
+    }
+
+    UUID[] orderingKeys = new UUID[rows.size()];
+    long[] eventIds = new long[rows.size()];
+    Set<LockedEventKey> identities = new HashSet<>();
+    Long admissionId = null;
+    boolean first = true;
+    for (int index = 0; index < rows.size(); index++) {
+      OpenLineageQueueRow row = rows.get(index);
+      if (row == null) {
+        throw new IllegalArgumentException("locked row is required");
+      }
+      requireLockedTransition(row.orderingKey(), row.id());
+      if (!identities.add(new LockedEventKey(row.orderingKey(), row.id()))) {
+        throw new IllegalArgumentException("locked rows must not contain duplicates");
+      }
+      if (first) {
+        admissionId = row.admissionId();
+        first = false;
+      } else if (!Objects.equals(admissionId, row.admissionId())) {
+        throw new IllegalArgumentException("locked rows must belong to one admission");
+      }
+      orderingKeys[index] = row.orderingKey();
+      eventIds[index] = row.id();
+    }
+    if (admissionId == null && rows.size() != 1) {
+      throw new IllegalArgumentException(
+          "singleton queue rows cannot form a batch acknowledgement");
+    }
+
+    acquireOrderingKeyLocks(orderingKeys);
+    long transitioned = acknowledgeLockedPrefixesAfterLaneLocks(orderingKeys, eventIds);
+    requireExpected(transitioned, rows.size(), "acknowledge OpenLineage queue payload prefixes");
+  }
+
+  @SqlQuery(
+      """
+      WITH acknowledged AS MATERIALIZED (
+        SELECT requested.ordering_key,
+               requested.event_id,
+               requested.ordinality
+        FROM unnest(
+            CAST(:orderingKeys AS uuid[]),
+            CAST(:eventIds AS bigint[])
+        ) WITH ORDINALITY AS requested(ordering_key, event_id, ordinality)
+      ), lanes AS MATERIALIZED (
+        SELECT acknowledged.ordering_key,
+               array_agg(acknowledged.event_id ORDER BY acknowledged.event_id) AS event_ids,
+               min(acknowledged.event_id) AS first_event_id,
+               max(acknowledged.event_id) AS last_event_id,
+               count(*) AS event_count
+        FROM acknowledged
+        GROUP BY acknowledged.ordering_key
+      ), validated AS MATERIALIZED (
+        SELECT lane.ordering_key,
+               lane.event_count,
+               head.event_id AS locked_event_id,
+               head.refresh_due_on_advance,
+               successor.id AS successor_id
+        FROM lanes AS lane
+        JOIN open_lineage_queue_heads AS head
+          ON head.ordering_key = lane.ordering_key
+        CROSS JOIN LATERAL (
+          SELECT array_agg(prefix.id ORDER BY prefix.id) AS event_ids
+          FROM (
+            SELECT queued.id
+            FROM open_lineage_queue AS queued
+            WHERE queued.ordering_key = lane.ordering_key
+              AND queued.id >= head.event_id
+            ORDER BY queued.id
+            LIMIT lane.event_count
+          ) AS prefix
+        ) AS current_prefix
+        LEFT JOIN LATERAL (
+          SELECT queued.id
+          FROM open_lineage_queue AS queued
+          WHERE queued.ordering_key = lane.ordering_key
+            AND queued.id > lane.last_event_id
+          ORDER BY queued.id
+          LIMIT 1
+        ) AS successor ON TRUE
+        WHERE head.event_id = lane.first_event_id
+          AND current_prefix.event_ids = lane.event_ids
+          AND lane.event_count <=
+              CASE WHEN head.refresh_due_on_advance THEN 1 ELSE 2 END
+      ), preserved AS (
+        UPDATE open_lineage_queue_heads AS head
+        SET event_id = validated.successor_id,
+            attempt_count = 0,
+            refresh_due_on_advance = TRUE,
+            last_error = NULL
+        FROM validated
+        WHERE head.ordering_key = validated.ordering_key
+          AND head.event_id = validated.locked_event_id
+          AND validated.successor_id IS NOT NULL
+          AND validated.refresh_due_on_advance = FALSE
+          AND validated.event_count = 1
+        RETURNING head.ordering_key
+      ), refreshed AS (
+        UPDATE open_lineage_queue_heads AS head
+        SET event_id = validated.successor_id,
+            available_at = date_trunc('milliseconds', statement_timestamp()),
+            attempt_count = 0,
+            refresh_due_on_advance = FALSE,
+            last_error = NULL
+        FROM validated
+        WHERE head.ordering_key = validated.ordering_key
+          AND head.event_id = validated.locked_event_id
+          AND validated.successor_id IS NOT NULL
+          AND (validated.refresh_due_on_advance = TRUE OR validated.event_count = 2)
+        RETURNING head.ordering_key
+      ), emptied AS (
+        DELETE FROM open_lineage_queue_heads AS head
+        USING validated
+        WHERE head.ordering_key = validated.ordering_key
+          AND head.event_id = validated.locked_event_id
+          AND validated.successor_id IS NULL
+        RETURNING head.ordering_key
+      ), transitioned AS MATERIALIZED (
+        SELECT ordering_key FROM preserved
+        UNION ALL
+        SELECT ordering_key FROM refreshed
+        UNION ALL
+        SELECT ordering_key FROM emptied
+      ), transition_summary AS MATERIALIZED (
+        SELECT (SELECT count(*) FROM acknowledged) AS input_count,
+               CAST(
+                   COALESCE((
+                     SELECT sum(validated.event_count)
+                     FROM validated
+                     JOIN transitioned
+                       ON transitioned.ordering_key = validated.ordering_key
+                   ), 0)
+                   AS BIGINT) AS transitioned_count
+      ), deleted AS (
+        DELETE FROM open_lineage_queue AS queued
+        USING acknowledged, transition_summary
+        WHERE transition_summary.transitioned_count = transition_summary.input_count
+          AND queued.ordering_key = acknowledged.ordering_key
+          AND queued.id = acknowledged.event_id
+        RETURNING queued.id
+      ), delete_summary AS MATERIALIZED (
+        SELECT count(*) AS deleted_count
+        FROM deleted
+      )
+      SELECT CASE
+               WHEN transition_summary.transitioned_count = transition_summary.input_count
+                AND delete_summary.deleted_count = transition_summary.input_count
+               THEN transition_summary.input_count
+               ELSE delete_summary.deleted_count
+             END
+      FROM transition_summary
+      CROSS JOIN delete_summary
+      """)
+  long acknowledgeLockedPrefixesAfterLaneLocks(
+      @Bind("orderingKeys") UUID[] orderingKeys, @Bind("eventIds") long[] eventIds);
+
   /** Acknowledges the lane head already locked by the caller's projection transaction. */
   default void ackLocked(UUID orderingKey, long eventId) {
     requireLockedTransition(orderingKey, eventId);
     requireAttachedReadCommittedTransaction("OpenLineage acknowledgement");
 
     boolean refreshDueOnAdvance = lockOrderingLaneAndReadRefreshDue(orderingKey, eventId);
+    ackLockedAfterLaneLock(orderingKey, eventId, refreshDueOnAdvance);
+  }
+
+  /** Acknowledges an exact head after the caller acquired every mixed-claim lane lock in order. */
+  default void ackLockedAfterLaneLock(UUID orderingKey, long eventId, boolean refreshDueOnAdvance) {
+    requireLockedTransition(orderingKey, eventId);
+    requireAttachedReadCommittedTransaction("OpenLineage acknowledgement after lane lock");
+
     int advanced = advanceLockedHeadUsingHint(orderingKey, eventId, refreshDueOnAdvance);
     if (advanced == 0) {
       requireOne(
@@ -446,6 +764,16 @@ public interface OpenLineageQueueDao extends Transactional<OpenLineageQueueDao> 
     requireAttachedReadCommittedTransaction("OpenLineage dead-letter transition");
 
     boolean refreshDueOnAdvance = lockOrderingLaneAndReadRefreshDue(orderingKey, eventId);
+    deadLetterLockedAfterLaneLock(orderingKey, eventId, attemptCount, error, refreshDueOnAdvance);
+  }
+
+  /** Dead-letters an exact head after all mixed-claim lane locks were acquired in order. */
+  default void deadLetterLockedAfterLaneLock(
+      UUID orderingKey, long eventId, int attemptCount, String error, boolean refreshDueOnAdvance) {
+    requireLockedTransition(orderingKey, eventId);
+    requirePositive(attemptCount, "attemptCount");
+    requireAttachedReadCommittedTransaction("OpenLineage dead-letter transition after lane lock");
+
     requireOne(
         insertDeadLetterLocked(orderingKey, eventId, attemptCount, normalizeError(error)),
         "insert OpenLineage dead letter " + eventId);
@@ -469,13 +797,15 @@ public interface OpenLineageQueueDao extends Transactional<OpenLineageQueueDao> 
           event,
           enqueued_at,
           attempt_count,
-          last_error)
+          last_error,
+          admission_id)
       SELECT queued.ordering_key,
              queued.id,
              queued.event,
              queued.enqueued_at,
              :attemptCount,
-             left(CAST(:error AS TEXT), 4096)
+             left(CAST(:error AS TEXT), 4096),
+             queued.admission_id
       FROM open_lineage_queue_heads AS head
       JOIN open_lineage_queue AS queued
         ON queued.ordering_key = head.ordering_key
@@ -690,6 +1020,13 @@ public interface OpenLineageQueueDao extends Transactional<OpenLineageQueueDao> 
     requirePositive(batchSize, "batchSize");
   }
 
+  private static void requireClaimLimit(int maxEvents) {
+    requirePositive(maxEvents, "maxEvents");
+    if (maxEvents > MAX_ADMISSION_EVENTS) {
+      throw new IllegalArgumentException("maxEvents must not exceed " + MAX_ADMISSION_EVENTS);
+    }
+  }
+
   private static void requirePositive(long value, String name) {
     if (value <= 0) {
       throw new IllegalArgumentException(name + " must be positive");
@@ -713,6 +1050,13 @@ public interface OpenLineageQueueDao extends Transactional<OpenLineageQueueDao> 
     if (affectedRows < 0 || affectedRows > 1) {
       throw new IllegalStateException(
           "Expected to " + action + " at most once, but affected " + affectedRows + " rows");
+    }
+  }
+
+  private static void requireExpected(long actualRows, long expectedRows, String action) {
+    if (actualRows != expectedRows) {
+      throw new IllegalStateException(
+          "Expected to " + action + " for " + expectedRows + " row(s), but affected " + actualRows);
     }
   }
 

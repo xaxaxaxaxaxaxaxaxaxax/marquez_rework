@@ -9,12 +9,15 @@ import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonSetter;
 import javax.validation.constraints.AssertTrue;
+import javax.validation.constraints.Max;
 import javax.validation.constraints.Min;
 import lombok.Getter;
 
 /** Durable OpenLineage intake worker settings. */
 public class OpenLineageConfig {
   public static final int DEFAULT_WORKER_THREADS = 8;
+  public static final int DEFAULT_PROJECTION_BATCH_SIZE = 8;
+  public static final int MAX_PROJECTION_BATCH_SIZE = 64;
   public static final long DEFAULT_POLL_INTERVAL_MILLIS = 1_000;
   public static final int DEFAULT_MAX_ATTEMPTS = 10;
   public static final long DEFAULT_RETRY_INITIAL_DELAY_MILLIS = 1_000;
@@ -30,6 +33,13 @@ public class OpenLineageConfig {
   @Min(1)
   @JsonProperty
   private int workerThreads = DEFAULT_WORKER_THREADS;
+
+  /** Maximum events, including an optional same-lane follower, in one projection claim. */
+  @Getter
+  @Min(1)
+  @Max(MAX_PROJECTION_BATCH_SIZE)
+  @JsonProperty
+  private int projectionBatchSize = DEFAULT_PROJECTION_BATCH_SIZE;
 
   @Getter
   @Min(1)

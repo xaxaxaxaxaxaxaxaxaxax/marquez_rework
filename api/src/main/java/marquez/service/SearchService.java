@@ -12,9 +12,11 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.BitSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import javax.validation.Valid;
 import javax.validation.constraints.NotNull;
@@ -46,6 +48,13 @@ import org.opensearch.client.transport.rest_client.RestClientTransport;
 public class SearchService {
   private static final Base64.Encoder ID_COMPONENT_ENCODER =
       Base64.getUrlEncoder().withoutPadding();
+
+  record IndexEntry(LineageEvent event, UUID effectiveRunUuid) {
+    IndexEntry {
+      Objects.requireNonNull(event, "event");
+      Objects.requireNonNull(effectiveRunUuid, "effectiveRunUuid");
+    }
+  }
 
   String[] DATASET_FIELDS = {
     "run_id",
@@ -187,6 +196,91 @@ public class SearchService {
     return indexEventWithRunUuid(event, effectiveRunUuid);
   }
 
+  /** Best-effort indexing for an ordered batch of committed queued events. */
+  int indexEventsBestEffort(@NotNull List<IndexEntry> orderedEntries) {
+    Objects.requireNonNull(orderedEntries, "orderedEntries");
+    if (indexingDisabled() || orderedEntries.isEmpty()) {
+      return 0;
+    }
+
+    List<BulkOperation> operations = new ArrayList<>();
+    List<Integer> operationOwners = new ArrayList<>();
+    BitSet failedEntries = new BitSet(orderedEntries.size());
+    BitSet submittedEntries = new BitSet(orderedEntries.size());
+
+    for (int entryIndex = 0; entryIndex < orderedEntries.size(); entryIndex++) {
+      try {
+        IndexEntry entry = orderedEntries.get(entryIndex);
+        List<BulkOperation> entryOperations =
+            buildIndexOperations(entry.event(), entry.effectiveRunUuid());
+        operations.addAll(entryOperations);
+        for (int operation = 0; operation < entryOperations.size(); operation++) {
+          operationOwners.add(entryIndex);
+        }
+        submittedEntries.set(entryIndex);
+      } catch (RuntimeException e) {
+        failedEntries.set(entryIndex);
+        log.error(
+            "Failed to materialize OpenSearch operations for queued event at batch index {}",
+            entryIndex,
+            e);
+      }
+    }
+
+    if (operations.isEmpty()) {
+      return failedEntries.cardinality();
+    }
+
+    try {
+      BulkResponse response = openSearchClient.bulk(BulkRequest.of(b -> b.operations(operations)));
+      if (!response.errors()) {
+        return failedEntries.cardinality();
+      }
+
+      List<BulkResponseItem> responseItems = response.items();
+      if (responseItems == null || responseItems.size() != operations.size()) {
+        failedEntries.or(submittedEntries);
+        log.error(
+            "OpenSearch bulk response could not be aligned to queued events: expected {} items, "
+                + "received {}",
+            operations.size(),
+            responseItems == null ? null : responseItems.size());
+        return failedEntries.cardinality();
+      }
+
+      boolean foundItemFailure = false;
+      for (int operationIndex = 0; operationIndex < responseItems.size(); operationIndex++) {
+        BulkResponseItem item = responseItems.get(operationIndex);
+        if (item == null) {
+          failedEntries.or(submittedEntries);
+          log.error("OpenSearch bulk response contained a null item");
+          return failedEntries.cardinality();
+        }
+        if (item.error() != null) {
+          foundItemFailure = true;
+          int entryIndex = operationOwners.get(operationIndex);
+          if (!failedEntries.get(entryIndex)) {
+            failedEntries.set(entryIndex);
+            log.error(
+                "OpenSearch bulk indexing failed for queued event at batch index {}: {}",
+                entryIndex,
+                describeFailure(item));
+          }
+        }
+      }
+
+      if (!foundItemFailure) {
+        failedEntries.or(submittedEntries);
+        log.error("OpenSearch bulk response reported errors without a failed item");
+      }
+      return failedEntries.cardinality();
+    } catch (IOException | RuntimeException e) {
+      failedEntries.or(submittedEntries);
+      log.error("Failed to bulk index queued OpenLineage events", e);
+      return failedEntries.cardinality();
+    }
+  }
+
   private boolean indexingDisabled() {
     if (!searchConfig.isEnabled()) {
       log.debug("Search is disabled, skipping indexing");
@@ -198,6 +292,20 @@ public class SearchService {
   private boolean indexEventWithRunUuid(LineageEvent event, UUID runUuid) {
     log.debug("Indexing event for run {}", runUuid);
 
+    List<BulkOperation> operations = buildIndexOperations(event, runUuid);
+
+    try {
+      BulkResponse response = openSearchClient.bulk(BulkRequest.of(b -> b.operations(operations)));
+      throwIfBulkFailed(response);
+      return true;
+    } catch (IOException e) {
+      // Search is a best-effort side effect. Preserve intake when its transport is unavailable.
+      log.error("Failed to index event; OpenSearch is not available.", e);
+      return false;
+    }
+  }
+
+  private List<BulkOperation> buildIndexOperations(LineageEvent event, UUID runUuid) {
     int operationCount = 1;
     if (event.getInputs() != null) {
       operationCount += event.getInputs().size();
@@ -210,16 +318,7 @@ public class SearchService {
     addDatasetOperations(operations, event.getInputs(), runUuid, event);
     addDatasetOperations(operations, event.getOutputs(), runUuid, event);
     operations.add(buildJobIndexOperation(runUuid, event));
-
-    try {
-      BulkResponse response = openSearchClient.bulk(BulkRequest.of(b -> b.operations(operations)));
-      throwIfBulkFailed(response);
-      return true;
-    } catch (IOException e) {
-      // Search is a best-effort side effect. Preserve intake when its transport is unavailable.
-      log.error("Failed to index event; OpenSearch is not available.", e);
-      return false;
-    }
+    return operations;
   }
 
   private UUID runUuidFromEvent(LineageEvent.Run run) {

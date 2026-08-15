@@ -23,7 +23,9 @@ class OpenLineageConfigTest {
   void defaults() {
     OpenLineageConfig config = new OpenLineageConfig();
 
+    assertThat(OpenLineageConfig.MAX_PROJECTION_BATCH_SIZE).isEqualTo(64);
     assertThat(config.getWorkerThreads()).isEqualTo(8);
+    assertThat(config.getProjectionBatchSize()).isEqualTo(8);
     assertThat(config.getPollIntervalMillis()).isEqualTo(1_000);
     assertThat(config.getMaxAttempts()).isEqualTo(10);
     assertThat(config.getRetryInitialDelayMillis()).isEqualTo(1_000);
@@ -39,6 +41,7 @@ class OpenLineageConfigTest {
             """
             {
               "workerThreads": 2,
+              "projectionBatchSize": 4,
               "pollIntervalMillis": 10,
               "maxAttempts": 3,
               "retryInitialDelayMillis": 30,
@@ -48,6 +51,7 @@ class OpenLineageConfigTest {
             """);
 
     assertThat(config.getWorkerThreads()).isEqualTo(2);
+    assertThat(config.getProjectionBatchSize()).isEqualTo(4);
     assertThat(config.getPollIntervalMillis()).isEqualTo(10);
     assertThat(config.getMaxAttempts()).isEqualTo(3);
     assertThat(config.getRetryInitialDelayMillis()).isEqualTo(30);
@@ -63,6 +67,7 @@ class OpenLineageConfigTest {
             """
             {
               "workerThreads": 0,
+              "projectionBatchSize": 0,
               "pollIntervalMillis": 0,
               "maxAttempts": 0,
               "retryInitialDelayMillis": 0,
@@ -78,11 +83,33 @@ class OpenLineageConfigTest {
     assertThat(invalidProperties)
         .contains(
             "workerThreads",
+            "projectionBatchSize",
             "pollIntervalMillis",
             "maxAttempts",
             "retryInitialDelayMillis",
             "retryMaxDelayMillis",
             "shutdownGracePeriodMillis");
+  }
+
+  @Test
+  void acceptsProjectionBatchSizeBounds() throws Exception {
+    OpenLineageConfig singleton = fromJson("{\"projectionBatchSize\": 1}");
+    OpenLineageConfig maximum =
+        fromJson("{\"projectionBatchSize\": " + OpenLineageConfig.MAX_PROJECTION_BATCH_SIZE + "}");
+
+    assertThat(VALIDATOR.validate(singleton)).isEmpty();
+    assertThat(VALIDATOR.validate(maximum)).isEmpty();
+  }
+
+  @Test
+  void rejectsProjectionBatchSizeAboveMaximum() throws Exception {
+    OpenLineageConfig config =
+        fromJson(
+            "{\"projectionBatchSize\": " + (OpenLineageConfig.MAX_PROJECTION_BATCH_SIZE + 1) + "}");
+
+    assertThat(VALIDATOR.validate(config))
+        .extracting(violation -> violation.getPropertyPath().toString())
+        .containsExactly("projectionBatchSize");
   }
 
   @Test

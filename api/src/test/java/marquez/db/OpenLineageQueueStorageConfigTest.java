@@ -173,6 +173,117 @@ class OpenLineageQueueStorageConfigTest {
   }
 
   @Test
+  void admissionMetadataUsesOneNarrowPartialQueueIndexAndNoDeadLetterIndex() {
+    Map<String, ColumnContract> columns = new LinkedHashMap<>();
+    jdbi.useHandle(
+        handle ->
+            handle
+                .createQuery(
+                    """
+                    SELECT table_name,
+                           data_type,
+                           is_nullable,
+                           column_default
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND column_name = 'admission_id'
+                      AND table_name IN (
+                        'open_lineage_queue',
+                        'open_lineage_dead_letters')
+                    ORDER BY table_name
+                    """)
+                .map(
+                    (resultSet, context) ->
+                        Map.entry(
+                            resultSet.getString("table_name"),
+                            new ColumnContract(
+                                resultSet.getString("data_type"),
+                                resultSet.getString("is_nullable"),
+                                resultSet.getString("column_default"))))
+                .forEach(entry -> columns.put(entry.getKey(), entry.getValue())));
+
+    assertThat(columns)
+        .containsExactlyInAnyOrderEntriesOf(
+            Map.of(
+                "open_lineage_queue",
+                new ColumnContract("bigint", "YES", null),
+                "open_lineage_dead_letters",
+                new ColumnContract("bigint", "YES", null)));
+
+    IndexContract admissionIndex =
+        jdbi.withHandle(
+            handle ->
+                handle
+                    .createQuery(
+                        """
+                        SELECT pg_get_indexdef(indexes.indexrelid) AS definition,
+                               indexes.indnatts AS total_columns,
+                               ARRAY(
+                                 SELECT pg_get_indexdef(indexes.indexrelid, key_position, TRUE)
+                                 FROM generate_series(1, indexes.indnkeyatts)
+                                   AS positions(key_position)
+                                 ORDER BY key_position
+                               ) AS key_columns
+                        FROM pg_index AS indexes
+                        WHERE indexes.indexrelid =
+                          to_regclass(current_schema() || '.open_lineage_queue_admission_idx')
+                        """)
+                    .map(
+                        (resultSet, context) ->
+                            new IndexContract(
+                                resultSet.getString("definition"),
+                                resultSet.getInt("total_columns"),
+                                options(resultSet.getArray("key_columns"))))
+                    .one());
+    assertThat(admissionIndex.keyColumns()).containsExactlyInAnyOrder("admission_id", "id");
+    assertThat(admissionIndex.totalColumns()).isEqualTo(2);
+    assertThat(admissionIndex.definition())
+        .contains("admission_id", "WHERE", "IS NOT NULL")
+        .doesNotContain("ordering_key", "INCLUDE");
+
+    String ownedSequence =
+        jdbi.withHandle(
+            handle ->
+                handle
+                    .createQuery(
+                        """
+                        SELECT sequence.relname
+                        FROM pg_class AS sequence
+                        JOIN pg_depend AS dependency
+                          ON dependency.objid = sequence.oid
+                         AND dependency.deptype = 'a'
+                        JOIN pg_attribute AS attribute
+                          ON attribute.attrelid = dependency.refobjid
+                         AND attribute.attnum = dependency.refobjsubid
+                        WHERE sequence.relkind = 'S'
+                          AND dependency.refobjid =
+                              to_regclass(current_schema() || '.open_lineage_queue')
+                          AND attribute.attname = 'admission_id'
+                        """)
+                    .mapTo(String.class)
+                    .one());
+    assertThat(ownedSequence).isEqualTo("open_lineage_queue_admission_id_seq");
+
+    int deadLetterAdmissionIndexes =
+        jdbi.withHandle(
+            handle ->
+                handle
+                    .createQuery(
+                        """
+                        SELECT count(*)
+                        FROM pg_index AS indexes
+                        JOIN pg_class AS relation
+                          ON relation.oid = indexes.indrelid
+                        WHERE relation.oid =
+                              to_regclass(current_schema() || '.open_lineage_dead_letters')
+                          AND pg_get_indexdef(indexes.indexrelid) LIKE '%admission_id%'
+                        """)
+                    .mapTo(Integer.class)
+                    .one());
+    assertThat(deadLetterAdmissionIndexes).isZero();
+  }
+
+  @Test
   void queueIdentitySequenceDoesNotCacheIdsAcrossConnections() {
     long cacheSize =
         jdbi.withHandle(

@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -26,9 +27,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.opensearch.client.opensearch.OpenSearchClient;
+import org.opensearch.client.opensearch._types.ErrorCause;
 import org.opensearch.client.opensearch.core.BulkRequest;
 import org.opensearch.client.opensearch.core.BulkResponse;
 import org.opensearch.client.opensearch.core.bulk.BulkOperation;
+import org.opensearch.client.opensearch.core.bulk.BulkResponseItem;
 
 class SearchServiceTest {
   private static final UUID RUN_ID = UUID.fromString("de2d8a76-57b3-42f6-8d26-06d6179ac45c");
@@ -84,6 +87,39 @@ class SearchServiceTest {
   }
 
   @Test
+  void indexesQueuedEventsInOneOrderedBulkRequestWithTheirEffectiveRunUuids() throws IOException {
+    stubSuccessfulBulk();
+    LineageEvent first = lineageEvent();
+    LineageEvent second = lineageEvent();
+
+    assertThat(
+            searchService.indexEventsBestEffort(
+                List.of(
+                    new SearchService.IndexEntry(first, RUN_ID),
+                    new SearchService.IndexEntry(second, EFFECTIVE_RUN_ID))))
+        .isZero();
+
+    ArgumentCaptor<BulkRequest> request = ArgumentCaptor.forClass(BulkRequest.class);
+    verify(openSearchClient).bulk(request.capture());
+    List<BulkOperation> operations = request.getValue().operations();
+    assertThat(operations)
+        .extracting(operation -> operation.index().id())
+        .containsExactly(
+            "DATASET.aW5wdXQtbmFtZXNwYWNl.aW5wdXQ",
+            "DATASET.b3V0cHV0LW5hbWVzcGFjZQ.b3V0cHV0",
+            "JOB.am9iLW5hbWVzcGFjZQ.am9i",
+            "DATASET.aW5wdXQtbmFtZXNwYWNl.aW5wdXQ",
+            "DATASET.b3V0cHV0LW5hbWVzcGFjZQ.b3V0cHV0",
+            "JOB.am9iLW5hbWVzcGFjZQ.am9i");
+    assertThat(operations.subList(0, 3))
+        .extracting(operation -> indexDocument(operation).get("run_id"))
+        .containsOnly(RUN_ID.toString());
+    assertThat(operations.subList(3, 6))
+        .extracting(operation -> indexDocument(operation).get("run_id"))
+        .containsOnly(EFFECTIVE_RUN_ID.toString());
+  }
+
+  @Test
   void continuesWhenBulkTransportIsUnavailable() throws IOException {
     when(openSearchClient.bulk(any(BulkRequest.class)))
         .thenThrow(new IOException("OpenSearch unavailable"));
@@ -100,6 +136,124 @@ class SearchServiceTest {
     when(openSearchClient.bulk(any(BulkRequest.class))).thenReturn(response);
 
     assertThrows(IllegalStateException.class, () -> searchService.indexEvent(lineageEvent()));
+  }
+
+  @Test
+  void queuedSingletonStillThrowsWhenBulkResponseContainsItemErrors() throws IOException {
+    BulkResponse response = mock(BulkResponse.class);
+    when(response.errors()).thenReturn(true);
+    when(response.items()).thenReturn(List.of());
+    when(openSearchClient.bulk(any(BulkRequest.class))).thenReturn(response);
+
+    assertThrows(
+        IllegalStateException.class,
+        () -> searchService.indexEvent(lineageEvent(), EFFECTIVE_RUN_ID));
+  }
+
+  @Test
+  void batchCountsDistinctFailedEntriesRatherThanFailedOperations() throws IOException {
+    BulkResponse response = mock(BulkResponse.class);
+    when(response.errors()).thenReturn(true);
+    doReturn(
+            List.of(
+                failedItem("first input"),
+                successfulItem(),
+                failedItem("first job"),
+                successfulItem(),
+                failedItem("second output"),
+                successfulItem(),
+                successfulItem(),
+                successfulItem(),
+                successfulItem()))
+        .when(response)
+        .items();
+    when(openSearchClient.bulk(any(BulkRequest.class))).thenReturn(response);
+
+    assertThat(
+            searchService.indexEventsBestEffort(
+                List.of(
+                    new SearchService.IndexEntry(lineageEvent(), RUN_ID),
+                    new SearchService.IndexEntry(lineageEvent(), EFFECTIVE_RUN_ID),
+                    new SearchService.IndexEntry(lineageEvent(), UUID.randomUUID()))))
+        .isEqualTo(2);
+  }
+
+  @Test
+  void batchTransportFailureCountsEverySubmittedEntry() throws IOException {
+    when(openSearchClient.bulk(any(BulkRequest.class)))
+        .thenThrow(new IOException("OpenSearch unavailable"));
+
+    assertThat(
+            searchService.indexEventsBestEffort(
+                List.of(
+                    new SearchService.IndexEntry(lineageEvent(), RUN_ID),
+                    new SearchService.IndexEntry(lineageEvent(), EFFECTIVE_RUN_ID))))
+        .isEqualTo(2);
+  }
+
+  @Test
+  void batchRuntimeFailureCountsEverySubmittedEntry() throws IOException {
+    when(openSearchClient.bulk(any(BulkRequest.class)))
+        .thenThrow(new IllegalStateException("serialization failed"));
+
+    assertThat(
+            searchService.indexEventsBestEffort(
+                List.of(
+                    new SearchService.IndexEntry(lineageEvent(), RUN_ID),
+                    new SearchService.IndexEntry(lineageEvent(), EFFECTIVE_RUN_ID))))
+        .isEqualTo(2);
+  }
+
+  @Test
+  void batchMaterializationFailureDoesNotSubmitPartialOperationsOrSuppressLaterEntries()
+      throws IOException {
+    stubSuccessfulBulk();
+    LineageEvent malformed = mock(LineageEvent.class);
+    when(malformed.getInputs()).thenReturn(List.of(dataset("partial", "input")));
+    when(malformed.getOutputs()).thenReturn(List.of(dataset("partial", "output")));
+    when(malformed.getJob()).thenThrow(new IllegalStateException("missing job"));
+
+    assertThat(
+            searchService.indexEventsBestEffort(
+                List.of(
+                    new SearchService.IndexEntry(malformed, RUN_ID),
+                    new SearchService.IndexEntry(lineageEvent(), EFFECTIVE_RUN_ID))))
+        .isEqualTo(1);
+
+    List<BulkOperation> operations = capturedOperations();
+    assertThat(operations).hasSize(3);
+    assertThat(operations)
+        .extracting(operation -> indexDocument(operation).get("run_id"))
+        .containsOnly(EFFECTIVE_RUN_ID.toString());
+  }
+
+  @Test
+  void batchConservativelyFailsSubmittedEntriesWhenErrorResponseCannotBeAligned()
+      throws IOException {
+    BulkResponse response = mock(BulkResponse.class);
+    when(response.errors()).thenReturn(true);
+    when(response.items()).thenReturn(List.of());
+    when(openSearchClient.bulk(any(BulkRequest.class))).thenReturn(response);
+
+    assertThat(
+            searchService.indexEventsBestEffort(
+                List.of(
+                    new SearchService.IndexEntry(lineageEvent(), RUN_ID),
+                    new SearchService.IndexEntry(lineageEvent(), EFFECTIVE_RUN_ID))))
+        .isEqualTo(2);
+  }
+
+  @Test
+  void emptyOrDisabledBatchSkipsBulkRequest() {
+    assertThat(searchService.indexEventsBestEffort(List.of())).isZero();
+    when(searchConfig.isEnabled()).thenReturn(false);
+
+    assertThat(
+            searchService.indexEventsBestEffort(
+                List.of(new SearchService.IndexEntry(lineageEvent(), EFFECTIVE_RUN_ID))))
+        .isZero();
+
+    verifyNoInteractions(openSearchClient);
   }
 
   @Test
@@ -202,6 +356,18 @@ class SearchServiceTest {
     BulkResponse response = mock(BulkResponse.class);
     when(response.errors()).thenReturn(false);
     when(openSearchClient.bulk(any(BulkRequest.class))).thenReturn(response);
+  }
+
+  private static BulkResponseItem successfulItem() {
+    return mock(BulkResponseItem.class);
+  }
+
+  private static BulkResponseItem failedItem(String reason) {
+    BulkResponseItem item = mock(BulkResponseItem.class);
+    ErrorCause error = mock(ErrorCause.class);
+    when(error.reason()).thenReturn(reason);
+    when(item.error()).thenReturn(error);
+    return item;
   }
 
   @SuppressWarnings("unchecked")

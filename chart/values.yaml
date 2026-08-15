@@ -63,6 +63,8 @@ marquez:
   ##
   openLineage:
     workerThreads: 8
+    # Maximum events projected per durable batch transaction (1-64); 1 uses singleton projection.
+    projectionBatchSize: 8
     pollIntervalMillis: 1000
     # Maximum committed caught-failure count; the failure reaching this count is dead-lettered.
     maxAttempts: 10

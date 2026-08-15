@@ -112,32 +112,55 @@ public class OpenLineageBatchIntegrationTest extends BaseIntegrationTest {
   }
 
   @Test
-  void acceptedSameLaneBatchReturnsBeforeProjectionAndQueuesInRequestOrder() throws Exception {
+  void acceptedSameLaneBatchesReturnBeforeProjectionAndPreserveAdmissionOrder() throws Exception {
     UUID runId = UUID.randomUUID();
     String producer = "https://example.com/open-lineage-ordered-batch/" + runId;
     String jobName = "ordered-batch-" + runId;
     LineageEvent predecessor =
         runEvent(runId, "PREDECESSOR", EVENT_TIME.minusSeconds(1), producer, jobName);
     LineageEvent start = runEvent(runId, "START", EVENT_TIME, producer, jobName);
-    LineageEvent other = runEvent(runId, "OTHER", EVENT_TIME.plusSeconds(1), producer, jobName);
+    LineageEvent firstOther =
+        runEvent(runId, "OTHER", EVENT_TIME.plusSeconds(1), producer, jobName);
+    LineageEvent secondOther =
+        runEvent(runId, "OTHER", EVENT_TIME.plusSeconds(2), producer, jobName);
     LineageEvent complete =
-        runEvent(runId, "COMPLETE", EVENT_TIME.plusSeconds(2), producer, jobName);
+        runEvent(runId, "COMPLETE", EVENT_TIME.plusSeconds(3), producer, jobName);
     UUID orderingKey = OpenLineageQueueDao.orderingKeyFor(predecessor);
     long predecessorId = seedFrozenHead(orderingKey, predecessor);
 
     try {
-      HttpResponse<String> response =
-          sendLineageBatch(List.of(start, other, complete)).get(5, TimeUnit.SECONDS);
+      HttpResponse<String> firstResponse =
+          sendLineageBatch(List.of(start, firstOther)).get(5, TimeUnit.SECONDS);
+      HttpResponse<String> secondResponse =
+          sendLineageBatch(List.of(secondOther, complete)).get(5, TimeUnit.SECONDS);
 
-      assertThat(response.statusCode()).isEqualTo(204);
-      assertThat(response.body()).isEmpty();
+      assertThat(firstResponse.statusCode()).isEqualTo(204);
+      assertThat(firstResponse.body()).isEmpty();
+      assertThat(secondResponse.statusCode()).isEqualTo(204);
+      assertThat(secondResponse.body()).isEmpty();
 
       LaneAdmissionState state = laneAdmissionState(orderingKey, runId);
       assertThat(state.headEventId()).isEqualTo(predecessorId);
       assertThat(state.frozenHead()).isTrue();
       assertThat(state.rawCount()).isZero();
-      assertThat(state.queuedEventTypes())
-          .containsExactly("PREDECESSOR", "START", "OTHER", "COMPLETE");
+      assertThat(state.queuedEvents())
+          .extracting(QueuedAdmissionEvent::eventType)
+          .containsExactly("PREDECESSOR", "START", "OTHER", "OTHER", "COMPLETE");
+      assertThat(state.queuedEvents())
+          .extracting(QueuedAdmissionEvent::id)
+          .isSorted()
+          .doesNotHaveDuplicates();
+      assertThat(state.queuedEvents().get(0))
+          .isEqualTo(new QueuedAdmissionEvent(predecessorId, "PREDECESSOR", null));
+
+      Long firstAdmissionId = state.queuedEvents().get(1).admissionId();
+      Long secondAdmissionId = state.queuedEvents().get(3).admissionId();
+      assertThat(firstAdmissionId).isNotNull();
+      assertThat(secondAdmissionId).isNotNull().isNotEqualTo(firstAdmissionId);
+      assertThat(state.queuedEvents().subList(1, 3))
+          .allSatisfy(event -> assertThat(event.admissionId()).isEqualTo(firstAdmissionId));
+      assertThat(state.queuedEvents().subList(3, 5))
+          .allSatisfy(event -> assertThat(event.admissionId()).isEqualTo(secondAdmissionId));
     } finally {
       thawFrozenHead(orderingKey);
     }
@@ -284,17 +307,24 @@ public class OpenLineageBatchIntegrationTest extends BaseIntegrationTest {
                           new HeadState(
                               resultSet.getLong("event_id"), resultSet.getBoolean("frozen")))
                   .findOne();
-          List<String> eventTypes =
+          List<QueuedAdmissionEvent> events =
               handle
                   .createQuery(
                       """
-                      SELECT event::jsonb ->> 'eventType'
+                      SELECT id,
+                             event::jsonb ->> 'eventType' AS event_type,
+                             admission_id
                       FROM open_lineage_queue
                       WHERE ordering_key = :orderingKey
                       ORDER BY id
                       """)
                   .bind("orderingKey", orderingKey)
-                  .mapTo(String.class)
+                  .map(
+                      (resultSet, context) ->
+                          new QueuedAdmissionEvent(
+                              resultSet.getLong("id"),
+                              resultSet.getString("event_type"),
+                              resultSet.getObject("admission_id", Long.class)))
                   .list();
           long rawCount =
               handle
@@ -305,7 +335,7 @@ public class OpenLineageBatchIntegrationTest extends BaseIntegrationTest {
           return new LaneAdmissionState(
               head.map(HeadState::eventId).orElse(null),
               head.map(HeadState::frozen).orElse(false),
-              eventTypes,
+              events,
               rawCount);
         });
   }
@@ -324,6 +354,11 @@ public class OpenLineageBatchIntegrationTest extends BaseIntegrationTest {
 
   private record HeadState(long eventId, boolean frozen) {}
 
+  private record QueuedAdmissionEvent(long id, String eventType, Long admissionId) {}
+
   private record LaneAdmissionState(
-      Long headEventId, boolean frozenHead, List<String> queuedEventTypes, long rawCount) {}
+      Long headEventId,
+      boolean frozenHead,
+      List<QueuedAdmissionEvent> queuedEvents,
+      long rawCount) {}
 }

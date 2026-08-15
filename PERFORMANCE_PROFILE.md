@@ -402,6 +402,60 @@ JAVA_TOOL_OPTIONS=-DrunOpenLineageBatchThroughputBenchmark=true \
   --tests marquez.OpenLineageBatchThroughputBenchmark
 ```
 
+### Request-bounded projection batching methodology
+
+`OpenLineageBatchPipelineThroughputBenchmark` is the opt-in gate for downstream projection
+batching. It compares `projectionBatchSize=1` and `projectionBatchSize=8` in the same codebase and
+JVM. Both cells admit the same deterministic sequence of eight-event requests through the
+production durable-intake component. A projection claim is confined to one atomic admission: it
+never fills spare capacity with events from another request. Within that admission, the durable q2
+state also bounds each lane. A head whose `refresh_due_on_advance` bit is false may contribute its
+immediate same-admission follower, while a head whose bit is true contributes only itself.
+
+The benchmark reports durable admission and projector drain separately. Payload construction is
+outside both intervals. Admission timing ends only after every request transaction commits. Drain
+timing starts when the preloaded heads are made due and the real worker starts, and ends only after
+the live queue and head table are empty and the expected raw and relational projections are
+visible. The sum is reported as sequential pipeline time; it is not presented as a concurrent
+steady-state latency measurement. This prevents the admission gain from concealing projector
+work, while retaining the historical admission-only comparison above unchanged.
+
+One warm-up pair precedes seven measured seed-paired trials. Cell order alternates between sizes 1
+and 8, each measured cell uses a clean semantic fixture, and one worker thread removes concurrent
+scheduling as a confounder. The primary result is the distribution of paired drain-throughput
+ratios, accompanied by admission and drain events/second, elapsed time, successful-claim transaction
+counts, queue invariants, raw and relational projection counts, dead letters, and WAL/LSN movement.
+Results are publishable here only when every correctness gate passes and the measured trials support
+the stated claim.
+
+The 2026-08-15 local PostgreSQL 14 / Java 17 run used 64 admissions (512 events) per measured cell.
+Every gate passed: the queue and head table drained, all raw and relational counts matched, admission
+boundaries and exact claim sizes matched, and no retry, dead letter, or batch fallback occurred.
+
+| Metric (median of seven cells unless noted) | Batch size 1 | Batch size 8 | Effect |
+|---|---:|---:|---:|
+| Projection drain throughput | 39.6 events/s (36.5–40.9) | 87.5 events/s (79.9–89.6) | 2.189x paired median; size 8 won 7/7 pairs |
+| Successful projection claim transactions/cell | 512 | 64 | 8x fewer |
+| Sequential admission + drain throughput | 38.6 events/s | 82.6 events/s | 2.14x |
+| Durable admission throughput | 1,453.9 events/s | 1,465.2 events/s | 1.01x (neutral) |
+| Projection WAL | 11,044 bytes/event | 15,818 bytes/event | 1.43x |
+| Admission WAL | 1,190 bytes/event | 1,177 bytes/event | 0.99x (neutral) |
+
+The measured gain therefore comes from amortizing claim, transaction, and queue-finalization work;
+the relational projector still executes its mature per-event operations inside the outer
+transaction. The larger transaction increased projection WAL in this fixture, so tune batch size
+against replication volume, transaction age, and lock duration rather than treating 8 as a
+universal optimum. These results describe one local, single-worker fixture and do not establish
+production capacity.
+
+Run the benchmark explicitly; it is disabled in normal test execution:
+
+```text
+JAVA_TOOL_OPTIONS=-DrunOpenLineageBatchPipelineThroughputBenchmark=true \
+  ./gradlew --rerun-tasks :api:testIntegration \
+  --tests marquez.OpenLineageBatchPipelineThroughputBenchmark
+```
+
 ## Native bespoke stats-query profile
 
 The bounded `/api/v1/stats/query` path was measured on Java 17 and PostgreSQL 14 with 100,000
