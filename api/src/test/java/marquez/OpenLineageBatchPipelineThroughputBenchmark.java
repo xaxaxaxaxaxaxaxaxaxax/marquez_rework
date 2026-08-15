@@ -9,48 +9,54 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.time.ZoneOffset.UTC;
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.codahale.metrics.Histogram;
 import com.codahale.metrics.Meter;
 import com.codahale.metrics.MetricRegistry;
+import io.dropwizard.db.DataSourceFactory;
+import io.dropwizard.db.ManagedDataSource;
 import java.net.URI;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import marquez.api.JdbiUtils;
 import marquez.common.Utils;
+import marquez.db.DbMigration;
+import marquez.db.FlywayFactory;
 import marquez.db.OpenLineageDao;
 import marquez.db.OpenLineageQueueDao;
 import marquez.db.OpenLineageQueueDao.PreparedEvent;
-import marquez.jdbi.MarquezJdbiExternalPostgresExtension;
 import marquez.service.OpenLineageConfig;
 import marquez.service.OpenLineageIntake;
 import marquez.service.OpenLineageService;
 import marquez.service.OpenLineageWorker;
+import marquez.service.OpenLineageWorkerHealthCheck;
 import marquez.service.RunService;
 import marquez.service.models.LineageEvent;
 import org.jdbi.v3.core.Jdbi;
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
+import org.jdbi.v3.jackson2.Jackson2Config;
+import org.jdbi.v3.jackson2.Jackson2Plugin;
+import org.jdbi.v3.postgres.PostgresPlugin;
+import org.jdbi.v3.sqlobject.SqlObjectPlugin;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
-import org.junit.jupiter.api.extension.ExtendWith;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
 
 /**
  * Opt-in production-pipeline benchmark for projection batch sizes one and eight.
  *
- * <p>Run with {@code -DrunOpenLineageBatchPipelineThroughputBenchmark=true}. The fixture is built
- * outside both measured intervals. Admission and drain are timed separately so faster durable
- * intake cannot conceal projection cost. Every correctness assertion is also a benchmark gate.
+ * <p>Run with {@code -DrunOpenLineageBatchPipelineThroughputBenchmark=true}. Deterministic paired
+ * fixtures are admitted outside the measured interval. Only projector drain is timed, and every
+ * correctness or worker-health assertion is a benchmark gate.
  */
+@Testcontainers
 @Tag("IntegrationTests")
 @EnabledIfSystemProperty(named = "runOpenLineageBatchPipelineThroughputBenchmark", matches = "true")
-@ExtendWith(MarquezJdbiExternalPostgresExtension.class)
 public class OpenLineageBatchPipelineThroughputBenchmark {
   private static final int EVENTS_PER_ADMISSION = 8;
   private static final int WARMUP_ADMISSIONS =
@@ -66,18 +72,65 @@ public class OpenLineageBatchPipelineThroughputBenchmark {
   private static final String PRODUCER = "https://example.com/marquez-batch-pipeline-benchmark";
   private static final URI RUN_SCHEMA =
       URI.create("https://openlineage.io/spec/2-0-0/OpenLineage.json#/definitions/RunEvent");
+  private static final List<String> INVALIDATING_METERS =
+      List.of(
+          "retried",
+          "dead_lettered",
+          "batch_fallback",
+          "poll_failed",
+          "coordinator_failed",
+          "task_failed",
+          "state_transition_failed",
+          "post_commit_failed");
 
-  private Jdbi jdbi;
+  @Container
+  private static final PostgresContainer POSTGRES =
+      PostgresContainer.create("open-lineage-batch-pipeline-throughput-benchmark");
 
-  @BeforeEach
-  void setUp(Jdbi configuredJdbi) {
-    jdbi = configuredJdbi;
-    JdbiUtils.cleanDatabase(jdbi);
+  private static ManagedDataSource dataSource;
+  private static Jdbi jdbi;
+
+  @BeforeAll
+  static void setUpDatabase() throws Exception {
+    DataSourceFactory sourceFactory = new DataSourceFactory();
+    sourceFactory.setDriverClass("org.postgresql.Driver");
+    sourceFactory.setUrl(POSTGRES.getJdbcUrl());
+    sourceFactory.setUser(POSTGRES.getUsername());
+    sourceFactory.setPassword(POSTGRES.getPassword());
+    sourceFactory.setInitialSize(1);
+    sourceFactory.setMinSize(1);
+    sourceFactory.setMaxSize(1);
+    sourceFactory.setDefaultTransactionIsolation(
+        DataSourceFactory.TransactionIsolation.READ_COMMITTED);
+
+    ManagedDataSource configuredDataSource =
+        sourceFactory.build(new MetricRegistry(), "open-lineage-batch-pipeline-benchmark");
+    try {
+      configuredDataSource.start();
+      DbMigration.migrateDbOrError(new FlywayFactory(), configuredDataSource, true);
+      Jdbi configuredJdbi =
+          Jdbi.create(configuredDataSource)
+              .installPlugin(new SqlObjectPlugin())
+              .installPlugin(new PostgresPlugin())
+              .installPlugin(new Jackson2Plugin());
+      configuredJdbi.getConfig(Jackson2Config.class).setMapper(Utils.getMapper());
+      dataSource = configuredDataSource;
+      jdbi = configuredJdbi;
+    } catch (Exception | Error failure) {
+      try {
+        configuredDataSource.stop();
+      } catch (Exception stopFailure) {
+        failure.addSuppressed(stopFailure);
+      }
+      throw failure;
+    }
   }
 
-  @AfterEach
-  void tearDown() {
-    JdbiUtils.cleanDatabase(jdbi);
+  @AfterAll
+  static void tearDownDatabase() throws Exception {
+    if (dataSource != null) {
+      dataSource.stop();
+    }
   }
 
   @Test
@@ -90,15 +143,15 @@ public class OpenLineageBatchPipelineThroughputBenchmark {
     runCell(1, WARMUP_ADMISSIONS, "warmup", "warmup-size1");
     runCell(8, WARMUP_ADMISSIONS, "warmup", "warmup-size8");
 
-    List<CellResult> size1Results = new ArrayList<>(TRIALS);
-    List<CellResult> size8Results = new ArrayList<>(TRIALS);
+    List<TimedCount> size1Results = new ArrayList<>(TRIALS);
+    List<TimedCount> size8Results = new ArrayList<>(TRIALS);
     List<Double> pairedDrainSpeedups = new ArrayList<>(TRIALS);
     int size8FasterPairs = 0;
     for (int trial = 1; trial <= TRIALS; trial++) {
       String fixtureKey = "trial-" + trial;
       String order;
-      CellResult size1;
-      CellResult size8;
+      TimedCount size1;
+      TimedCount size8;
       if ((trial & 1) == 1) {
         order = "size1,size8";
         size1 = runCell(1, ADMISSIONS_PER_CELL, fixtureKey, fixtureKey + "-size1");
@@ -109,7 +162,7 @@ public class OpenLineageBatchPipelineThroughputBenchmark {
         size1 = runCell(1, ADMISSIONS_PER_CELL, fixtureKey, fixtureKey + "-size1");
       }
 
-      double pairedDrainSpeedup = size8.drainEventsPerSecond() / size1.drainEventsPerSecond();
+      double pairedDrainSpeedup = size8.perSecond() / size1.perSecond();
       if (pairedDrainSpeedup > 1.0) {
         size8FasterPairs++;
       }
@@ -124,138 +177,111 @@ public class OpenLineageBatchPipelineThroughputBenchmark {
               + "paired_drain_speedup=%.3fx%n",
           trial,
           order,
-          size1.eventCount(),
-          size1.drainEventsPerSecond(),
-          size8.drainEventsPerSecond(),
+          size1.count(),
+          size1.perSecond(),
+          size8.perSecond(),
           pairedDrainSpeedup);
     }
 
-    List<Double> size1AdmissionThroughputs =
-        size1Results.stream().map(CellResult::admissionEventsPerSecond).toList();
-    List<Double> size8AdmissionThroughputs =
-        size8Results.stream().map(CellResult::admissionEventsPerSecond).toList();
-    List<Double> size1DrainThroughputs =
-        size1Results.stream().map(CellResult::drainEventsPerSecond).toList();
-    List<Double> size8DrainThroughputs =
-        size8Results.stream().map(CellResult::drainEventsPerSecond).toList();
-    List<Double> size1PipelineThroughputs =
-        size1Results.stream().map(CellResult::sequentialPipelineEventsPerSecond).toList();
-    List<Double> size8PipelineThroughputs =
-        size8Results.stream().map(CellResult::sequentialPipelineEventsPerSecond).toList();
+    List<Double> size1DrainThroughputs = size1Results.stream().map(TimedCount::perSecond).toList();
+    List<Double> size8DrainThroughputs = size8Results.stream().map(TimedCount::perSecond).toList();
+    Distribution size1Distribution = Distribution.of(size1DrainThroughputs);
+    Distribution size8Distribution = Distribution.of(size8DrainThroughputs);
+    Distribution speedupDistribution = Distribution.of(pairedDrainSpeedups);
 
     System.out.printf(
         Locale.ROOT,
         "OPENLINEAGE_BATCH_PIPELINE_SUMMARY admissions_per_cell=%d events_per_cell=%d trials=%d "
-            + "size1_admission_median_events_per_second=%.1f "
-            + "size8_admission_median_events_per_second=%.1f "
             + "size1_drain_median_events_per_second=%.1f size1_drain_range=%.1f..%.1f "
             + "size8_drain_median_events_per_second=%.1f size8_drain_range=%.1f..%.1f "
-            + "size1_sequential_pipeline_median_events_per_second=%.1f "
-            + "size8_sequential_pipeline_median_events_per_second=%.1f "
             + "paired_drain_median_speedup=%.3fx paired_drain_range=%.3f..%.3f "
             + "size8_faster_pairs=%d/%d%n",
         ADMISSIONS_PER_CELL,
         Math.multiplyExact(ADMISSIONS_PER_CELL, EVENTS_PER_ADMISSION),
         TRIALS,
-        median(size1AdmissionThroughputs),
-        median(size8AdmissionThroughputs),
-        median(size1DrainThroughputs),
-        minimum(size1DrainThroughputs),
-        maximum(size1DrainThroughputs),
-        median(size8DrainThroughputs),
-        minimum(size8DrainThroughputs),
-        maximum(size8DrainThroughputs),
-        median(size1PipelineThroughputs),
-        median(size8PipelineThroughputs),
-        median(pairedDrainSpeedups),
-        minimum(pairedDrainSpeedups),
-        maximum(pairedDrainSpeedups),
+        size1Distribution.median(),
+        size1Distribution.minimum(),
+        size1Distribution.maximum(),
+        size8Distribution.median(),
+        size8Distribution.minimum(),
+        size8Distribution.maximum(),
+        speedupDistribution.median(),
+        speedupDistribution.minimum(),
+        speedupDistribution.maximum(),
         size8FasterPairs,
         TRIALS);
   }
 
-  private CellResult runCell(
+  private TimedCount runCell(
       int projectionBatchSize, int admissionCount, String fixtureKey, String cellName)
       throws Exception {
     JdbiUtils.cleanDatabase(jdbi);
     List<List<PreparedEvent>> admissions = preparedAdmissions(fixtureKey, admissionCount);
-    List<UUID> expectedRunIds = expectedRunIds(admissions);
     int eventCount = Math.multiplyExact(admissionCount, EVENTS_PER_ADMISSION);
     OpenLineageIntake intake =
         new OpenLineageIntake(jdbi.onDemand(OpenLineageQueueDao.class), () -> {});
 
-    String beforeAdmissionLsn = currentWalLsn();
-    long admissionStartedAt = System.nanoTime();
     int admitted = 0;
     for (List<PreparedEvent> admission : admissions) {
       admitted += intake.enqueueAll(admission);
     }
-    long admissionNanos = System.nanoTime() - admissionStartedAt;
-    String afterAdmissionLsn = currentWalLsn();
-
     assertThat(admitted).isEqualTo(eventCount);
-    assertQueuedFixture(admissionCount, expectedRunIds);
+
+    vacuumAnalyze();
+    assertQueuedFixture(admissionCount, eventCount);
 
     MetricRegistry metrics = new MetricRegistry();
     OpenLineageWorker worker = newWorker(projectionBatchSize, metrics);
     Meter successes = metrics.meter(workerMetricName("succeeded"));
-    Meter retries = metrics.meter(workerMetricName("retried"));
-    Meter deadLetters = metrics.meter(workerMetricName("dead_lettered"));
+    List<Meter> invalidatingMeters =
+        INVALIDATING_METERS.stream()
+            .map(suffix -> metrics.meter(workerMetricName(suffix)))
+            .toList();
     long drainNanos;
     try {
       long drainStartedAt = System.nanoTime();
       worker.start();
-      awaitSuccessfulDrain(eventCount, successes, retries, deadLetters);
+      awaitSuccessfulDrain(eventCount, successes, invalidatingMeters, metrics);
       drainNanos = System.nanoTime() - drainStartedAt;
+      assertThat(new OpenLineageWorkerHealthCheck(worker).execute().isHealthy())
+          .as("worker health after the measured drain")
+          .isTrue();
     } finally {
       worker.stop();
     }
-    String afterDrainLsn = currentWalLsn();
+
+    assertNoInvalidatingMeters(metrics);
+    assertThat(metrics.meter(workerMetricName("forced_shutdown")).getCount()).isZero();
+    assertThat(metrics.meter(workerMetricName("shutdown_incomplete")).getCount()).isZero();
+
+    WorkerCounts workerCounts = workerCounts(metrics);
+    long maximumSelected =
+        Math.multiplyExact((long) projectionBatchSize, workerCounts.nonemptyClaims());
+    assertThat(workerCounts.nonemptyClaims()).isPositive();
+    assertThat(workerCounts.nonemptyClaims()).isEqualTo(eventCount / projectionBatchSize);
+    assertThat(workerCounts.selected()).isGreaterThanOrEqualTo(workerCounts.nonemptyClaims());
+    assertThat(workerCounts.selected()).isLessThanOrEqualTo(maximumSelected);
+    assertThat(workerCounts.committedOutcomes()).isLessThanOrEqualTo(workerCounts.selected());
+    assertThat(workerCounts.selected()).isEqualTo(eventCount);
+    assertThat(workerCounts.committedOutcomes()).isEqualTo(eventCount);
+    assertThat(workerCounts.selected()).isEqualTo(maximumSelected);
 
     assertProjectedFixture(admissionCount, eventCount);
-    Histogram claimSize = metrics.histogram(workerMetricName("claim_size"));
-    long expectedClaims = projectionBatchSize == 1 ? eventCount : admissionCount;
-    assertThat(claimSize.getCount()).isEqualTo(expectedClaims);
-    assertThat(claimSize.getSnapshot().getMin()).isEqualTo(projectionBatchSize);
-    assertThat(claimSize.getSnapshot().getMax()).isEqualTo(projectionBatchSize);
-    assertThat(metrics.meter(workerMetricName("selected")).getCount()).isEqualTo(eventCount);
-    assertThat(successes.getCount()).isEqualTo(eventCount);
-    assertThat(retries.getCount()).isZero();
-    assertThat(deadLetters.getCount()).isZero();
-    assertThat(metrics.meter(workerMetricName("batch_fallback")).getCount()).isZero();
-
-    CellResult result =
-        new CellResult(
-            projectionBatchSize,
-            admissionCount,
-            eventCount,
-            admissionNanos,
-            drainNanos,
-            admissionCount,
-            expectedClaims,
-            walBytes(beforeAdmissionLsn, afterAdmissionLsn),
-            walBytes(afterAdmissionLsn, afterDrainLsn));
+    TimedCount result = new TimedCount(eventCount, drainNanos);
     System.out.printf(
         Locale.ROOT,
         "OPENLINEAGE_BATCH_PIPELINE_CELL cell=%s projection_batch_size=%d admissions=%d "
-            + "events=%d admission_millis=%.3f admission_events_per_second=%.1f "
-            + "drain_millis=%.3f drain_events_per_second=%.1f "
-            + "sequential_pipeline_events_per_second=%.1f admission_transactions=%d "
-            + "successful_projection_claim_transactions=%d admission_wal_bytes=%d "
-            + "drain_wal_bytes=%d%n",
+            + "events=%d drain_millis=%.3f drain_events_per_second=%.1f "
+            + "nonempty_claims=%d selected=%d committed_outcomes=%d%n",
         cellName,
         projectionBatchSize,
         admissionCount,
         eventCount,
-        nanosToMillis(admissionNanos),
-        result.admissionEventsPerSecond(),
         nanosToMillis(drainNanos),
-        result.drainEventsPerSecond(),
-        result.sequentialPipelineEventsPerSecond(),
-        result.admissionTransactions(),
-        result.successfulProjectionClaimTransactions(),
-        result.admissionWalBytes(),
-        result.drainWalBytes());
+        result.perSecond(),
+        workerCounts.nonemptyClaims(),
+        workerCounts.selected(),
+        workerCounts.committedOutcomes());
     return result;
   }
 
@@ -264,12 +290,7 @@ public class OpenLineageBatchPipelineThroughputBenchmark {
     OpenLineageDao baseDao = jdbi.onDemand(OpenLineageDao.class);
     RunService runService = new RunService(baseDao, List.of());
     OpenLineageService service = new OpenLineageService(baseDao, runService, Runnable::run);
-    return new OpenLineageWorker(
-        jdbi,
-        jdbi.onDemand(OpenLineageQueueDao.class),
-        service,
-        workerConfig(projectionBatchSize),
-        metrics);
+    return new OpenLineageWorker(jdbi, service, workerConfig(projectionBatchSize), metrics);
   }
 
   private static OpenLineageConfig workerConfig(int projectionBatchSize) throws Exception {
@@ -291,61 +312,48 @@ public class OpenLineageBatchPipelineThroughputBenchmark {
   }
 
   private void awaitSuccessfulDrain(
-      int expectedEvents, Meter successes, Meter retries, Meter deadLetters)
+      int expectedEvents, Meter successes, List<Meter> invalidatingMeters, MetricRegistry metrics)
       throws InterruptedException {
     long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(DRAIN_TIMEOUT_SECONDS);
     while (successes.getCount() < expectedEvents
-        && retries.getCount() == 0
-        && deadLetters.getCount() == 0
+        && invalidatingMeterCount(invalidatingMeters) == 0
         && System.nanoTime() < deadline) {
       TimeUnit.MILLISECONDS.sleep(1);
     }
-    assertThat(retries.getCount()).as("projection retries while draining").isZero();
-    assertThat(deadLetters.getCount()).as("projection dead letters while draining").isZero();
+    assertNoInvalidatingMeters(metrics);
     assertThat(successes.getCount())
         .as("events projected before the drain timeout")
         .isEqualTo(expectedEvents);
   }
 
-  private void assertQueuedFixture(int admissionCount, List<UUID> expectedRunIds) {
-    List<QueuedEvent> queued =
-        jdbi.withHandle(
-            handle ->
-                handle
-                    .createQuery(
-                        """
-                        SELECT id,
-                               event::jsonb -> 'run' ->> 'runId' AS run_id,
-                               admission_id
-                        FROM open_lineage_queue
-                        ORDER BY id
-                        """)
-                    .map(
-                        (resultSet, context) ->
-                            new QueuedEvent(
-                                resultSet.getLong("id"),
-                                UUID.fromString(resultSet.getString("run_id")),
-                                resultSet.getObject("admission_id", Long.class)))
-                    .list());
-    assertThat(queued).hasSize(expectedRunIds.size());
-    assertThat(queued).extracting(QueuedEvent::id).isSorted().doesNotHaveDuplicates();
-    assertThat(queued).extracting(QueuedEvent::runId).containsExactlyElementsOf(expectedRunIds);
-
-    Set<Long> admissionIds = new HashSet<>();
-    for (int admission = 0; admission < admissionCount; admission++) {
-      List<QueuedEvent> members =
-          queued.subList(admission * EVENTS_PER_ADMISSION, (admission + 1) * EVENTS_PER_ADMISSION);
-      Long admissionId = members.get(0).admissionId();
-      assertThat(admissionId).isNotNull();
-      assertThat(members)
-          .allSatisfy(member -> assertThat(member.admissionId()).isEqualTo(admissionId));
-      assertThat(admissionIds.add(admissionId)).isTrue();
+  private static long invalidatingMeterCount(List<Meter> meters) {
+    long count = 0;
+    for (Meter meter : meters) {
+      count += meter.getCount();
     }
+    return count;
+  }
 
-    QueueCounts counts = queueCounts();
-    assertThat(counts)
-        .isEqualTo(
-            new QueueCounts(expectedRunIds.size(), expectedRunIds.size(), admissionCount, 0, 0));
+  private static void assertNoInvalidatingMeters(MetricRegistry metrics) {
+    for (String suffix : INVALIDATING_METERS) {
+      assertThat(metrics.meter(workerMetricName(suffix)).getCount())
+          .as("OpenLineage worker %s meter", suffix)
+          .isZero();
+    }
+  }
+
+  private static WorkerCounts workerCounts(MetricRegistry metrics) {
+    return new WorkerCounts(
+        metrics.histogram(workerMetricName("claim_size")).getCount(),
+        metrics.meter(workerMetricName("selected")).getCount(),
+        metrics.meter(workerMetricName("succeeded")).getCount(),
+        metrics.meter(workerMetricName("retried")).getCount(),
+        metrics.meter(workerMetricName("dead_lettered")).getCount());
+  }
+
+  private void assertQueuedFixture(int admissionCount, int eventCount) {
+    assertThat(QueueSnapshot.read(jdbi))
+        .isEqualTo(QueueSnapshot.batch(eventCount, admissionCount, EVENTS_PER_ADMISSION));
     long rawEventCount =
         jdbi.withHandle(
             handle ->
@@ -354,7 +362,7 @@ public class OpenLineageBatchPipelineThroughputBenchmark {
   }
 
   private void assertProjectedFixture(int admissionCount, int eventCount) {
-    assertThat(queueCounts()).isEqualTo(new QueueCounts(0, 0, 0, 0, 0));
+    assertThat(QueueSnapshot.read(jdbi)).isEqualTo(QueueSnapshot.empty());
     ProjectionCounts counts =
         jdbi.withHandle(
             handle ->
@@ -387,29 +395,8 @@ public class OpenLineageBatchPipelineThroughputBenchmark {
                 Math.multiplyExact(admissionCount, 4)));
   }
 
-  private QueueCounts queueCounts() {
-    return jdbi.withHandle(
-        handle ->
-            handle
-                .createQuery(
-                    """
-                    SELECT (SELECT count(*) FROM open_lineage_queue) AS queued,
-                           (SELECT count(*) FROM open_lineage_queue_heads) AS heads,
-                           (SELECT count(DISTINCT admission_id) FROM open_lineage_queue)
-                               AS admissions,
-                           (SELECT count(*) FROM open_lineage_queue WHERE admission_id IS NULL)
-                               AS null_admissions,
-                           (SELECT count(*) FROM open_lineage_dead_letters) AS dead_letters
-                    """)
-                .map(
-                    (resultSet, context) ->
-                        new QueueCounts(
-                            resultSet.getLong("queued"),
-                            resultSet.getLong("heads"),
-                            resultSet.getLong("admissions"),
-                            resultSet.getLong("null_admissions"),
-                            resultSet.getLong("dead_letters")))
-                .one());
+  private void vacuumAnalyze() {
+    jdbi.useHandle(handle -> handle.execute("VACUUM (ANALYZE)"));
   }
 
   private static List<List<PreparedEvent>> preparedAdmissions(
@@ -453,101 +440,21 @@ public class OpenLineageBatchPipelineThroughputBenchmark {
     return LineageEvent.Dataset.builder().namespace(NAMESPACE).name(name).build();
   }
 
-  private static List<UUID> expectedRunIds(List<List<PreparedEvent>> admissions) {
-    List<UUID> runIds = new ArrayList<>(admissions.size() * EVENTS_PER_ADMISSION);
-    for (List<PreparedEvent> admission : admissions) {
-      for (PreparedEvent event : admission) {
-        try {
-          runIds.add(
-              UUID.fromString(
-                  Utils.getMapper()
-                      .readTree(event.eventJson())
-                      .path("run")
-                      .path("runId")
-                      .asText()));
-        } catch (Exception failure) {
-          throw new IllegalArgumentException("benchmark fixture could not be read", failure);
-        }
-      }
-    }
-    return List.copyOf(runIds);
-  }
-
-  private String currentWalLsn() {
-    return jdbi.withHandle(
-        handle ->
-            handle.createQuery("SELECT pg_current_wal_lsn()::text").mapTo(String.class).one());
-  }
-
-  private long walBytes(String before, String after) {
-    return jdbi.withHandle(
-        handle ->
-            handle
-                .createQuery(
-                    "SELECT pg_wal_lsn_diff(CAST(:after AS pg_lsn), "
-                        + "CAST(:before AS pg_lsn))::bigint")
-                .bind("after", after)
-                .bind("before", before)
-                .mapTo(Long.class)
-                .one());
-  }
-
   private static String workerMetricName(String suffix) {
     return MetricRegistry.name(OpenLineageWorker.class, suffix);
-  }
-
-  private static double eventsPerSecond(int events, long elapsedNanos) {
-    return events * 1_000_000_000.0 / elapsedNanos;
   }
 
   private static double nanosToMillis(long nanos) {
     return nanos / 1_000_000.0;
   }
 
-  private static double median(List<Double> values) {
-    List<Double> sorted = values.stream().sorted().toList();
-    int middle = sorted.size() / 2;
-    return (sorted.size() & 1) == 1
-        ? sorted.get(middle)
-        : (sorted.get(middle - 1) + sorted.get(middle)) / 2.0;
-  }
-
-  private static double minimum(List<Double> values) {
-    return values.stream().mapToDouble(Double::doubleValue).min().orElseThrow();
-  }
-
-  private static double maximum(List<Double> values) {
-    return values.stream().mapToDouble(Double::doubleValue).max().orElseThrow();
-  }
-
-  private record QueuedEvent(long id, UUID runId, Long admissionId) {}
-
-  private record QueueCounts(
-      long queued, long heads, long admissions, long nullAdmissions, long deadLetters) {}
-
   private record ProjectionCounts(
       long rawEvents, long distinctRawRuns, long runs, long jobs, long datasets) {}
 
-  private record CellResult(
-      int projectionBatchSize,
-      int admissionCount,
-      int eventCount,
-      long admissionNanos,
-      long drainNanos,
-      long admissionTransactions,
-      long successfulProjectionClaimTransactions,
-      long admissionWalBytes,
-      long drainWalBytes) {
-    private double admissionEventsPerSecond() {
-      return eventsPerSecond(eventCount, admissionNanos);
-    }
-
-    private double drainEventsPerSecond() {
-      return eventsPerSecond(eventCount, drainNanos);
-    }
-
-    private double sequentialPipelineEventsPerSecond() {
-      return eventsPerSecond(eventCount, Math.addExact(admissionNanos, drainNanos));
+  private record WorkerCounts(
+      long nonemptyClaims, long selected, long succeeded, long retried, long deadLettered) {
+    private long committedOutcomes() {
+      return Math.addExact(Math.addExact(succeeded, retried), deadLettered);
     }
   }
 }

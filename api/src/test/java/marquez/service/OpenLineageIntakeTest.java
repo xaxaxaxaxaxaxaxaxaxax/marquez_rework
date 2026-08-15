@@ -22,6 +22,7 @@ import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.UUID;
 import marquez.db.OpenLineageQueueDao;
+import marquez.db.OpenLineageQueueDao.PreparedAdmission;
 import marquez.db.OpenLineageQueueDao.PreparedEvent;
 import marquez.service.models.BaseEvent;
 import marquez.service.models.DatasetEvent;
@@ -36,6 +37,8 @@ class OpenLineageIntakeTest {
   private final PreparedEvent prepared = new PreparedEvent(UUID.randomUUID(), "{}");
   private final PreparedEvent secondPrepared = new PreparedEvent(UUID.randomUUID(), "{}");
   private final List<PreparedEvent> batch = List.of(prepared, secondPrepared);
+  private final PreparedAdmission admission =
+      OpenLineageQueueDao.prepareAll(List.of(datasetEvent("first"), datasetEvent("second")));
 
   @Test
   void enqueueCommitsBeforeWakingWorker() {
@@ -72,25 +75,25 @@ class OpenLineageIntakeTest {
 
   @Test
   void enqueueAllCommitsBeforeWakingWorkerOnce() {
-    when(queueDao.enqueueAll(same(batch))).thenReturn(2);
+    when(queueDao.enqueueAll(same(admission))).thenReturn(2);
 
-    assertEquals(2, intake.enqueueAll(batch));
+    assertEquals(2, intake.enqueueAll(admission));
 
     InOrder inOrder = inOrder(queueDao, wakeUp);
-    inOrder.verify(queueDao).enqueueAll(same(batch));
+    inOrder.verify(queueDao).enqueueAll(same(admission));
     inOrder.verify(wakeUp).run();
     verifyNoMoreInteractions(queueDao, wakeUp);
   }
 
   @Test
   void enqueueAllRemainsSuccessfulWhenWakeUpFails() {
-    when(queueDao.enqueueAll(same(batch))).thenReturn(2);
+    when(queueDao.enqueueAll(same(admission))).thenReturn(2);
     doThrow(new IllegalStateException("stopped")).when(wakeUp).run();
 
-    assertEquals(2, intake.enqueueAll(batch));
+    assertEquals(2, intake.enqueueAll(admission));
 
     InOrder inOrder = inOrder(queueDao, wakeUp);
-    inOrder.verify(queueDao).enqueueAll(same(batch));
+    inOrder.verify(queueDao).enqueueAll(same(admission));
     inOrder.verify(wakeUp).run();
     verifyNoMoreInteractions(queueDao, wakeUp);
   }
@@ -98,12 +101,31 @@ class OpenLineageIntakeTest {
   @Test
   void batchCommitIndeterminateFailureIsPropagatedWithoutRetryOrWakeUp() {
     IllegalStateException failure = new IllegalStateException("batch commit response lost");
-    when(queueDao.enqueueAll(same(batch))).thenThrow(failure);
+    when(queueDao.enqueueAll(same(admission))).thenThrow(failure);
 
-    assertSame(failure, assertThrows(IllegalStateException.class, () -> intake.enqueueAll(batch)));
-    verify(queueDao).enqueueAll(same(batch));
+    assertSame(
+        failure, assertThrows(IllegalStateException.class, () -> intake.enqueueAll(admission)));
+    verify(queueDao).enqueueAll(same(admission));
     verifyNoMoreInteractions(queueDao);
     verifyNoInteractions(wakeUp);
+  }
+
+  @Test
+  void preparedEventListCompatibilityUsesSharedWakePath() {
+    when(queueDao.enqueueAll(same(batch))).thenReturn(2);
+
+    assertEquals(2, intake.enqueueAll(batch));
+
+    InOrder inOrder = inOrder(queueDao, wakeUp);
+    inOrder.verify(queueDao).enqueueAll(same(batch));
+    inOrder.verify(wakeUp).run();
+  }
+
+  @Test
+  void emptyPreparedAdmissionReturnsZeroWithoutQueueOrWakeUp() {
+    assertEquals(0, intake.enqueueAll(OpenLineageQueueDao.prepareAll(List.of())));
+
+    verifyNoInteractions(queueDao, wakeUp);
   }
 
   @Test
@@ -115,27 +137,31 @@ class OpenLineageIntakeTest {
 
   @Test
   void nullBatchIsRejectedWithoutQueueOrWakeUp() {
-    assertThrows(NullPointerException.class, () -> intake.enqueueAll(null));
+    assertThrows(NullPointerException.class, () -> intake.enqueueAll((PreparedAdmission) null));
+    assertThrows(NullPointerException.class, () -> intake.enqueueAll((List<PreparedEvent>) null));
 
     verifyNoInteractions(queueDao, wakeUp);
   }
 
   @Test
   void baseEventIsPreparedBeforeEnqueue() {
-    BaseEvent event =
-        DatasetEvent.builder()
-            .eventTime(ZonedDateTime.parse("2026-08-11T00:00:00Z"))
-            .dataset(LineageEvent.Dataset.builder().namespace("namespace").name("dataset").build())
-            .producer("https://example.com/producer")
-            .schemaURL(
-                URI.create(
-                    "https://openlineage.io/spec/2-0-0/OpenLineage.json#/definitions/DatasetEvent"))
-            .build();
+    BaseEvent event = datasetEvent("dataset");
     PreparedEvent expected = OpenLineageQueueDao.prepare(event);
     when(queueDao.enqueue(expected)).thenReturn(42L);
 
     assertEquals(42L, intake.enqueue(event));
 
     verify(queueDao).enqueue(expected);
+  }
+
+  private static DatasetEvent datasetEvent(String name) {
+    return DatasetEvent.builder()
+        .eventTime(ZonedDateTime.parse("2026-08-11T00:00:00Z"))
+        .dataset(LineageEvent.Dataset.builder().namespace("namespace").name(name).build())
+        .producer("https://example.com/producer")
+        .schemaURL(
+            URI.create(
+                "https://openlineage.io/spec/2-0-0/OpenLineage.json#/definitions/DatasetEvent"))
+        .build();
   }
 }

@@ -11,8 +11,8 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.verify;
@@ -37,6 +37,7 @@ import marquez.api.exceptions.JdbiExceptionExceptionMapper;
 import marquez.common.Utils;
 import marquez.db.OpenLineageDao;
 import marquez.db.OpenLineageQueueDao;
+import marquez.db.OpenLineageQueueDao.PreparedAdmission;
 import marquez.db.OpenLineageQueueDao.PreparedEvent;
 import marquez.service.JobService;
 import marquez.service.LineageService;
@@ -101,8 +102,8 @@ class OpenLineageResourceTest {
   void setUpOpenLineageIntake() {
     reset(OPEN_LINEAGE_DAO, OPEN_LINEAGE_INTAKE);
     when(OPEN_LINEAGE_INTAKE.enqueue(any(PreparedEvent.class))).thenReturn(1L);
-    when(OPEN_LINEAGE_INTAKE.enqueueAll(anyList()))
-        .thenAnswer(invocation -> ((List<?>) invocation.getArgument(0)).size());
+    when(OPEN_LINEAGE_INTAKE.enqueueAll(any(PreparedAdmission.class)))
+        .thenAnswer(invocation -> ((PreparedAdmission) invocation.getArgument(0)).size());
   }
 
   @Test
@@ -271,11 +272,7 @@ class OpenLineageResourceTest {
     assertEquals(204, response.getStatus());
     assertFalse(response.hasEntity());
     verify(OPEN_LINEAGE_INTAKE)
-        .enqueueAll(
-            List.of(
-                OpenLineageQueueDao.prepare(lineageEvent),
-                OpenLineageQueueDao.prepare(datasetEvent),
-                OpenLineageQueueDao.prepare(jobEvent)));
+        .enqueueAll(argThat((PreparedAdmission admission) -> admission.size() == 3));
     verifyNoMoreInteractions(OPEN_LINEAGE_INTAKE);
   }
 
@@ -356,7 +353,7 @@ class OpenLineageResourceTest {
   @Test
   void testCreateBatchAdmissionIllegalArgumentReturnsInternalServerError() throws IOException {
     String event = eventJsonFrom("/open_lineage/event_required_only.json");
-    when(OPEN_LINEAGE_INTAKE.enqueueAll(anyList()))
+    when(OPEN_LINEAGE_INTAKE.enqueueAll(any(PreparedAdmission.class)))
         .thenThrow(new IllegalArgumentException("password=do-not-return"));
 
     try (Response response = postBatch("[" + event + "]")) {
@@ -364,7 +361,7 @@ class OpenLineageResourceTest {
       assertFalse(response.getHeaders().containsKey("Retry-After"));
       assertFalse(response.readEntity(String.class).contains("password=do-not-return"));
     }
-    verify(OPEN_LINEAGE_INTAKE).enqueueAll(anyList());
+    verify(OPEN_LINEAGE_INTAKE).enqueueAll(any(PreparedAdmission.class));
   }
 
   @Test

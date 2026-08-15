@@ -20,39 +20,6 @@ import org.junit.jupiter.api.Test;
 
 class OpenLineageOpenApiContractTest {
   private static final ObjectMapper YAML = new ObjectMapper(new YAMLFactory());
-  private static final List<String> REQUEST_SCHEMAS =
-      List.of(
-          "OpenLineageEventRequest",
-          "OpenLineageRunEventRequest",
-          "OpenLineageDatasetEventRequest",
-          "OpenLineageJobEventRequest",
-          "OpenLineageRunRequest",
-          "OpenLineageRunFacetsRequest",
-          "OpenLineageParentRunFacetRequest",
-          "OpenLineageRunLinkRequest",
-          "OpenLineageJobRequest",
-          "OpenLineageDatasetRequest",
-          "OpenLineageIdentityRequest");
-
-  @Test
-  void publicAndDocumentationContractsStaySynchronized() throws Exception {
-    JsonNode publicSpec = readRepoYaml("spec/openapi.yml");
-    JsonNode documentationSpec = readRepoYaml("docs/openapi.yml");
-
-    assertThat(documentationSpec.at("/paths/~1lineage/post/requestBody"))
-        .isEqualTo(publicSpec.at("/paths/~1lineage/post/requestBody"));
-    assertThat(documentationSpec.at("/paths/~1lineage/post/description"))
-        .isEqualTo(publicSpec.at("/paths/~1lineage/post/description"));
-    assertThat(documentationSpec.at("/paths/~1lineage/post/responses"))
-        .isEqualTo(publicSpec.at("/paths/~1lineage/post/responses"));
-    assertThat(documentationSpec.at("/paths/~1lineage~1batch/post"))
-        .isEqualTo(publicSpec.at("/paths/~1lineage~1batch/post"));
-    for (String schemaName : REQUEST_SCHEMAS) {
-      assertThat(documentationSpec.at("/components/schemas/" + schemaName))
-          .as(schemaName)
-          .isEqualTo(publicSpec.at("/components/schemas/" + schemaName));
-    }
-  }
 
   @Test
   void requestUnionPreservesSupportedVariantsAndHttpResponses() throws Exception {
@@ -149,24 +116,6 @@ class OpenLineageOpenApiContractTest {
     assertThat(identity.path("minLength").asInt()).isEqualTo(1);
     assertThat(identity.has("pattern")).isFalse();
     assertThat(identity.path("description").asText()).contains("OpenAPI 3.0 cannot express");
-
-    String generatedPage =
-        Files.readString(repoRoot().resolve("docs/docs/api/record-lineage.api.mdx"));
-    assertThat(generatedPage)
-        .doesNotContain(">any</ul>")
-        .contains(
-            operationDescription,
-            post.at("/responses/201/description").asText(),
-            "OpenLineageRunEventRequest",
-            "OpenLineageDatasetEventRequest",
-            "OpenLineageJobEventRequest",
-            "Acceptance confirms only that the event was committed to the intake queue",
-            "no durable delivery guarantee",
-            "may be missing, concurrent, or out of order",
-            "not retried by the intake queue",
-            "Any 5xx response during queue admission is commit-indeterminate",
-            "Clients that retry must tolerate duplicate events",
-            post.at("/responses/500/description").asText());
   }
 
   @Test
@@ -198,18 +147,8 @@ class OpenLineageOpenApiContractTest {
             "the whole batch is committed in one queue transaction or none of it is committed",
             "a batch is never partially admitted",
             "A 204 response confirms only that the entire batch was committed to the intake queue",
-            "lineage projections are processed asynchronously",
-            "retains the request's membership under one internal nullable BIGINT admission ID",
-            "NULL is reserved for unchanged singleton and legacy rows",
-            "existing durable queue ID carries original event order",
-            "no separate ordinal is stored",
-            "currently ready events from that admission",
-            "preserving ordering-lane heads and scheduling quanta",
-            "may split the request across subsets",
-            "atomic admission does not imply atomic projection visibility",
-            "successful batched fast-path subset commits atomically",
-            "falls back, in the same claim transaction, to the existing per-event retry "
-                + "and dead-letter behavior",
+            "lineage projections are processed asynchronously in bounded subsets",
+            "Atomic durable admission does not imply atomic projection visibility for the whole batch",
             "best effort",
             "Any 5xx response during queue admission is commit-indeterminate",
             "the entire queue transaction may already have committed",
@@ -228,17 +167,6 @@ class OpenLineageOpenApiContractTest {
             "atomic transaction",
             "committed the entire batch",
             "a retry can duplicate every event");
-
-    String generatedPage =
-        Files.readString(repoRoot().resolve("docs/docs/api/record-lineage-batch.api.mdx"));
-    assertThat(generatedPage)
-        .contains(
-            operationDescription,
-            post.at("/responses/204/description").asText(),
-            post.at("/responses/500/description").asText(),
-            "OpenLineageRunEventRequest",
-            "OpenLineageDatasetEventRequest",
-            "OpenLineageJobEventRequest");
   }
 
   private static void assertExampleContainsRequired(JsonNode schema) {

@@ -34,7 +34,7 @@ public class OpenLineageConfig {
   @JsonProperty
   private int workerThreads = DEFAULT_WORKER_THREADS;
 
-  /** Maximum events, including an optional same-lane follower, in one projection claim. */
+  /** Maximum events assigned to one worker task; each admission-scoped claim uses its remainder. */
   @Getter
   @Min(1)
   @Max(MAX_PROJECTION_BATCH_SIZE)

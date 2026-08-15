@@ -258,6 +258,10 @@ class OpenLineageDaoTest {
 
     assertThat(projected.getRun().getUuid()).isEqualTo(expectedRunUuid);
     assertThat(projected.getRunState().getRunUuid()).isEqualTo(expectedRunUuid);
+    assertThat(projected.getRun().getCreatedAt()).isEqualTo(eventTime);
+    assertThat(projected.getRunArgs().getArgs()).isEqualTo(OpenLineageDao.EMPTY_RUN_ARGS_JSON);
+    assertThat(projected.getRunArgs().getChecksum())
+        .isEqualTo(OpenLineageDao.EMPTY_RUN_ARGS_CHECKSUM);
     assertThat(jobDao.lockJobByUuid(projected.getJob().getUuid()).getCurrentRunUuid())
         .contains(expectedRunUuid);
   }
@@ -636,6 +640,20 @@ class OpenLineageDaoTest {
     assertThat(countSql(executedSql, "io_type IN ('INPUT', 'OUTPUT')")).isEqualTo(1);
     assertThat(runDao.findRunByUuidAsRow(runUuid).orElseThrow().getStartRunStateUuid())
         .contains(projected.getRunState().getUuid());
+
+    UpdateLineageRow missingIo =
+        dao.updateMarquezModel(
+            newRunEvent(
+                "compact_missing_" + runUuid,
+                UUID.randomUUID(),
+                "START",
+                JobFacet.builder().build(),
+                null,
+                null),
+            Utils.getMapper(),
+            false);
+    assertThat(missingIo.getInputs()).isEmpty();
+    assertThat(missingIo.getOutputs()).isEmpty();
   }
 
   @Test
@@ -1174,6 +1192,17 @@ class OpenLineageDaoTest {
         .hasFieldOrPropertyWithValue("name", "dataset_output");
     assertThat(jobEventRow.getOutputs().get().get(0).getDatasetVersionRow().getLifecycleState())
         .isEqualTo("create");
+
+    UpdateLineageRow missingIo =
+        LineageTestUtils.createLineageRow(
+            dao,
+            new Job(NAMESPACE, "missing_job_io_" + UUID.randomUUID(), JobFacet.builder().build()),
+            null,
+            null);
+    assertThat(missingIo.getInputs()).isPresent();
+    assertThat(missingIo.getInputs().orElseThrow()).isEmpty();
+    assertThat(missingIo.getOutputs()).isPresent();
+    assertThat(missingIo.getOutputs().orElseThrow()).isEmpty();
   }
 
   @Test

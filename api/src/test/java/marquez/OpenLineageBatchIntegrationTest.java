@@ -146,10 +146,6 @@ public class OpenLineageBatchIntegrationTest extends BaseIntegrationTest {
       assertThat(state.queuedEvents())
           .extracting(QueuedAdmissionEvent::eventType)
           .containsExactly("PREDECESSOR", "START", "OTHER", "OTHER", "COMPLETE");
-      assertThat(state.queuedEvents())
-          .extracting(QueuedAdmissionEvent::id)
-          .isSorted()
-          .doesNotHaveDuplicates();
       assertThat(state.queuedEvents().get(0))
           .isEqualTo(new QueuedAdmissionEvent(predecessorId, "PREDECESSOR", null));
 

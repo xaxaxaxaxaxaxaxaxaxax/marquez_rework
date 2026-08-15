@@ -52,6 +52,10 @@ class HotPathIndexesTest {
               "open_lineage_queue_pkey",
               new ExpectedIndex(List.of("ordering_key", "id"), List.of(), null, List.of(0, 0))),
           Map.entry(
+              "open_lineage_queue_admission_idx",
+              new ExpectedIndex(
+                  List.of("admission_id"), List.of(), "admission_id IS NOT NULL", List.of(0))),
+          Map.entry(
               "open_lineage_queue_heads_pkey",
               new ExpectedIndex(List.of("ordering_key"), List.of(), null, List.of(0))),
           Map.entry(

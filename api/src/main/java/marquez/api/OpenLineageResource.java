@@ -14,7 +14,6 @@ import com.codahale.metrics.annotation.ResponseMetered;
 import com.codahale.metrics.annotation.Timed;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import io.dropwizard.jersey.jsr310.ZonedDateTimeParam;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import javax.validation.Valid;
@@ -36,6 +35,7 @@ import marquez.api.models.SortDirection;
 import marquez.common.models.RunId;
 import marquez.db.OpenLineageDao;
 import marquez.db.OpenLineageQueueDao;
+import marquez.db.OpenLineageQueueDao.PreparedAdmission;
 import marquez.db.OpenLineageQueueDao.PreparedEvent;
 import marquez.service.OpenLineageIntake;
 import marquez.service.ServiceFactory;
@@ -49,7 +49,7 @@ import marquez.service.models.NodeId;
 @Path("/api/v1")
 public class OpenLineageResource extends BaseResource {
   private static final String DEFAULT_DEPTH = "20";
-  static final int MAX_BATCH_SIZE = 1000;
+  static final int MAX_BATCH_SIZE = OpenLineageQueueDao.MAX_ADMISSION_EVENTS;
 
   private final OpenLineageDao openLineageDao;
   private final OpenLineageIntake openLineageIntake;
@@ -97,22 +97,22 @@ public class OpenLineageResource extends BaseResource {
   @Path("/lineage/batch")
   public Response createBatch(
       @NotNull @Size(min = 1, max = MAX_BATCH_SIZE) List<@NotNull @Valid BaseEvent> events) {
-    final List<PreparedEvent> preparedEvents = new ArrayList<>(events.size());
+    final PreparedAdmission preparedAdmission;
     try {
       for (BaseEvent event : events) {
         if (!isSupported(event)) {
           log.warn("Unsupported batch event type {}", event.getClass().getName());
           return Response.status(BAD_REQUEST).build();
         }
-
-        preparedEvents.add(prepare(event));
+        validateInputDatasetIds(event);
       }
+      preparedAdmission = OpenLineageQueueDao.prepareAll(events);
     } catch (IllegalArgumentException invalidArgument) {
       log.warn("Invalid OpenLineage batch: {}", invalidArgument.getMessage());
       return Response.status(BAD_REQUEST).build();
     }
 
-    openLineageIntake.enqueueAll(preparedEvents);
+    openLineageIntake.enqueueAll(preparedAdmission);
     return Response.noContent().build();
   }
 
@@ -124,12 +124,16 @@ public class OpenLineageResource extends BaseResource {
 
   private static PreparedEvent prepare(BaseEvent event) {
     PreparedEvent prepared = OpenLineageQueueDao.prepare(event);
+    validateInputDatasetIds(event);
+    return prepared;
+  }
+
+  private static void validateInputDatasetIds(BaseEvent event) {
     if (event instanceof LineageEvent lineageEvent) {
       OpenLineageDao.validateDatasetIds(lineageEvent.getInputs());
     } else if (event instanceof JobEvent jobEvent) {
       OpenLineageDao.validateDatasetIds(jobEvent.getInputs());
     }
-    return prepared;
   }
 
   @Timed

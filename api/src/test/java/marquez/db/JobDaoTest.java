@@ -12,6 +12,7 @@ import static marquez.db.DbTestUtils.newJob;
 import static marquez.service.models.ServiceModelGenerator.newJobMetaWith;
 import static marquez.service.models.ServiceModelGenerator.newRunMeta;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.junit.Assert.assertNull;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyCollection;
@@ -55,11 +56,13 @@ import marquez.service.models.Run;
 import marquez.service.models.RunMeta;
 import org.assertj.core.api.AbstractObjectAssert;
 import org.jdbi.v3.core.Jdbi;
+import org.jdbi.v3.core.statement.UnableToExecuteStatementException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.postgresql.util.PGobject;
 
@@ -152,9 +155,110 @@ public class JobDaoTest {
   }
 
   @Test
+  void unifiedJobUpsertSupportsParentAndProjectionAxes() {
+    String suffix = UUID.randomUUID().toString();
+    Instant eventTime = Instant.parse("2026-08-15T00:00:00Z");
+    JobRow parent =
+        createJobWithoutSymlinkTarget(
+            jdbi, namespace, "unified-parent-" + suffix, "unified parent");
+
+    for (boolean parentAware : List.of(false, true)) {
+      for (boolean ordered : List.of(false, true)) {
+        String simpleName = "unified-" + parentAware + "-" + ordered + "-" + suffix;
+        UUID parentUuid = parentAware ? parent.getUuid() : null;
+        byte[] projectionKey = ordered ? Utils.sha256Utf8(simpleName) : null;
+        ProjectionOrder order = ordered ? new ProjectionOrder(eventTime, projectionKey) : null;
+
+        JobRow inserted = upsertProjection(parentUuid, simpleName, eventTime, order);
+
+        assertThat(inserted.getParentJobUuid()).isEqualTo(parentUuid);
+        SnapshotWatermark watermark = snapshotWatermark(inserted.getUuid());
+        assertThat(watermark.eventTime()).isEqualTo(ordered ? eventTime : null);
+        assertThat(watermark.eventKey()).isEqualTo(projectionKey);
+      }
+    }
+  }
+
+  @ParameterizedTest(
+      name = "raw order remains database-validated: parent={0}, hasTime={1}, hasKey={2}")
+  @CsvSource({"false,true,true", "true,true,false", "true,false,true"})
+  void rawOrderedCompatibilityPreservesPostgresConstraintFailures(
+      boolean parentAware, boolean hasTime, boolean hasKey) {
+    String suffix = UUID.randomUUID().toString();
+    Instant now = Instant.parse("2026-08-15T01:00:00Z");
+    Instant projectionTime = hasTime ? now : null;
+    JobRow parent =
+        parentAware
+            ? createJobWithoutSymlinkTarget(jdbi, namespace, "raw-parent-" + suffix, "raw parent")
+            : null;
+    byte[] malformedKey = hasKey ? new byte[hasTime ? 31 : 32] : null;
+
+    Throwable failure =
+        catchThrowable(
+            () -> {
+              if (parentAware) {
+                jobDao.upsertOpenLineageJob(
+                    UUID.randomUUID(),
+                    parent.getUuid(),
+                    JobType.BATCH,
+                    now,
+                    namespace.getUuid(),
+                    namespace.getName(),
+                    "raw-child-" + suffix,
+                    null,
+                    null,
+                    null,
+                    jobDao.toJson(Collections.emptySet(), Utils.getMapper()),
+                    projectionTime,
+                    malformedKey);
+              } else {
+                jobDao.upsertOpenLineageJob(
+                    UUID.randomUUID(),
+                    JobType.BATCH,
+                    now,
+                    namespace.getUuid(),
+                    namespace.getName(),
+                    "raw-parentless-" + suffix,
+                    null,
+                    null,
+                    null,
+                    jobDao.toJson(Collections.emptySet(), Utils.getMapper()),
+                    projectionTime,
+                    malformedKey);
+              }
+            });
+
+    assertThat(failure).isInstanceOf(UnableToExecuteStatementException.class);
+    Throwable rootCause = rootCause(failure);
+    assertThat(rootCause).isInstanceOf(SQLException.class);
+    assertThat(((SQLException) rootCause).getSQLState()).isEqualTo("23514");
+    assertThat(rootCause).hasMessageContaining("jobs_open_lineage_snapshot_order_pair");
+  }
+
+  @Test
+  void losingOrderedWriteAfterLegacyDeleteReturnsHiddenBaseRow() {
+    String name = "hidden-snapshot-" + UUID.randomUUID();
+    JobRow job = createJobWithoutSymlinkTarget(jdbi, namespace, name, "legacy winner");
+    Instant losingTime = job.getUpdatedAt().minusSeconds(1);
+    jobDao.delete(job.getNamespaceName(), job.getName());
+
+    JobRow returned =
+        upsertProjection(
+            null,
+            name,
+            losingTime,
+            new ProjectionOrder(losingTime, Utils.sha256Utf8("losing hidden snapshot")));
+
+    assertThat(returned.getUuid()).isEqualTo(job.getUuid());
+    assertThat(returned.getDescription()).contains("legacy winner");
+    assertThat(jobDao.findJobByNameAsRow(namespace.getName(), name)).isEmpty();
+  }
+
+  @Test
   void legacyJobWritesClearOwnedWatermarksWithoutLoweringUpdatedAt() {
     String name = "legacy-job-watermark-" + UUID.randomUUID();
     JobRow job = createJobWithoutSymlinkTarget(jdbi, namespace, name, "initial legacy snapshot");
+    RunRow legacyRun = DbTestUtils.newRun(jdbi, job);
     Instant highWater = Instant.parse("2030-08-13T00:00:30Z");
     Instant olderLegacyTime = highWater.minusSeconds(20);
     byte[] digest = Utils.sha256Utf8("ordered-before-legacy");
@@ -187,6 +291,18 @@ public class JobDaoTest {
         "legacy-location",
         null,
         jobDao.toJson(Collections.emptySet(), Utils.getMapper()),
+        legacyRun.getUuid());
+    jobDao.upsertJob(
+        UUID.randomUUID(),
+        JobType.BATCH,
+        olderLegacyTime,
+        namespace.getUuid(),
+        namespace.getName(),
+        name,
+        "legacy winner",
+        "legacy-location",
+        null,
+        jobDao.toJson(Collections.emptySet(), Utils.getMapper()),
         null);
 
     Map<String, Object> snapshot =
@@ -195,8 +311,8 @@ public class JobDaoTest {
                 handle
                     .createQuery(
                         """
-                        SELECT updated_at, description, open_lineage_snapshot_time,
-                               open_lineage_current_run_time
+                        SELECT updated_at, description, current_run_uuid,
+                               open_lineage_snapshot_time, open_lineage_current_run_time
                         FROM jobs WHERE uuid = :jobUuid
                         """)
                     .bind("jobUuid", job.getUuid())
@@ -204,6 +320,7 @@ public class JobDaoTest {
                     .one());
     assertThat(((java.sql.Timestamp) snapshot.get("updated_at")).toInstant()).isEqualTo(highWater);
     assertThat(snapshot.get("description")).isEqualTo("legacy winner");
+    assertThat(snapshot.get("current_run_uuid")).isEqualTo(legacyRun.getUuid());
     assertThat(snapshot.get("open_lineage_snapshot_time")).isNull();
     assertThat(snapshot.get("open_lineage_current_run_time")).isNull();
 
@@ -759,72 +876,6 @@ public class JobDaoTest {
         targetJob.getName());
   }
 
-  public void testSymlinkParentJobRenamesChildren() throws SQLException {
-    String parentJobName = "parentJob";
-    JobRow parentJob =
-        createJobWithoutSymlinkTarget(jdbi, namespace, parentJobName, "the original parent job");
-    Instant now = Instant.now();
-    PGobject inputs = new PGobject();
-    inputs.setValue("[]");
-    inputs.setType("JSON");
-    String childJob1Name = "child1";
-    JobRow childJob1 =
-        jobDao.upsertJob(
-            UUID.randomUUID(),
-            parentJob.getUuid(),
-            JobType.BATCH,
-            now,
-            namespace.getUuid(),
-            namespace.getName(),
-            childJob1Name,
-            null,
-            null,
-            null,
-            inputs,
-            null);
-
-    String childJob2Name = "child2";
-    JobRow childJob2 =
-        jobDao.upsertJob(
-            UUID.randomUUID(),
-            parentJob.getUuid(),
-            JobType.BATCH,
-            now,
-            namespace.getUuid(),
-            namespace.getName(),
-            childJob2Name,
-            null,
-            null,
-            null,
-            inputs,
-            null);
-
-    // the job queried is returned, since there is no symlink
-    String jobFqn = parentJobName + "." + childJob1Name;
-    Optional<Job> jobByName = jobDao.findJobByName(parentJob.getNamespaceName(), jobFqn);
-    assertJobIdEquals(jobByName, parentJob.getNamespaceName(), jobFqn);
-
-    JobRow targetJob =
-        createJobWithoutSymlinkTarget(jdbi, namespace, "newParentJob", "the target of the symlink");
-
-    createJobWithSymlinkTarget(
-        jdbi, namespace, parentJobName, targetJob.getUuid(), "the symlink job");
-
-    // now the renamed job should be returned
-    String newJobFqn = targetJob.getName() + "." + childJob1Name;
-    assertJobIdEquals(
-        jobDao.findJobByName(parentJob.getNamespaceName(), jobFqn),
-        targetJob.getNamespaceName(),
-        newJobFqn);
-
-    // query the second child by only its simple name
-    String child2Fqn = targetJob.getName() + "." + childJob2Name;
-    assertJobIdEquals(
-        jobDao.findJobByName(parentJob.getNamespaceName(), child2Fqn),
-        targetJob.getNamespaceName(),
-        child2Fqn);
-  }
-
   private AbstractObjectAssert<?, Job> assertJobIdEquals(
       Optional<Job> jobByName, String namespaceName, String jobName) {
     return assertThat(jobByName)
@@ -926,6 +977,24 @@ public class JobDaoTest {
         .containsExactlyInAnyOrderElementsOf(fixture.jobMeta().getOutputs());
   }
 
+  private static JobRow upsertProjection(
+      UUID parentJobUuid, String name, Instant eventTime, ProjectionOrder order) {
+    return jobDao.upsertJob(
+        JobDao.JobUpsertRequest.forOpenLineageProjection(
+            UUID.randomUUID(),
+            parentJobUuid,
+            JobType.BATCH,
+            eventTime,
+            namespace.getUuid(),
+            namespace.getName(),
+            name,
+            "projection snapshot",
+            null,
+            null,
+            jobDao.toJson(Collections.emptySet(), Utils.getMapper()),
+            order));
+  }
+
   private static SnapshotWatermark snapshotWatermark(UUID jobUuid) {
     return jdbi.withHandle(
         handle ->
@@ -937,9 +1006,20 @@ public class JobDaoTest {
                 .map(
                     (resultSet, context) ->
                         new SnapshotWatermark(
-                            resultSet.getTimestamp("open_lineage_snapshot_time").toInstant(),
+                            Optional.ofNullable(
+                                    resultSet.getTimestamp("open_lineage_snapshot_time"))
+                                .map(java.sql.Timestamp::toInstant)
+                                .orElse(null),
                             resultSet.getBytes("open_lineage_snapshot_key")))
                 .one());
+  }
+
+  private static Throwable rootCause(Throwable throwable) {
+    Throwable cause = throwable;
+    while (cause.getCause() != null) {
+      cause = cause.getCause();
+    }
+    return cause;
   }
 
   private static PointerWatermark pointerWatermark(UUID jobUuid) {

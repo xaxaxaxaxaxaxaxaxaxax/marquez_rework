@@ -21,22 +21,6 @@ import org.junit.jupiter.api.Test;
 
 class StatsOpenApiContractTest {
   private static final ObjectMapper YAML = new ObjectMapper(new YAMLFactory());
-  private static final List<String> SCHEMAS =
-      List.of("StatsMetric", "StatsScope", "StatsPoint", "StatsQueryResult", "StatsError");
-
-  @Test
-  void publicAndDocumentationContractsStaySynchronized() throws Exception {
-    JsonNode publicSpec = readRepoYaml("spec/openapi.yml");
-    JsonNode documentationSpec = readRepoYaml("docs/openapi.yml");
-
-    assertThat(documentationSpec.at("/paths/~1stats~1query/get"))
-        .isEqualTo(publicSpec.at("/paths/~1stats~1query/get"));
-    for (String schemaName : SCHEMAS) {
-      assertThat(documentationSpec.at("/components/schemas/" + schemaName))
-          .as(schemaName)
-          .isEqualTo(publicSpec.at("/components/schemas/" + schemaName));
-    }
-  }
 
   @Test
   void queryContractIsTypedBoundedAndExplicit() throws Exception {

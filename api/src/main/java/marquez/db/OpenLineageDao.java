@@ -10,7 +10,6 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.sql.SQLException;
 import java.time.Instant;
-import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -88,8 +87,11 @@ import org.slf4j.LoggerFactory;
 
 @RegisterRowMapper(LineageEventMapper.class)
 public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
+  Logger LOG = LoggerFactory.getLogger(OpenLineageDao.class);
   String DEFAULT_SOURCE_NAME = "default";
   String DEFAULT_NAMESPACE_OWNER = "anonymous";
+  String EMPTY_RUN_ARGS_JSON = Utils.toJson(Collections.emptyMap());
+  String EMPTY_RUN_ARGS_CHECKSUM = Utils.checksumFor(Collections.emptyMap());
 
   enum SpecEventType {
     RUN_EVENT,
@@ -211,7 +213,7 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
       ObjectMapper mapper,
       boolean listenerSnapshotRequired,
       @Nullable ProjectionOrder order) {
-    Instant now = event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant();
+    Instant now = event.getEventTime().toInstant();
     ModelDaos daos = new ModelDaos(this);
     LineageWriteContext context = LineageWriteContext.forIntake(daos, null, order);
     LineageProjectionResult projection = updateBaseMarquezModel(event, mapper, now, context);
@@ -227,28 +229,18 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
       updateLineageRow.setRunIoSnapshot(runIoSnapshot);
     }
 
-    if (streaming) {
-      updateMarquezOnStreamingJob(
-          event,
-          updateLineageRow,
-          runState,
-          daos,
-          runIoSnapshot,
-          projection.projectCurrentIo(),
-          order);
-    } else if (event.getEventType() != null && runState.isDone()) {
-      updateMarquezOnComplete(
-          event,
-          updateLineageRow,
-          runState,
-          daos,
-          runIoSnapshot,
-          projection.projectCurrentIo(),
-          order);
+    if (streaming || (event.getEventType() != null && runState.isDone())) {
+      updateRunJobVersionInTransaction(
+          event, now, projection, runState, daos, runIoSnapshot, order);
     }
 
     if (runIoSnapshot != null && (streaming || "complete".equalsIgnoreCase(event.getEventType()))) {
-      updateOutputDatasetVersions(context, runIoSnapshot, now, order);
+      updateOutputDatasetVersions(
+          daos,
+          runIoSnapshot,
+          updateLineageRow.getOutputs().orElse(Collections.emptyList()),
+          now,
+          order);
     }
     return updateLineageRow;
   }
@@ -267,7 +259,7 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
       DatasetEvent event, ObjectMapper mapper, @Nullable ProjectionOrder order) {
     ModelDaos daos = new ModelDaos(this);
     LineageWriteContext context = LineageWriteContext.forIntake(daos, null, order);
-    Instant now = event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant();
+    Instant now = event.getEventTime().toInstant();
 
     UpdateLineageRow bag = new UpdateLineageRow();
     NamespaceRow namespace =
@@ -276,8 +268,7 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
 
     Dataset dataset = event.getDataset();
     DatasetRecord record =
-        upsertLineageDatasets(context, List.of(dataset), now, null, false).get(0);
-    context.queueDatasetFacets(dataset, record, null, null, now, false);
+        upsertAndQueueLineageDatasets(context, List.of(dataset), now, null, null, false).get(0);
     context.flushDatasetFacets();
     context.flushColumnLineage(now);
 
@@ -308,7 +299,7 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
       JobEvent event, ObjectMapper mapper, @Nullable ProjectionOrder order) {
     ModelDaos daos = new ModelDaos(this);
     LineageWriteContext context = LineageWriteContext.forIntake(daos, null, order);
-    Instant now = event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant();
+    Instant now = event.getEventTime().toInstant();
 
     UpdateLineageRow bag = new UpdateLineageRow();
     NamespaceRow namespace =
@@ -317,15 +308,11 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
     JobProjection jobProjection =
         buildJobFromEvent(
             event.getJob(),
-            event.getEventTime(),
-            null,
             event.getInputs(),
             mapper,
             daos,
             now,
             namespace,
-            null,
-            null,
             Optional.empty(),
             order);
     JobRow job = jobProjection.job();
@@ -338,26 +325,14 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
     List<DatasetRecord> datasetInputs =
         event.getInputs() == null
             ? new ArrayList<>()
-            : upsertLineageDatasets(context, event.getInputs(), now, null, true);
-    if (event.getInputs() != null) {
-      for (int index = 0; index < event.getInputs().size(); index++) {
-        context.queueDatasetFacets(
-            event.getInputs().get(index), datasetInputs.get(index), null, null, now, true);
-      }
-    }
+            : upsertAndQueueLineageDatasets(context, event.getInputs(), now, null, null, true);
     bag.setInputs(Optional.of(datasetInputs));
     context.flushInputMappings();
 
     List<DatasetRecord> datasetOutputs =
         event.getOutputs() == null
             ? new ArrayList<>()
-            : upsertLineageDatasets(context, event.getOutputs(), now, null, false);
-    if (event.getOutputs() != null) {
-      for (int index = 0; index < event.getOutputs().size(); index++) {
-        context.queueDatasetFacets(
-            event.getOutputs().get(index), datasetOutputs.get(index), null, null, now, false);
-      }
-    }
+            : upsertAndQueueLineageDatasets(context, event.getOutputs(), now, null, null, false);
     bag.setOutputs(Optional.of(datasetOutputs));
     context.flushDatasetFacets();
     context.flushColumnLineage(now);
@@ -396,7 +371,7 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
 
   private UpdateLineageRow updateBaseMarquezModelInTransaction(
       LineageEvent event, ObjectMapper mapper) {
-    Instant now = event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant();
+    Instant now = event.getEventTime().toInstant();
     ModelDaos daos = new ModelDaos(this);
     LineageWriteContext context = LineageWriteContext.forIntake(daos, null, null);
     UpdateLineageRow bag = updateBaseMarquezModel(event, mapper, now, context).row();
@@ -421,15 +396,11 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
     JobProjection jobProjection =
         buildJobFromEvent(
             event.getJob(),
-            event.getEventTime(),
-            event.getEventType(),
             event.getInputs(),
             mapper,
             daos,
             now,
             namespace,
-            nominalStartTime,
-            nominalEndTime,
             parentRun,
             context.order());
     JobRow job = jobProjection.job();
@@ -440,11 +411,18 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
         context.order() == null
             || daos.getJobDao().canProjectCurrentIo(job.getUuid(), context.order());
 
-    Map<String, String> runArgsMap = createRunArgs(event);
+    RunFacet runFacets = event.getRun().getFacets();
+    boolean hasRunArgs =
+        runFacets != null && (runFacets.getNominalTime() != null || runFacets.getParent() != null);
+    String runArgsJson = EMPTY_RUN_ARGS_JSON;
+    String runArgsChecksum = EMPTY_RUN_ARGS_CHECKSUM;
+    if (hasRunArgs) {
+      Map<String, String> runArgsMap = createRunArgs(event);
+      runArgsJson = Utils.toJson(runArgsMap);
+      runArgsChecksum = Utils.checksumFor(runArgsMap);
+    }
     RunArgsRow runArgs =
-        daos.getRunArgsDao()
-            .upsertRunArgs(
-                UUID.randomUUID(), now, Utils.toJson(runArgsMap), Utils.checksumFor(runArgsMap));
+        daos.getRunArgsDao().upsertRunArgs(UUID.randomUUID(), now, runArgsJson, runArgsChecksum);
     bag.setRunArgs(runArgs);
 
     RunUpsert.RunUpsertBuilder runUpsertBuilder =
@@ -488,16 +466,9 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
     boolean suppressMissingIoInvalidation = event.isTerminalEventForStreamingJobWithNoDatasets();
     List<DatasetRecord> datasetInputs = null;
     if (!inputsMissing) {
-      datasetInputs = upsertLineageDatasets(context, event.getInputs(), now, runUuid, true);
-      for (int index = 0; index < event.getInputs().size(); index++) {
-        context.queueDatasetFacets(
-            event.getInputs().get(index),
-            datasetInputs.get(index),
-            runUuid,
-            event.getEventType(),
-            now,
-            true);
-      }
+      datasetInputs =
+          upsertAndQueueLineageDatasets(
+              context, event.getInputs(), now, runUuid, event.getEventType(), true);
     } else if (!suppressMissingIoInvalidation && projectCurrentIo) {
       if (outputsMissing) {
         daos.getJobVersionDao().markInputAndOutputDatasetsAsPreviousFor(job.getUuid());
@@ -512,16 +483,9 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
 
     List<DatasetRecord> datasetOutputs = null;
     if (!outputsMissing) {
-      datasetOutputs = upsertLineageDatasets(context, event.getOutputs(), now, runUuid, false);
-      for (int index = 0; index < event.getOutputs().size(); index++) {
-        context.queueDatasetFacets(
-            event.getOutputs().get(index),
-            datasetOutputs.get(index),
-            runUuid,
-            event.getEventType(),
-            now,
-            false);
-      }
+      datasetOutputs =
+          upsertAndQueueLineageDatasets(
+              context, event.getOutputs(), now, runUuid, event.getEventType(), false);
     } else if (!suppressMissingIoInvalidation && !inputsMissing && projectCurrentIo) {
       daos.getJobVersionDao().markInputOrOutputDatasetAsPreviousFor(job.getUuid(), IoType.OUTPUT);
     }
@@ -536,7 +500,7 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
     return Optional.ofNullable(event.getRun().getFacets())
         .flatMap(f -> Optional.ofNullable(f.getNominalTime()))
         .map(NominalTimeRunFacet::getNominalStartTime)
-        .map(t -> t.withZoneSameInstant(ZoneId.of("UTC")).toInstant())
+        .map(ZonedDateTime::toInstant)
         .orElse(null);
   }
 
@@ -544,7 +508,7 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
     return Optional.ofNullable(event.getRun().getFacets())
         .flatMap(f -> Optional.ofNullable(f.getNominalTime()))
         .map(NominalTimeRunFacet::getNominalEndTime)
-        .map(t -> t.withZoneSameInstant(ZoneId.of("UTC")).toInstant())
+        .map(ZonedDateTime::toInstant)
         .orElse(null);
   }
 
@@ -570,18 +534,13 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
 
   private JobProjection buildJobFromEvent(
       Job job,
-      ZonedDateTime eventTime,
-      String eventType,
       List<Dataset> inputs,
       ObjectMapper mapper,
       ModelDaos daos,
       Instant now,
       NamespaceRow namespace,
-      Instant nominalStartTime,
-      Instant nominalEndTime,
       Optional<ParentRunFacet> parentRun,
       @Nullable ProjectionOrder order) {
-    Logger log = LoggerFactory.getLogger(OpenLineageDao.class);
     JobDao jobDao = daos.getJobDao();
     String description =
         Optional.ofNullable(job.getFacets())
@@ -592,7 +551,7 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
     String location = getJobLocation(job);
 
     Optional<ParentJobResolution> parentResolution =
-        parentRun.map(facet -> findParentJobRow(daos, job, log, facet, order));
+        parentRun.map(facet -> findParentJobRow(daos, job, facet, order));
     Optional<JobRow> parentJob = parentResolution.map(ParentJobResolution::job);
 
     // construct the simple name of the job by removing the parent prefix plus the dot '.' separator
@@ -608,78 +567,27 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
                   }
                 })
             .orElse(job.getName());
-    log.debug(
+    LOG.debug(
         "Calculated job name {} from job {} with parent {}",
         jobName,
         job.getName(),
         parentJob.map(JobRow::getName));
     PGobject currentInputs = jobDao.toJson(toDatasetId(inputs), mapper);
-    JobRow upsertedJob;
-    if (order == null) {
-      upsertedJob =
-          parentJob
-              .map(
-                  parent ->
-                      jobDao.upsertJob(
-                          UUID.randomUUID(),
-                          parent.getUuid(),
-                          job.type(),
-                          now,
-                          namespace.getUuid(),
-                          namespace.getName(),
-                          jobName,
-                          description,
-                          location,
-                          null,
-                          currentInputs,
-                          null))
-              .orElseGet(
-                  () ->
-                      jobDao.upsertJob(
-                          UUID.randomUUID(),
-                          job.type(),
-                          now,
-                          namespace.getUuid(),
-                          namespace.getName(),
-                          jobName,
-                          description,
-                          location,
-                          null,
-                          currentInputs,
-                          null));
-    } else {
-      upsertedJob =
-          parentJob
-              .map(
-                  parent ->
-                      jobDao.upsertOpenLineageJob(
-                          UUID.randomUUID(),
-                          parent.getUuid(),
-                          job.type(),
-                          now,
-                          namespace.getUuid(),
-                          namespace.getName(),
-                          jobName,
-                          description,
-                          location,
-                          null,
-                          currentInputs,
-                          order))
-              .orElseGet(
-                  () ->
-                      jobDao.upsertOpenLineageJob(
-                          UUID.randomUUID(),
-                          job.type(),
-                          now,
-                          namespace.getUuid(),
-                          namespace.getName(),
-                          jobName,
-                          description,
-                          location,
-                          null,
-                          currentInputs,
-                          order));
-    }
+    JobRow upsertedJob =
+        jobDao.upsertJob(
+            JobDao.JobUpsertRequest.forOpenLineageProjection(
+                UUID.randomUUID(),
+                parentJob.map(JobRow::getUuid).orElse(null),
+                job.type(),
+                now,
+                namespace.getUuid(),
+                namespace.getName(),
+                jobName,
+                description,
+                location,
+                null,
+                currentInputs,
+                order));
     String requestedFullName =
         parentJob.map(parent -> parent.getName() + "." + jobName).orElse(jobName);
     JobRow canonicalJob =
@@ -724,13 +632,13 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
   }
 
   private ParentJobResolution findParentJobRow(
-      ModelDaos daos, Job job, Logger log, ParentRunFacet facet, @Nullable ProjectionOrder order) {
+      ModelDaos daos, Job job, ParentRunFacet facet, @Nullable ProjectionOrder order) {
     try {
-      log.debug("Found parent run event {}", facet);
+      LOG.debug("Found parent run event {}", facet);
       String parentNamespaceName = formatNamespaceName(facet.getJob().getNamespace());
       ParentJobResolution parentResolution =
           createParentJobRunRecord(daos, job, parentNamespaceName, facet, order);
-      log.debug("Found parent job record {}", parentResolution.job());
+      LOG.debug("Found parent job record {}", parentResolution.job());
       return parentResolution;
     } catch (Exception e) {
       throw new RuntimeException("Unable to insert parent run", e);
@@ -743,7 +651,6 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
       String parentNamespaceName,
       ParentRunFacet facet,
       @Nullable ProjectionOrder order) {
-    Logger log = LoggerFactory.getLogger(OpenLineageDao.class);
     String parentJobName = reportedParentJobName(job, facet);
     NamespaceRow parentNamespace =
         daos.getNamespaceDao()
@@ -756,13 +663,13 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
                 parentNamespace.getUuid(),
                 parentNamespace.getName(),
                 parentJobName);
-    log.info("Resolved parent job record {}", parentJob);
+    LOG.info("Resolved parent job record {}", parentJob);
     UUID parentRunUuid = preferredParentRunUuid(job, facet, parentJob);
 
     RunArgsRow argsRow =
         daos.getRunArgsDao()
             .upsertRunArgs(
-                UUID.randomUUID(), Instant.EPOCH, "{}", Utils.checksumFor(Collections.emptyMap()));
+                UUID.randomUUID(), Instant.EPOCH, EMPTY_RUN_ARGS_JSON, EMPTY_RUN_ARGS_CHECKSUM);
     RunDao runDao = daos.getRunDao();
     RunRow parentRun =
         runDao.getOrCreateSyntheticParentRun(
@@ -772,7 +679,7 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
             argsRow.getUuid(),
             parentJob.getNamespaceName(),
             parentJob.getName());
-    log.info("Resolved parent run record {}", parentRun);
+    LOG.info("Resolved parent run record {}", parentRun);
     updateCurrentRun(
         daos.getJobDao(),
         parentJob.getUuid(),
@@ -885,38 +792,6 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
     updateLineageRow.setJobVersionBag(bagOfJobVersionInfo);
   }
 
-  private void updateMarquezOnComplete(
-      LineageEvent event,
-      UpdateLineageRow updateLineageRow,
-      RunState runState,
-      ModelDaos daos,
-      RunIoSnapshot runIoSnapshot,
-      boolean projectCurrentIo,
-      @Nullable ProjectionOrder order) {
-    if (runIoSnapshot == null) {
-      throw new IllegalStateException("A terminal run event requires a cumulative I/O snapshot");
-    }
-    JobVersionDao jobVersionDao = daos.getJobVersionDao();
-    // Link the job version to the job only if the run is marked done and has transitioned into one
-    // of the following states: COMPLETED, ABORTED, or FAILED.
-    final boolean linkJobToJobVersion = runState.isDone();
-
-    BagOfJobVersionInfo bagOfJobVersionInfo =
-        jobVersionDao.upsertJobVersionOnRunTransitionInTransaction(
-            jobVersionDao.loadJobRowRunDetails(
-                updateLineageRow.getJob(),
-                updateLineageRow.getNamespace(),
-                updateLineageRow.getRun().getUuid(),
-                runIoSnapshot,
-                getJobLocation(event.getJob())),
-            runState,
-            event.getEventTime().toInstant(),
-            linkJobToJobVersion,
-            order,
-            projectCurrentIo);
-    updateLineageRow.setJobVersionBag(bagOfJobVersionInfo);
-  }
-
   /**
    * A separate method is used as the logic to update Marquez model differs for streaming and batch.
    * The assumption for batch is that the job version is created when task is done and cumulative
@@ -959,17 +834,22 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
     }
   }
 
-  private void updateMarquezOnStreamingJob(
+  private void updateRunJobVersionInTransaction(
       LineageEvent event,
-      UpdateLineageRow updateLineageRow,
+      Instant transitionedAt,
+      LineageProjectionResult projection,
       RunState runState,
       ModelDaos daos,
-      RunIoSnapshot runIoSnapshot,
-      boolean projectCurrentIo,
+      @Nullable RunIoSnapshot runIoSnapshot,
       @Nullable ProjectionOrder order) {
+    boolean streaming = event.getJob() != null && event.getJob().isStreamingJob();
     if (runIoSnapshot == null) {
-      throw new IllegalStateException("A streaming run event requires a cumulative I/O snapshot");
+      throw new IllegalStateException(
+          streaming
+              ? "A streaming run event requires a cumulative I/O snapshot"
+              : "A terminal run event requires a cumulative I/O snapshot");
     }
+    UpdateLineageRow updateLineageRow = projection.row();
     JobVersionDao jobVersionDao = daos.getJobVersionDao();
     JobRowRunDetails jobRowRunDetails =
         jobVersionDao.loadJobRowRunDetails(
@@ -979,28 +859,26 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
             runIoSnapshot,
             getJobLocation(event.getJob()));
 
-    if (event.isTerminalEventForStreamingJobWithNoDatasets()) {
+    if (streaming && event.isTerminalEventForStreamingJobWithNoDatasets()) {
       return;
     }
 
-    if (!jobVersionDao.versionExists(jobRowRunDetails.jobVersion().getValue())
-        || (order != null && projectCurrentIo)) {
-      // need to insert new job version
-      BagOfJobVersionInfo bagOfJobVersionInfo =
-          jobVersionDao.upsertJobVersionOnRunTransitionInTransaction(
-              jobRowRunDetails,
-              runState,
-              event.getEventTime().toInstant(),
-              true,
-              order,
-              projectCurrentIo);
-      updateLineageRow.setJobVersionBag(bagOfJobVersionInfo);
+    if (streaming
+        && jobVersionDao.versionExists(jobRowRunDetails.jobVersion().getValue())
+        && (order == null || !projection.projectCurrentIo())) {
+      return;
     }
+
+    BagOfJobVersionInfo bagOfJobVersionInfo =
+        jobVersionDao.upsertJobVersionOnRunTransitionInTransaction(
+            jobRowRunDetails, runState, transitionedAt, true, order, projection.projectCurrentIo());
+    updateLineageRow.setJobVersionBag(bagOfJobVersionInfo);
   }
 
   private void updateOutputDatasetVersions(
-      LineageWriteContext context,
+      ModelDaos daos,
       RunIoSnapshot runIoSnapshot,
+      List<DatasetRecord> reportedOutputs,
       Instant now,
       @Nullable ProjectionOrder order) {
     Map<UUID, UUID> selectedVersionByDataset = new LinkedHashMap<>();
@@ -1017,9 +895,10 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
     // A cumulative run snapshot cannot reconstruct occurrence order for an older event. Preserve
     // the existing pointer for those ambiguous datasets, and overlay this payload's known last
     // occurrence in encounter order.
-    for (Map.Entry<UUID, UUID> output : context.lastOutputVersionByDataset().entrySet()) {
-      ambiguousDatasets.remove(output.getKey());
-      selectedVersionByDataset.put(output.getKey(), output.getValue());
+    for (DatasetRecord output : reportedOutputs) {
+      UUID datasetUuid = output.getDatasetRow().getUuid();
+      ambiguousDatasets.remove(datasetUuid);
+      selectedVersionByDataset.put(datasetUuid, output.getDatasetVersionRow().getUuid());
     }
 
     List<DatasetCurrentVersionUpdate> updates = new ArrayList<>(selectedVersionByDataset.size());
@@ -1029,7 +908,7 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
       }
     }
     if (!updates.isEmpty()) {
-      context.daos().getDatasetDao().updateVersionsInTransaction(updates, order);
+      daos.getDatasetDao().updateVersionsInTransaction(updates, order);
     }
   }
 
@@ -1079,10 +958,21 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
       return new ArrayList<>();
     }
 
+    return upsertLineageDatasetsInPayloadOrder(context, datasets, now, runUuid, isInput);
+  }
+
+  private List<DatasetRecord> upsertAndQueueLineageDatasets(
+      LineageWriteContext context,
+      List<Dataset> datasets,
+      Instant eventTime,
+      @Nullable UUID runUuid,
+      @Nullable String eventType,
+      boolean isInput) {
     List<DatasetRecord> records =
-        upsertLineageDatasetsInPayloadOrder(context, datasets, now, runUuid, isInput);
-    if (!isInput) {
-      context.rememberOutputVersions(records);
+        upsertLineageDatasets(context, datasets, eventTime, runUuid, isInput);
+    for (int index = 0; index < datasets.size(); index++) {
+      context.queueDatasetFacets(
+          datasets.get(index), records.get(index), runUuid, eventType, eventTime, isInput);
     }
     return records;
   }
@@ -1120,42 +1010,16 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
             .daos()
             .getDatasetSymlinkDao()
             .resolvePrimarySymlinksInTransaction(primarySymlinkWrites);
-    List<String> lifecycleStates = new ArrayList<>(datasets.size());
-    List<DatasetUpsert> datasetUpserts = new ArrayList<>(datasets.size());
     Set<UUID> datasetUuids = new LinkedHashSet<>();
     boolean repeatedDatasetUuid = false;
-    for (int index = 0; index < preparedBases.size(); index++) {
-      LineageWriteContext.PreparedLineageDatasetBase preparedBase = preparedBases.get(index);
-      DatasetSymlinkRow symlink = symlinks.get(index);
-      String lifecycleState = getDatasetLifecycleState(preparedBase.dataset());
-      lifecycleStates.add(lifecycleState);
-      datasetUpserts.add(toDatasetUpsert(preparedBase, symlink, lifecycleState, now));
+    for (DatasetSymlinkRow symlink : symlinks) {
       repeatedDatasetUuid |= !datasetUuids.add(symlink.getUuid());
     }
 
     // DatasetDao maps every occurrence back to payload order. Ordered duplicates share the one
     // canonical row produced from the last occurrence; legacy duplicates retain sequential state.
-    List<DatasetRow> datasetRows =
-        context.daos().getDatasetDao().upsertAllInTransaction(datasetUpserts, context.order());
-    List<LineageWriteContext.PreparedLineageDataset> prepared = new ArrayList<>(datasets.size());
-    for (int index = 0; index < preparedBases.size(); index++) {
-      LineageWriteContext.PreparedLineageDatasetBase preparedBase = preparedBases.get(index);
-      List<SchemaField> fields =
-          Optional.ofNullable(preparedBase.dataset().getFacets())
-              .map(DatasetFacets::getSchema)
-              .map(SchemaDatasetFacet::getFields)
-              .orElse(null);
-      prepared.add(
-          new LineageWriteContext.PreparedLineageDataset(
-              preparedBase.dataset(),
-              preparedBase.rawNamespace(),
-              preparedBase.datasetNamespace(),
-              preparedBase.source(),
-              symlinks.get(index),
-              datasetRows.get(index),
-              lifecycleStates.get(index),
-              fields));
-    }
+    List<LineageWriteContext.PreparedLineageDataset> prepared =
+        upsertPreparedDatasetBases(context, preparedBases, symlinks, now);
 
     if (repeatedDatasetUuid) {
       // Distinct primary names can still be aliases for one physical dataset. Finish immutable
@@ -1279,41 +1143,39 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
     List<LineageWriteContext.PreparedLineageDatasetBase> preparedBases =
         new ArrayList<>(datasets.size());
     List<DatasetSymlinkRow> symlinks = new ArrayList<>(datasets.size());
-    List<String> lifecycleStates = new ArrayList<>(datasets.size());
-    List<DatasetUpsert> datasetUpserts = new ArrayList<>(datasets.size());
     for (Dataset dataset : datasets) {
       LineageWriteContext.PreparedLineageDatasetBase preparedBase =
           prepareLineageDatasetBase(context, dataset, now);
       DatasetSymlinkRow symlink = resolveLineageDatasetSymlink(context, preparedBase, now);
-      String lifecycleState = getDatasetLifecycleState(dataset);
       preparedBases.add(preparedBase);
       symlinks.add(symlink);
-      lifecycleStates.add(lifecycleState);
-      datasetUpserts.add(toDatasetUpsert(preparedBase, symlink, lifecycleState, now));
+    }
+
+    List<LineageWriteContext.PreparedLineageDataset> prepared =
+        upsertPreparedDatasetBases(context, preparedBases, symlinks, now);
+    return upsertPreparedLineageDatasetsSequentially(context, prepared, now, runUuid, isInput);
+  }
+
+  private List<LineageWriteContext.PreparedLineageDataset> upsertPreparedDatasetBases(
+      LineageWriteContext context,
+      List<LineageWriteContext.PreparedLineageDatasetBase> preparedBases,
+      List<DatasetSymlinkRow> symlinks,
+      Instant now) {
+    List<DatasetUpsert> datasetUpserts = new ArrayList<>(preparedBases.size());
+    for (int index = 0; index < preparedBases.size(); index++) {
+      datasetUpserts.add(toDatasetUpsert(preparedBases.get(index), symlinks.get(index), now));
     }
 
     List<DatasetRow> datasetRows =
         context.daos().getDatasetDao().upsertAllInTransaction(datasetUpserts, context.order());
-    List<LineageWriteContext.PreparedLineageDataset> prepared = new ArrayList<>(datasets.size());
-    for (int index = 0; index < datasets.size(); index++) {
-      LineageWriteContext.PreparedLineageDatasetBase preparedBase = preparedBases.get(index);
-      List<SchemaField> fields =
-          Optional.ofNullable(preparedBase.dataset().getFacets())
-              .map(DatasetFacets::getSchema)
-              .map(SchemaDatasetFacet::getFields)
-              .orElse(null);
+    List<LineageWriteContext.PreparedLineageDataset> prepared =
+        new ArrayList<>(preparedBases.size());
+    for (int index = 0; index < preparedBases.size(); index++) {
       prepared.add(
           new LineageWriteContext.PreparedLineageDataset(
-              preparedBase.dataset(),
-              preparedBase.rawNamespace(),
-              preparedBase.datasetNamespace(),
-              preparedBase.source(),
-              symlinks.get(index),
-              datasetRows.get(index),
-              lifecycleStates.get(index),
-              fields));
+              preparedBases.get(index), symlinks.get(index), datasetRows.get(index)));
     }
-    return upsertPreparedLineageDatasetsSequentially(context, prepared, now, runUuid, isInput);
+    return prepared;
   }
 
   private List<DatasetRecord> upsertLineageDatasetsSequentially(
@@ -1454,8 +1316,7 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
     LineageWriteContext.PreparedLineageDatasetBase preparedBase =
         prepareLineageDatasetBase(context, ds, now);
     DatasetSymlinkRow symlink = resolveLineageDatasetSymlink(context, preparedBase, now);
-    String lifecycleState = getDatasetLifecycleState(ds);
-    DatasetUpsert datasetUpsert = toDatasetUpsert(preparedBase, symlink, lifecycleState, now);
+    DatasetUpsert datasetUpsert = toDatasetUpsert(preparedBase, symlink, now);
     DatasetRow datasetRow =
         context.order() == null
             ? context
@@ -1479,21 +1340,7 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
                 .upsertAllInTransaction(List.of(datasetUpsert), context.order())
                 .get(0);
 
-    List<SchemaField> fields =
-        Optional.ofNullable(ds.getFacets())
-            .map(DatasetFacets::getSchema)
-            .map(SchemaDatasetFacet::getFields)
-            .orElse(null);
-
-    return new LineageWriteContext.PreparedLineageDataset(
-        ds,
-        preparedBase.rawNamespace(),
-        preparedBase.datasetNamespace(),
-        preparedBase.source(),
-        symlink,
-        datasetRow,
-        lifecycleState,
-        fields);
+    return new LineageWriteContext.PreparedLineageDataset(preparedBase, symlink, datasetRow);
   }
 
   private DatasetSymlinkRow resolveLineageDatasetSymlink(
@@ -1546,18 +1393,27 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
     String formattedNamespaceName = formatNamespaceName(rawNamespaceName);
     NamespaceRow dsNamespace = context.upsertNamespace(rawNamespaceName, now);
 
-    boolean hasExplicitSource = ds.getFacets() != null && ds.getFacets().getDataSource() != null;
-    String sourceName =
-        hasExplicitSource ? ds.getFacets().getDataSource().getName() : DEFAULT_SOURCE_NAME;
-    String sourceUrl =
-        hasExplicitSource ? getUrlOrNull(ds.getFacets().getDataSource().getUri()) : "";
+    DatasetFacets facets = ds.getFacets();
+    boolean hasExplicitSource = facets != null && facets.getDataSource() != null;
+    String sourceName = hasExplicitSource ? facets.getDataSource().getName() : DEFAULT_SOURCE_NAME;
+    String sourceUrl = hasExplicitSource ? getUrlOrNull(facets.getDataSource().getUri()) : "";
     SourceRow source =
         context.upsertSource(sourceName, getSourceType(ds), sourceUrl, hasExplicitSource, now);
 
-    String dsDescription = null;
-    if (ds.getFacets() != null && ds.getFacets().getDocumentation() != null) {
-      dsDescription = ds.getFacets().getDocumentation().getDescription();
-    }
+    String dsDescription =
+        facets != null && facets.getDocumentation() != null
+            ? facets.getDocumentation().getDescription()
+            : null;
+    String lifecycleState =
+        Optional.ofNullable(facets)
+            .map(DatasetFacets::getLifecycleStateChange)
+            .map(LifecycleStateChangeFacet::getLifecycleStateChange)
+            .orElse("");
+    List<SchemaField> fields =
+        Optional.ofNullable(facets)
+            .map(DatasetFacets::getSchema)
+            .map(SchemaDatasetFacet::getFields)
+            .orElse(null);
 
     NamespaceRow datasetNamespace =
         rawNamespaceName.equals(formattedNamespaceName)
@@ -1570,21 +1426,15 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
         datasetNamespace,
         source,
         dsDescription,
+        lifecycleState,
+        fields,
         new PrimaryDatasetSymlinkUpsert(
             UUID.randomUUID(), formatDatasetName(ds.getName()), datasetNamespace.getUuid(), now));
-  }
-
-  private String getDatasetLifecycleState(Dataset dataset) {
-    return Optional.ofNullable(dataset.getFacets())
-        .map(DatasetFacets::getLifecycleStateChange)
-        .map(LifecycleStateChangeFacet::getLifecycleStateChange)
-        .orElse("");
   }
 
   private DatasetUpsert toDatasetUpsert(
       LineageWriteContext.PreparedLineageDatasetBase preparedBase,
       DatasetSymlinkRow symlink,
-      String lifecycleState,
       Instant now) {
     Dataset ds = preparedBase.dataset();
     return new DatasetUpsert(
@@ -1598,7 +1448,7 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
         preparedBase.primarySymlinkWrite().getName(),
         ds.getName(),
         preparedBase.description(),
-        lifecycleState.equalsIgnoreCase("DROP"));
+        preparedBase.lifecycleState().equalsIgnoreCase("DROP"));
   }
 
   private DatasetVersionRow createDatasetVersion(
@@ -1650,31 +1500,43 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
         NamespaceRow datasetNamespace,
         SourceRow source,
         @Nullable String description,
+        String lifecycleState,
+        @Nullable List<SchemaField> fields,
         PrimaryDatasetSymlinkUpsert primarySymlinkWrite) {}
 
     private record PreparedLineageDataset(
-        Dataset dataset,
-        NamespaceRow rawNamespace,
-        NamespaceRow datasetNamespace,
-        SourceRow source,
-        DatasetSymlinkRow symlink,
-        DatasetRow datasetRow,
-        String lifecycleState,
-        @Nullable List<SchemaField> fields) {
+        PreparedLineageDatasetBase base, DatasetSymlinkRow symlink, DatasetRow datasetRow) {
+      Dataset dataset() {
+        return base.dataset();
+      }
+
+      NamespaceRow rawNamespace() {
+        return base.rawNamespace();
+      }
+
+      NamespaceRow datasetNamespace() {
+        return base.datasetNamespace();
+      }
+
+      SourceRow source() {
+        return base.source();
+      }
+
+      String lifecycleState() {
+        return base.lifecycleState();
+      }
+
+      @Nullable
+      List<SchemaField> fields() {
+        return base.fields();
+      }
+
       List<SchemaField> fieldsOrEmpty() {
-        return fields == null ? Collections.emptyList() : fields;
+        return fields() == null ? Collections.emptyList() : fields();
       }
 
       PreparedLineageDataset withDatasetRow(DatasetRow replacement) {
-        return new PreparedLineageDataset(
-            dataset,
-            rawNamespace,
-            datasetNamespace,
-            source,
-            symlink,
-            replacement,
-            lifecycleState,
-            fields);
+        return new PreparedLineageDataset(base, symlink, replacement);
       }
     }
 
@@ -1686,7 +1548,6 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
     private final Map<String, NamespaceRow> namespacesByExactName = new LinkedHashMap<>();
     private final Map<String, SourceState> lastSourceStateByName = new LinkedHashMap<>();
     private final Set<UUID> pendingInputMappings = new LinkedHashSet<>();
-    private final Map<UUID, UUID> lastOutputVersionByDataset = new LinkedHashMap<>();
     @Nullable private List<DatasetFacetWrite> pendingDatasetFacets;
     private final List<ColumnLineageDatasetWrite> pendingColumnLineage = new ArrayList<>();
 
@@ -1776,17 +1637,6 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
       if (runUuid != null) {
         pendingInputMappings.add(datasetVersionUuid);
       }
-    }
-
-    void rememberOutputVersions(List<DatasetRecord> records) {
-      for (DatasetRecord record : records) {
-        lastOutputVersionByDataset.put(
-            record.getDatasetRow().getUuid(), record.getDatasetVersionRow().getUuid());
-      }
-    }
-
-    Map<UUID, UUID> lastOutputVersionByDataset() {
-      return Collections.unmodifiableMap(lastOutputVersionByDataset);
     }
 
     void flushInputMappings() {
@@ -1959,7 +1809,6 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
         outputFieldsByName.putIfAbsent(datasetField.getName(), datasetField);
       }
 
-      Logger log = LoggerFactory.getLogger(OpenLineageDao.class);
       List<ColumnLineageWrite> writes = new ArrayList<>(columnLineageByOutput.size());
       for (Map.Entry<String, LineageEvent.ColumnLineageOutputColumn> entry :
           columnLineageByOutput.entrySet()) {
@@ -1971,14 +1820,14 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
 
         DatasetFieldRow outputField = outputFieldsByName.get(columnName);
         if (outputField == null) {
-          log.error(
+          LOG.error(
               "Cannot produce column lineage for missing output field in output dataset: {}",
               columnName);
           continue;
         }
 
         List<Pair<UUID, UUID>> inputFields = resolveInputFields(columnLineage.getInputFields());
-        log.debug(
+        LOG.debug(
             "Adding column lineage on output field '{}' for dataset version '{}' with input fields: {}",
             outputField.getName(),
             datasetVersionRow.getUuid(),
@@ -2024,8 +1873,7 @@ public interface OpenLineageDao extends BaseDao, Transactional<OpenLineageDao> {
       if (inputFieldsByKey == null) {
         List<InputFieldData> runFields =
             daos.getDatasetFieldDao().findInputFieldsDataAssociatedWithRun(runUuid);
-        LoggerFactory.getLogger(OpenLineageDao.class)
-            .debug("Found input datasets fields for run '{}': {}", runUuid, runFields);
+        LOG.debug("Found input datasets fields for run '{}': {}", runUuid, runFields);
 
         inputFieldsByKey = new LinkedHashMap<>();
         for (InputFieldData fieldData : runFields) {

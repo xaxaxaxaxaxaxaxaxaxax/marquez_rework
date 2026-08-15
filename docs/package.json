@@ -4,9 +4,13 @@
   "private": true,
   "scripts": {
     "docusaurus": "docusaurus",
+    "api-docs:sync": "docusaurus clean-api-docs all && docusaurus gen-api-docs all",
+    "prestart": "npm run api-docs:sync",
     "start": "docusaurus start",
+    "prebuild": "npm run api-docs:sync",
     "build": "docusaurus build",
     "swizzle": "docusaurus swizzle",
+    "predeploy": "npm run api-docs:sync",
     "deploy": "docusaurus deploy",
     "clear": "docusaurus clear",
     "serve": "docusaurus serve",

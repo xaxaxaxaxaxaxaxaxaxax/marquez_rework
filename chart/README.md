@@ -78,7 +78,7 @@ helm delete marquez
 | `marquez.port`               | API host port                                                                 | `5000`                   |
 | `marquez.adminPort`          | Heath/Liveness host port                                                      | `5001`                   |
 | `marquez.openLineage.workerThreads` | Concurrent OpenLineage event processors per Marquez replica            | `8`                      |
-| `marquez.openLineage.projectionBatchSize` | Maximum events from one durable batch admission projected per transaction; valid range 1-64, with 1 selecting singleton projection | `8` |
+| `marquez.openLineage.projectionBatchSize` | Maximum events from one admitted batch projected per transaction; valid range 1-64, with 1 retaining singleton projection | `8` |
 | `marquez.openLineage.pollIntervalMillis` | Delay between database polls when no due work is found              | `1000`                   |
 | `marquez.openLineage.maxAttempts` | Maximum committed caught-failure count; the failure reaching it is dead-lettered | `10`              |
 | `marquez.openLineage.retryInitialDelayMillis` | Initial retry-backoff bound for processing failures             | `1000`                   |
@@ -95,15 +95,10 @@ With `marquez.db.autoCommentsEnabled: false`, SQL statements no longer include a
 when those prefixes are operationally required; SQL behavior is otherwise unchanged.
 
 `marquez.openLineage.projectionBatchSize` is independent of the HTTP batch admission limit of
-1000. A projection transaction never waits for a batch to fill and includes at most the configured
-number of events, including an optional same-lane follower selected to preserve the queue's
-scheduling quantum. Rows admitted through the singular endpoint and legacy queued rows have no
-batch admission ID and remain singleton claims; batch admission IDs are nullable
-database-generated `BIGINT` values and are not an API or configuration value. Larger projection
-batches hold more queue and metadata
-locks and can create a larger post-commit publication burst. Monitor `claim_size`,
-`batch_fallback`, and transaction age when tuning this value, and increase shutdown grace if
-representative transactions can exceed the configured worker drain window.
+1000. Projection claims may be smaller than the configured size, and one admitted batch may span
+multiple projection transactions. Larger values can hold more queue and metadata locks and create
+larger post-commit publication bursts. Monitor `claim_size`, `batch_fallback`, and transaction age
+when tuning the value; set it to `1` to retain singleton projection.
 
 Set `marquez.terminationGracePeriodSeconds` to more than twice
 `marquez.openLineage.shutdownGracePeriodMillis` (after converting milliseconds to seconds),

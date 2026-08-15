@@ -9,34 +9,50 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import java.io.IOException;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Function;
 import marquez.search.SearchConfig;
 import marquez.service.models.LineageEvent;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.opensearch.client.json.jackson.JacksonJsonpMapper;
 import org.opensearch.client.opensearch.OpenSearchClient;
 import org.opensearch.client.opensearch._types.ErrorCause;
+import org.opensearch.client.opensearch._types.query_dsl.MultiMatchQuery;
+import org.opensearch.client.opensearch._types.query_dsl.Operator;
+import org.opensearch.client.opensearch._types.query_dsl.TextQueryType;
 import org.opensearch.client.opensearch.core.BulkRequest;
 import org.opensearch.client.opensearch.core.BulkResponse;
+import org.opensearch.client.opensearch.core.SearchRequest;
 import org.opensearch.client.opensearch.core.bulk.BulkOperation;
 import org.opensearch.client.opensearch.core.bulk.BulkResponseItem;
+import org.opensearch.client.opensearch.core.search.BuiltinHighlighterType;
+import org.opensearch.client.opensearch.core.search.HighlightField;
+import org.opensearch.client.util.ObjectBuilder;
 
 class SearchServiceTest {
   private static final UUID RUN_ID = UUID.fromString("de2d8a76-57b3-42f6-8d26-06d6179ac45c");
   private static final UUID EFFECTIVE_RUN_ID =
       UUID.fromString("ec0f5598-20ab-4d60-ab4d-6fc280748251");
+  private static final ObjectMapper DOCUMENT_MAPPER =
+      new JacksonJsonpMapper().objectMapper().registerModule(new JavaTimeModule());
 
   private SearchConfig searchConfig;
   private OpenSearchClient openSearchClient;
@@ -48,6 +64,48 @@ class SearchServiceTest {
     openSearchClient = mock(OpenSearchClient.class);
     when(searchConfig.isEnabled()).thenReturn(true);
     searchService = new SearchService(searchConfig, openSearchClient);
+  }
+
+  @Test
+  @SuppressWarnings({"rawtypes", "unchecked"})
+  void searchRequestsPreserveTheirExactSharedQueryShape() throws IOException {
+    searchService.searchDatasets("needle");
+    searchService.searchJobs("needle");
+
+    ArgumentCaptor<Function<SearchRequest.Builder, ObjectBuilder<SearchRequest>>> requests =
+        ArgumentCaptor.forClass(Function.class);
+    verify(openSearchClient, times(2)).search(requests.capture(), eq(ObjectNode.class));
+    SearchRequest datasetRequest =
+        requests.getAllValues().get(0).apply(new SearchRequest.Builder()).build();
+    SearchRequest jobRequest =
+        requests.getAllValues().get(1).apply(new SearchRequest.Builder()).build();
+
+    assertSearchRequest(
+        datasetRequest,
+        "datasets",
+        List.of(
+            "run_id",
+            "name",
+            "namespace",
+            "facets.schema.fields.name",
+            "facets.schema.fields.type",
+            "facets.columnLineage.fields.*.inputFields.name",
+            "facets.columnLineage.fields.*.inputFields.namespace",
+            "facets.columnLineage.fields.*.inputFields.field",
+            "facets.columnLineage.fields.*.transformationDescription",
+            "facets.columnLineage.fields.*.transformationType"));
+    assertSearchRequest(
+        jobRequest,
+        "jobs",
+        List.of(
+            "facets.sql.query",
+            "facets.sourceCode.sourceCode",
+            "facets.sourceCode.language",
+            "runFacets.processing_engine.name",
+            "run_id",
+            "name",
+            "namespace",
+            "type"));
   }
 
   @Test
@@ -66,12 +124,22 @@ class SearchServiceTest {
             "DATASET.b3V0cHV0LW5hbWVzcGFjZQ.b3V0cHV0",
             "JOB.am9iLW5hbWVzcGFjZQ.am9i");
 
-    @SuppressWarnings("unchecked")
-    Map<String, Object> inputDocument = (Map<String, Object>) operations.get(0).index().document();
+    Map<String, Object> inputDocument = indexDocument(operations.get(0));
     assertThat(inputDocument)
+        .containsOnlyKeys(
+            "run_id", "eventType", "name", "inputFacets", "outputFacets", "namespace", "facets")
         .containsEntry("run_id", RUN_ID.toString())
         .containsEntry("namespace", "input-namespace")
-        .containsEntry("name", "input");
+        .containsEntry("name", "input")
+        .containsEntry("inputFacets", null)
+        .containsEntry("outputFacets", null)
+        .containsEntry("facets", null);
+    assertThat(indexDocument(operations.get(2)))
+        .containsOnlyKeys("run_id", "eventType", "name", "type", "namespace", "facets", "runFacets")
+        .containsEntry("run_id", RUN_ID.toString())
+        .containsEntry("type", "BATCH")
+        .containsEntry("facets", null)
+        .containsEntry("runFacets", null);
   }
 
   @Test
@@ -139,29 +207,29 @@ class SearchServiceTest {
   }
 
   @Test
-  void queuedSingletonStillThrowsWhenBulkResponseContainsItemErrors() throws IOException {
-    BulkResponse response = mock(BulkResponse.class);
-    when(response.errors()).thenReturn(true);
-    when(response.items()).thenReturn(List.of());
-    when(openSearchClient.bulk(any(BulkRequest.class))).thenReturn(response);
-
-    assertThrows(
-        IllegalStateException.class,
-        () -> searchService.indexEvent(lineageEvent(), EFFECTIVE_RUN_ID));
-  }
-
-  @Test
-  void batchCountsDistinctFailedEntriesRatherThanFailedOperations() throws IOException {
+  void batchMapsUnevenOperationRangesAcrossMaterializationFailure() throws IOException {
+    LineageEvent first = lineageEvent();
+    first.setOutputs(List.of());
+    LineageEvent malformed = mock(LineageEvent.class);
+    when(malformed.getInputs()).thenReturn(List.of(dataset("partial", "input")));
+    when(malformed.getOutputs()).thenReturn(List.of());
+    when(malformed.getJob()).thenThrow(new IllegalStateException("missing job"));
+    LineageEvent third = lineageEvent();
+    third.setInputs(
+        List.of(
+            dataset("third-input-namespace", "third-input-one"),
+            dataset("third-input-namespace", "third-input-two")));
+    LineageEvent fourth = lineageEvent();
+    fourth.setInputs(List.of());
+    fourth.setOutputs(List.of());
     BulkResponse response = mock(BulkResponse.class);
     when(response.errors()).thenReturn(true);
     doReturn(
             List.of(
                 failedItem("first input"),
-                successfulItem(),
                 failedItem("first job"),
-                successfulItem(),
-                failedItem("second output"),
-                successfulItem(),
+                failedItem("third first input"),
+                failedItem("third second input"),
                 successfulItem(),
                 successfulItem(),
                 successfulItem()))
@@ -172,10 +240,13 @@ class SearchServiceTest {
     assertThat(
             searchService.indexEventsBestEffort(
                 List.of(
-                    new SearchService.IndexEntry(lineageEvent(), RUN_ID),
-                    new SearchService.IndexEntry(lineageEvent(), EFFECTIVE_RUN_ID),
-                    new SearchService.IndexEntry(lineageEvent(), UUID.randomUUID()))))
-        .isEqualTo(2);
+                    new SearchService.IndexEntry(first, RUN_ID),
+                    new SearchService.IndexEntry(malformed, UUID.randomUUID()),
+                    new SearchService.IndexEntry(third, EFFECTIVE_RUN_ID),
+                    new SearchService.IndexEntry(fourth, UUID.randomUUID()))))
+        .isEqualTo(3);
+
+    assertThat(capturedOperations()).hasSize(7);
   }
 
   @Test
@@ -346,6 +417,20 @@ class SearchServiceTest {
     return LineageEvent.Dataset.builder().namespace(namespace).name(name).build();
   }
 
+  private static void assertSearchRequest(
+      SearchRequest request, String index, List<String> fields) {
+    assertThat(request.index()).containsExactly(index);
+    MultiMatchQuery query = request.query().multiMatch();
+    assertThat(query.query()).isEqualTo("needle");
+    assertThat(query.type()).isEqualTo(TextQueryType.PhrasePrefix);
+    assertThat(query.operator()).isEqualTo(Operator.Or);
+    assertThat(query.fields()).containsExactlyElementsOf(fields);
+    assertThat(request.highlight().fields().keySet()).containsExactlyInAnyOrderElementsOf(fields);
+    for (HighlightField field : request.highlight().fields().values()) {
+      assertThat(field.type().builtin()).isEqualTo(BuiltinHighlighterType.Plain);
+    }
+  }
+
   private List<BulkOperation> capturedOperations() throws IOException {
     ArgumentCaptor<BulkRequest> request = ArgumentCaptor.forClass(BulkRequest.class);
     verify(openSearchClient).bulk(request.capture());
@@ -372,6 +457,6 @@ class SearchServiceTest {
 
   @SuppressWarnings("unchecked")
   private static Map<String, Object> indexDocument(BulkOperation operation) {
-    return (Map<String, Object>) operation.index().document();
+    return DOCUMENT_MAPPER.convertValue(operation.index().document(), Map.class);
   }
 }

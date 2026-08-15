@@ -284,53 +284,10 @@ millisecond-floored database time, bounding clock preservation to two successful
 Retry refreshes the clock and resets the bit. This reduces indexed head updates; it does not
 promise that another lane runs between the two promotions.
 
-The head lock is acquired before the projection savepoint. A caught projection failure rolls back
-partial projection writes to that savepoint and commits either retry state or a dead letter;
-`maxAttempts` counts only those committed caught failures. Before commit, an uncaught database
-error, lost connection, process crash, or PostgreSQL crash that aborts the transaction consumes no
-attempt and leaves the head eligible when PostgreSQL releases it. A connection or process failure
-while the commit result is being returned is indeterminate: projection and acknowledgement may
-already be committed, so the worker fails health rather than inferring replay eligibility. Database
-projection and queue state are atomic, but commit observation, best-effort post-commit listeners,
-and asynchronous failover remain at-least-once boundaries.
-
-Each active event pins one JDBC connection for its transaction. Size the pool for all configured
-processors plus independent HTTP capacity, and monitor old `pg_stat_activity.xact_start` values:
-a long transaction holds its row lock and can delay vacuum cleanup. `statement_timeout` bounds an
-individual SQL statement, while `idle_in_transaction_session_timeout` bounds idle gaps; neither is
-a general PG14 total-transaction deadline. Apply database timeouts only to a dedicated queue
-role/session. There is no per-event application cancellation deadline; forced shutdown relies on
-task interruption followed by synchronous connection abort to roll back unfinished transactions.
-
-Worker shutdown has two intervals of `shutdownGracePeriodMillis`. The first drains cooperatively.
-If it expires or shutdown is interrupted, the forced phase interrupts remaining tasks and invokes
-JDBC `Connection.abort` synchronously for every registered connection before the second
-deadline-bounded executor wait. The two waits are bounded, but the synchronous driver abort calls
-between them have no application-enforced deadline and can extend total stop time if a driver
-blocks. A completed abort rolls back the open transaction and releases its head lock.
-`shutdown_incomplete` means a coordinator or processor thread, registered connection, or
-connection-abort failure was still present after that process; there is no delayed queue-recovery
-timer.
-
-The smallest useful model is:
-
-```text
-H                     = number of nonempty ordering keys
-live selectable rows  = H
-B                     = requested poll batch; production fixes B = 1
-L                     = earlier due heads locked by concurrent transactions
-D                     = dead or invisible index entries encountered by PostgreSQL
-live-row poll work    = O(B + L)
-physical index work   = O(B + L + D)
-same-run concurrency  = 1
-queue bytes           = fixed pages + sum(serialized payload bytes + row/index overhead) + O(H)
-```
-
-With `W` processors holding at most one head each, `L <= W - 1`; production therefore has a live
-candidate bound of `O(W)` for `B = 1`, independent of queue cardinality. A transaction held by a
-slow processor keeps its lane locked and lets later due lanes pass it until commit or rollback.
-Vacuum and the due-index statistics determine `D`, so the live-row bound is not a promise of
-constant physical page reads in a bloated relation.
+The canonical [durable-intake operational model](METRICS.md#durable-openlineage-intake) defines
+claim and outcome algebra, failure and commit-observation boundaries, connection and timeout
+costs, shutdown semantics, and current selection/concurrency bounds. Those operational details are
+maintained there rather than duplicated in this historical profile.
 
 The replaced anti-predecessor selection scanned deferred followers. With 100,000 due followers behind
 one unavailable hot head plus 100 independent heads, it took 308.49 ms and visited 100,099 due
@@ -347,30 +304,25 @@ reduced end-to-end throughput. The final design keeps run-local FIFO and makes s
 state monotonic, accepting ordinary row-lock contention without turning the queue into a per-job
 scheduler.
 
-### Million-event queue gate
-
-The final scale gate uses frozen JOBKEY and run-causal source snapshots with PostgreSQL durability
-settings intact. It measures 100,000 and 1,000,000-row HOT, MANY, MIX, and BLOCKED fixtures;
-fixed-work poll/follower/head/enqueue plans; storage and WAL slopes; an exact eight-worker
-100,000-event transaction-stress prefix at a one-million-row high-water mark; lossless bulk
-reclamation of the remaining rows; vacuum/refill reuse; real worker sensitivity; HTTP admission
-and drain; and one JFR diagnostic. Bulk reclamation is explicitly excluded from throughput and WAL
-comparisons. Results are recorded only after the fail-closed source manifest and DAO/schema/worker
-adapter review match the production files.
-
-### Batch admission throughput
+### Historical pre-V81 batch admission throughput
 
 The opt-in `OpenLineageBatchThroughputBenchmark` compares the actual HTTP admission paths with
 four closed-loop clients. Each cell submits 16,384 small required-only RunEvents with distinct run
 IDs, so every event exercises a distinct ordering lock and creates a distinct queue head. The
 single cell sends one event per `POST /lineage`; the batch cell sends 128 events per
 `POST /lineage/batch`. Request construction is outside the timed interval. New heads are scheduled
-at infinity during each cell so the asynchronous projector cannot consume CPU or database capacity;
-this is an admission-throughput measurement, not projection throughput.
+at infinity during each cell so the asynchronous projector cannot claim or project them. The
+running worker still performs empty polls, so its small database and CPU cost remains present. This
+is an admission-throughput measurement, not projection throughput.
 
-The Java 17/PostgreSQL 14 run used 8,192 warm-up events per path followed by seven measured cells
-per path. Cell order alternated, the queue was truncated between cells, and every response status,
-queue row, unique-lane head, and zero-dead-letter invariant was checked.
+The table below is historical evidence from before V81 added admission IDs and V82 added their
+membership index. It must not be treated as current admission capacity until the benchmark is
+rerun. The historical Java 17/PostgreSQL 14 run used 8,192 warm-up events per path followed by
+seven measured cells per path. Cell order alternated, the queue was truncated between cells, and
+every response status, queue row, unique-lane head, and zero-dead-letter invariant was checked. The
+current benchmark also uses the same deterministic event identities for both cells in each pair
+and gates V81 admission count, null membership, and exact batch membership size after each timed
+cell.
 
 | Events/request | HTTP route | Median events/s | Cell range | Median requests/s |
 |---:|---|---:|---:|---:|
@@ -381,15 +333,10 @@ The median paired throughput gain was **13.88x**. The first single-event cell wa
 events/s; the other six were 3,009.5–3,154.4 events/s, so the seven-cell median is not driven by
 that outlier. Batch throughput varied by about +/-6% around its median.
 
-The smallest useful throughput model is:
-
-```text
-event throughput = request throughput * events per request
-```
-
-Batching does not approach the theoretical 128x ceiling because parsing, validation,
-serialization, identity allocation, queue-row writes, and per-lane lock/head work remain
-per-event. It nevertheless removes 127 HTTP exchanges and 127 queue transactions per 128 events.
+Here `event throughput = request throughput * events per request`. Batching does not approach the
+theoretical 128x ceiling because parsing, validation, serialization, identity allocation,
+queue-row writes, and per-lane lock/head work remain per-event. It nevertheless removes 127 HTTP
+exchanges and 127 queue transactions per 128 events.
 This fixture deliberately uses all-distinct lanes; repeated events for the same run deduplicate
 advisory-lock and head work and can have a different throughput profile. Results are indicative for
 one local machine and do not establish production capacity.
@@ -405,48 +352,35 @@ JAVA_TOOL_OPTIONS=-DrunOpenLineageBatchThroughputBenchmark=true \
 ### Request-bounded projection batching methodology
 
 `OpenLineageBatchPipelineThroughputBenchmark` is the opt-in gate for downstream projection
-batching. It compares `projectionBatchSize=1` and `projectionBatchSize=8` in the same codebase and
-JVM. Both cells admit the same deterministic sequence of eight-event requests through the
-production durable-intake component. A projection claim is confined to one atomic admission: it
-never fills spare capacity with events from another request. Within that admission, the durable q2
-state also bounds each lane. A head whose `refresh_due_on_advance` bit is false may contribute its
-immediate same-admission follower, while a head whose bit is true contributes only itself.
+batching. It compares `projectionBatchSize=1` and `projectionBatchSize=8` against the same
+deterministic eight-event admissions in one JVM. A benchmark-local PostgreSQL 14 container is
+migrated with Flyway, and the worker uses a Dropwizard managed pool fixed at one reusable physical
+connection with READ COMMITTED isolation. No running Marquez application is required.
 
-The benchmark reports durable admission and projector drain separately. Payload construction is
-outside both intervals. Admission timing ends only after every request transaction commits. Drain
-timing starts when the preloaded heads are made due and the real worker starts, and ends only after
-the live queue and head table are empty and the expected raw and relational projections are
-visible. The sum is reported as sequential pipeline time; it is not presented as a concurrent
-steady-state latency measurement. This prevents the admission gain from concealing projector
-work, while retaining the historical admission-only comparison above unchanged.
+Admission and fixture construction are outside timing; this benchmark reports drain only. After
+each clean seed, `VACUUM (ANALYZE)` runs outside timing so both variants start with reclaimed tuples
+and statistics for the actual fixture. An aggregate V81 gate verifies queue rows, heads, distinct
+admissions, non-null membership, and exact eight-row admission sizes without reading or reparsing
+payload JSON. Drain timing begins immediately before the one-thread worker starts and ends when its
+commit-observed `succeeded` meter reaches the event count. Queue emptiness and raw and relational
+projection counts are checked afterward.
 
-One warm-up pair precedes seven measured seed-paired trials. Cell order alternates between sizes 1
-and 8, each measured cell uses a clean semantic fixture, and one worker thread removes concurrent
-scheduling as a confounder. The primary result is the distribution of paired drain-throughput
-ratios, accompanied by admission and drain events/second, elapsed time, successful-claim transaction
-counts, queue invariants, raw and relational projection counts, dead letters, and WAL/LSN movement.
-Results are publishable here only when every correctness gate passes and the measured trials support
-the stated claim.
+One warm-up pair precedes seven measured pairs, measured order alternates, and both cells in a pair
+use identical fixture identities. The primary statistic is the median of paired drain-throughput
+ratios, accompanied by its range and pair wins; variant medians and ranges are descriptive. The
+benchmark uses the canonical [worker metric algebra](METRICS.md#durable-openlineage-intake). For
+this full all-success fixture it additionally requires `S = O = events` and `S = B*K`; any retry,
+dead letter, fallback, worker failure, forced or incomplete shutdown, or unhealthy pre-stop worker
+invalidates the cell.
 
-The 2026-08-15 local PostgreSQL 14 / Java 17 run used 64 admissions (512 events) per measured cell.
-Every gate passed: the queue and head table drained, all raw and relational counts matched, admission
-boundaries and exact claim sizes matched, and no retry, dead letter, or batch fallback occurred.
-
-| Metric (median of seven cells unless noted) | Batch size 1 | Batch size 8 | Effect |
-|---|---:|---:|---:|
-| Projection drain throughput | 39.6 events/s (36.5–40.9) | 87.5 events/s (79.9–89.6) | 2.189x paired median; size 8 won 7/7 pairs |
-| Successful projection claim transactions/cell | 512 | 64 | 8x fewer |
-| Sequential admission + drain throughput | 38.6 events/s | 82.6 events/s | 2.14x |
-| Durable admission throughput | 1,453.9 events/s | 1,465.2 events/s | 1.01x (neutral) |
-| Projection WAL | 11,044 bytes/event | 15,818 bytes/event | 1.43x |
-| Admission WAL | 1,190 bytes/event | 1,177 bytes/event | 0.99x (neutral) |
-
-The measured gain therefore comes from amortizing claim, transaction, and queue-finalization work;
-the relational projector still executes its mature per-event operations inside the outer
-transaction. The larger transaction increased projection WAL in this fixture, so tune batch size
-against replication volume, transaction age, and lock duration rather than treating 8 as a
-universal optimum. These results describe one local, single-worker fixture and do not establish
-production capacity.
+There is currently no publishable projection-batching performance result. The previous result was
+collected through a non-pooled `PGSimpleDataSource`, so the batch-size-one cell opened roughly one
+physical PostgreSQL connection per claim while the batch-size-eight cell opened roughly one per
+eight events. That violated physical comparability; its throughput and WAL figures and their tuning
+conclusions are retracted. WAL is no longer mixed into this throughput benchmark: an unchecked LSN
+delta is cluster-global, while forcing a checkpoint before every cell would introduce full-page
+images and alter the measured drain workload. A repaired full pooled run is required before changing
+the configured default or publishing a replacement claim.
 
 Run the benchmark explicitly; it is disabled in normal test execution:
 

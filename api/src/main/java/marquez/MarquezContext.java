@@ -166,8 +166,7 @@ public final class MarquezContext {
     this.searchService = new SearchService(searchConfig);
     this.openLineageService = new OpenLineageService(baseDao, runService, searchService);
     this.openLineageWorker =
-        new OpenLineageWorker(
-            jdbi, openLineageQueueDao, openLineageService, openLineageConfig, metricRegistry);
+        new OpenLineageWorker(jdbi, openLineageService, openLineageConfig, metricRegistry);
     this.openLineageIntake = new OpenLineageIntake(openLineageQueueDao, openLineageWorker::wakeUp);
     this.lineageService = new LineageService(lineageDao, jobDao, runDao);
     this.columnLineageService = new ColumnLineageService(columnLineageDao, datasetFieldDao);

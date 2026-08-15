@@ -7,6 +7,10 @@
 # Generated files
 .docusaurus
 .cache-loader
+/docs/api/*.api.mdx
+/docs/api/*.info.mdx
+/docs/api/*.tag.mdx
+/docs/api/sidebar.js
 
 # Misc
 .DS_Store

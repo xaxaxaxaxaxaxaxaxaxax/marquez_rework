@@ -14,7 +14,6 @@ import java.net.http.HttpRequest.BodyPublishers;
 import java.net.http.HttpResponse;
 import java.net.http.HttpResponse.BodyHandlers;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
@@ -32,10 +31,10 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
  * Opt-in admission-throughput benchmark for single-event requests versus 128-event batches.
  *
  * <p>Run with {@code -DrunOpenLineageBatchThroughputBenchmark=true}. New queue heads are scheduled
- * at infinity during the benchmark so the asynchronous projector cannot consume database or CPU
- * capacity from the measured HTTP admission path. The client count, warm-up events, measured events
- * per cell, and trial count can be overridden with {@code openLineageBatchBenchmark.*} system
- * properties.
+ * at infinity during the benchmark, preventing projection claims and writes. The running worker
+ * still performs empty polls, so its small database and CPU cost remains in the measured HTTP
+ * admission path. The client count, warm-up events, measured events per cell, and trial count can
+ * be overridden with {@code openLineageBatchBenchmark.*} system properties.
  */
 @Tag("IntegrationTests")
 @EnabledIfSystemProperty(named = "runOpenLineageBatchThroughputBenchmark", matches = "true")
@@ -68,25 +67,26 @@ public class OpenLineageBatchThroughputBenchmark extends BaseIntegrationTest {
     try {
       freezeNewQueueHeads(jdbi);
       queueHeadsFrozen = true;
-      runCell(jdbi, clients, 1, WARMUP_EVENTS, "warmup-single");
-      runCell(jdbi, clients, BATCH_SIZE, WARMUP_EVENTS, "warmup-batch");
+      runCell(jdbi, clients, 1, WARMUP_EVENTS, "warmup");
+      runCell(jdbi, clients, BATCH_SIZE, WARMUP_EVENTS, "warmup");
 
       for (int trial = 1; trial <= TRIALS; trial++) {
-        CellResult single;
-        CellResult batch;
+        TimedCount single;
+        TimedCount batch;
         String order;
+        String fixtureKey = "trial-" + trial;
         if ((trial & 1) == 1) {
           order = "single,batch";
-          single = runCell(jdbi, clients, 1, EVENTS_PER_CELL, "trial-" + trial + "-single");
-          batch = runCell(jdbi, clients, BATCH_SIZE, EVENTS_PER_CELL, "trial-" + trial + "-batch");
+          single = runCell(jdbi, clients, 1, EVENTS_PER_CELL, fixtureKey);
+          batch = runCell(jdbi, clients, BATCH_SIZE, EVENTS_PER_CELL, fixtureKey);
         } else {
           order = "batch,single";
-          batch = runCell(jdbi, clients, BATCH_SIZE, EVENTS_PER_CELL, "trial-" + trial + "-batch");
-          single = runCell(jdbi, clients, 1, EVENTS_PER_CELL, "trial-" + trial + "-single");
+          batch = runCell(jdbi, clients, BATCH_SIZE, EVENTS_PER_CELL, fixtureKey);
+          single = runCell(jdbi, clients, 1, EVENTS_PER_CELL, fixtureKey);
         }
 
-        double singleThroughput = single.eventsPerSecond();
-        double batchThroughput = batch.eventsPerSecond();
+        double singleThroughput = single.perSecond();
+        double batchThroughput = batch.perSecond();
         double pairedSpeedup = batchThroughput / singleThroughput;
         singleThroughputs.add(singleThroughput);
         batchThroughputs.add(batchThroughput);
@@ -106,6 +106,9 @@ public class OpenLineageBatchThroughputBenchmark extends BaseIntegrationTest {
             pairedSpeedup);
       }
 
+      Distribution singleDistribution = Distribution.of(singleThroughputs);
+      Distribution batchDistribution = Distribution.of(batchThroughputs);
+      Distribution speedupDistribution = Distribution.of(pairedSpeedups);
       System.out.printf(
           Locale.ROOT,
           "OPENLINEAGE_BATCH_THROUGHPUT_SUMMARY clients=%d events_per_cell=%d trials=%d "
@@ -115,13 +118,13 @@ public class OpenLineageBatchThroughputBenchmark extends BaseIntegrationTest {
           CLIENTS,
           EVENTS_PER_CELL,
           TRIALS,
-          median(singleThroughputs),
-          minimum(singleThroughputs),
-          maximum(singleThroughputs),
-          median(batchThroughputs),
-          minimum(batchThroughputs),
-          maximum(batchThroughputs),
-          median(pairedSpeedups));
+          singleDistribution.median(),
+          singleDistribution.minimum(),
+          singleDistribution.maximum(),
+          batchDistribution.median(),
+          batchDistribution.minimum(),
+          batchDistribution.maximum(),
+          speedupDistribution.median());
     } finally {
       try {
         if (queueHeadsFrozen) {
@@ -138,11 +141,11 @@ public class OpenLineageBatchThroughputBenchmark extends BaseIntegrationTest {
     }
   }
 
-  private CellResult runCell(
-      Jdbi jdbi, ExecutorService clients, int batchSize, int eventCount, String cellName)
+  private TimedCount runCell(
+      Jdbi jdbi, ExecutorService clients, int batchSize, int eventCount, String fixtureKey)
       throws Exception {
     cleanQueue(jdbi);
-    List<String> eventJsons = eventJsons(eventCount, cellName);
+    List<String> eventJsons = eventJsons(eventCount, fixtureKey);
     List<String> requestBodies = requestBodies(eventJsons, batchSize);
     List<List<HttpRequest>> assignments = requestAssignments(requestBodies, batchSize);
     int expectedStatus = batchSize == 1 ? 201 : 204;
@@ -186,8 +189,12 @@ public class OpenLineageBatchThroughputBenchmark extends BaseIntegrationTest {
     long elapsedNanos = System.nanoTime() - startedAt;
 
     assertThat(acceptedRequests).isEqualTo(requestBodies.size());
-    assertQueueState(jdbi, eventCount);
-    return new CellResult(eventCount, elapsedNanos);
+    QueueSnapshot expectedQueue =
+        batchSize == 1
+            ? QueueSnapshot.singular(eventCount)
+            : QueueSnapshot.batch(eventCount, requestBodies.size(), batchSize);
+    assertThat(QueueSnapshot.read(jdbi)).isEqualTo(expectedQueue);
+    return new TimedCount(eventCount, elapsedNanos);
   }
 
   private List<List<HttpRequest>> requestAssignments(List<String> bodies, int batchSize) {
@@ -210,10 +217,10 @@ public class OpenLineageBatchThroughputBenchmark extends BaseIntegrationTest {
     return assignments;
   }
 
-  private static List<String> eventJsons(int eventCount, String cellName) {
+  private static List<String> eventJsons(int eventCount, String fixtureKey) {
     List<String> events = new ArrayList<>(eventCount);
     for (int event = 0; event < eventCount; event++) {
-      UUID runId = UUID.nameUUIDFromBytes((cellName + ':' + event).getBytes(UTF_8));
+      UUID runId = UUID.nameUUIDFromBytes((fixtureKey + ':' + event).getBytes(UTF_8));
       events.add(
           "{\"eventTime\":\"2026-08-15T00:00:00Z\","
               + "\"run\":{\"runId\":\""
@@ -236,29 +243,6 @@ public class OpenLineageBatchThroughputBenchmark extends BaseIntegrationTest {
       batches.add('[' + String.join(",", eventJsons.subList(offset, offset + batchSize)) + ']');
     }
     return batches;
-  }
-
-  private static void assertQueueState(Jdbi jdbi, int expectedEvents) {
-    QueueState state =
-        jdbi.withHandle(
-            handle ->
-                handle
-                    .createQuery(
-                        """
-                        SELECT (SELECT count(*) FROM open_lineage_queue) AS event_count,
-                               (SELECT count(*) FROM open_lineage_queue_heads) AS head_count,
-                               (SELECT count(*) FROM open_lineage_dead_letters) AS dead_count
-                        """)
-                    .map(
-                        (resultSet, context) ->
-                            new QueueState(
-                                resultSet.getLong("event_count"),
-                                resultSet.getLong("head_count"),
-                                resultSet.getLong("dead_count")))
-                    .one());
-    assertThat(state.eventCount()).isEqualTo(expectedEvents);
-    assertThat(state.headCount()).isEqualTo(expectedEvents);
-    assertThat(state.deadCount()).isZero();
   }
 
   private static void freezeNewQueueHeads(Jdbi jdbi) {
@@ -284,28 +268,4 @@ public class OpenLineageBatchThroughputBenchmark extends BaseIntegrationTest {
                 "TRUNCATE open_lineage_queue_heads, open_lineage_queue, "
                     + "open_lineage_dead_letters RESTART IDENTITY"));
   }
-
-  private static double median(List<Double> samples) {
-    List<Double> ordered = samples.stream().sorted().toList();
-    int middle = ordered.size() / 2;
-    return (ordered.size() & 1) == 1
-        ? ordered.get(middle)
-        : (ordered.get(middle - 1) + ordered.get(middle)) / 2.0;
-  }
-
-  private static double minimum(List<Double> samples) {
-    return samples.stream().min(Comparator.naturalOrder()).orElseThrow();
-  }
-
-  private static double maximum(List<Double> samples) {
-    return samples.stream().max(Comparator.naturalOrder()).orElseThrow();
-  }
-
-  private record CellResult(int events, long elapsedNanos) {
-    double eventsPerSecond() {
-      return events * 1_000_000_000.0 / elapsedNanos;
-    }
-  }
-
-  private record QueueState(long eventCount, long headCount, long deadCount) {}
 }

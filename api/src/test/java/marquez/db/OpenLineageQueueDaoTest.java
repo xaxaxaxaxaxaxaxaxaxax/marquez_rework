@@ -8,6 +8,7 @@ package marquez.db;
 import static java.time.ZoneOffset.UTC;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.inOrder;
@@ -16,16 +17,17 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.sql.Savepoint;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -34,6 +36,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import marquez.common.Utils;
+import marquez.db.OpenLineageQueueDao.PreparedAdmission;
 import marquez.db.OpenLineageQueueDao.PreparedEvent;
 import marquez.db.models.OpenLineageQueueRow;
 import marquez.jdbi.MarquezJdbiExternalPostgresExtension;
@@ -44,8 +47,6 @@ import marquez.service.models.LineageEvent;
 import org.jdbi.v3.core.Handle;
 import org.jdbi.v3.core.Jdbi;
 import org.jdbi.v3.core.transaction.TransactionIsolationLevel;
-import org.jdbi.v3.sqlobject.statement.SqlQuery;
-import org.jdbi.v3.sqlobject.statement.SqlUpdate;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -155,7 +156,35 @@ class OpenLineageQueueDaoTest {
   }
 
   @Test
-  void bulkAdmissionPreservesExactJsonLaneOrderAndHeads() {
+  void preparedAdmissionOwnsASequentialInputSnapshotAndBindsItsColumnsDirectly() {
+    LineageEvent first = runEvent("prepared-admission", "START");
+    LineageEvent second = runEvent("prepared-admission", "COMPLETE");
+    UUID lane = OpenLineageQueueDao.orderingKeyFor(first);
+    List<BaseEvent> source = new LinkedList<>();
+    source.add(first);
+    source.add(second);
+
+    PreparedAdmission admission = OpenLineageQueueDao.prepareAll(source);
+    source.clear();
+
+    assertThat(admission.size()).isEqualTo(2);
+    assertThat(PreparedAdmission.class.getConstructors()).isEmpty();
+    assertThat(PreparedAdmission.class.getFields()).isEmpty();
+    assertThat(PreparedAdmission.class.getDeclaredMethods())
+        .filteredOn(method -> Modifier.isPublic(method.getModifiers()))
+        .extracting(method -> method.getName())
+        .containsExactly("size");
+    assertThat(dao.enqueueAll(admission)).isEqualTo(2);
+    assertThat(lanePayloads(lane)).containsExactly(Utils.toJson(first), Utils.toJson(second));
+    List<Long> ids = queueIds();
+    assertThat(ids).hasSize(2);
+    assertThat(admissionId(ids.get(0))).isPositive().isEqualTo(admissionId(ids.get(1)));
+    assertQueueIntegrity();
+  }
+
+  @Test
+  void bulkAdmissionPreservesExactJsonLaneOrderHeadsAndMembership() {
+    long singleton = dao.enqueue(UUID.randomUUID(), payloadJson(0));
     UUID firstLane = UUID.randomUUID();
     UUID secondLane = UUID.randomUUID();
     UUID thirdLane = UUID.randomUUID();
@@ -166,13 +195,14 @@ class OpenLineageQueueDaoTest {
 
     int inserted =
         dao.enqueueAll(
-            List.of(
-                new PreparedEvent(firstLane, first),
-                new PreparedEvent(secondLane, second),
-                new PreparedEvent(firstLane, third),
-                new PreparedEvent(thirdLane, duplicate),
-                new PreparedEvent(secondLane, duplicate),
-                new PreparedEvent(firstLane, duplicate)));
+            new LinkedList<>(
+                List.of(
+                    new PreparedEvent(firstLane, first),
+                    new PreparedEvent(secondLane, second),
+                    new PreparedEvent(firstLane, third),
+                    new PreparedEvent(thirdLane, duplicate),
+                    new PreparedEvent(secondLane, duplicate),
+                    new PreparedEvent(firstLane, duplicate))));
 
     assertThat(inserted).isEqualTo(6);
     assertThat(lanePayloads(firstLane)).containsExactly(first, third, duplicate);
@@ -181,28 +211,18 @@ class OpenLineageQueueDaoTest {
     assertThat(headId(firstLane)).isEqualTo(laneIds(firstLane).get(0));
     assertThat(headId(secondLane)).isEqualTo(laneIds(secondLane).get(0));
     assertThat(headId(thirdLane)).isEqualTo(laneIds(thirdLane).get(0));
-    assertThat(headCount()).isEqualTo(3);
-    assertQueueIntegrity();
-  }
-
-  @Test
-  void bulkAdmissionUsesOneInternalAdmissionAndSingletonsRemainUnmarked() {
-    long singleton = dao.enqueue(UUID.randomUUID(), payloadJson(0));
-    dao.enqueueAll(
-        List.of(
-            new PreparedEvent(UUID.randomUUID(), payloadJson(1)),
-            new PreparedEvent(UUID.randomUUID(), payloadJson(2)),
-            new PreparedEvent(UUID.randomUUID(), payloadJson(3))));
-    dao.enqueueAll(List.of(new PreparedEvent(UUID.randomUUID(), payloadJson(4))));
-
+    assertThat(headCount()).isEqualTo(4);
     List<Long> ids = queueIds();
-    assertThat(ids).hasSize(5);
+    assertThat(ids).hasSize(7);
     assertThat(admissionId(singleton)).isNull();
     Long firstAdmission = admissionId(ids.get(1));
     assertThat(firstAdmission).isPositive();
-    assertThat(admissionId(ids.get(2))).isEqualTo(firstAdmission);
-    assertThat(admissionId(ids.get(3))).isEqualTo(firstAdmission);
-    assertThat(admissionId(ids.get(4))).isPositive().isNotEqualTo(firstAdmission);
+    assertThat(ids.subList(1, ids.size()))
+        .allSatisfy(id -> assertThat(admissionId(id)).isEqualTo(firstAdmission));
+
+    dao.enqueueAll(List.of(new PreparedEvent(UUID.randomUUID(), payloadJson(4))));
+    long laterAdmissionEvent = queueIds().get(7);
+    assertThat(admissionId(laterAdmissionEvent)).isPositive().isNotEqualTo(firstAdmission);
     assertQueueIntegrity();
   }
 
@@ -212,17 +232,45 @@ class OpenLineageQueueDaoTest {
     List<PreparedEvent> containsNull = new ArrayList<>();
     containsNull.add(new PreparedEvent(key, payloadJson(1)));
     containsNull.add(null);
+    List<PreparedEvent> tooMany =
+        Collections.nCopies(
+            OpenLineageQueueDao.MAX_ADMISSION_EVENTS + 1, new PreparedEvent(key, payloadJson(2)));
+    List<BaseEvent> containsNullEvent = new ArrayList<>();
+    containsNullEvent.add(runEvent("valid", "START"));
+    containsNullEvent.add(null);
 
-    assertThatThrownBy(() -> dao.enqueueAll(null))
+    assertThatThrownBy(() -> dao.enqueueAll((List<PreparedEvent>) null))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessage("prepared events are required");
+    assertThatThrownBy(() -> dao.enqueueAll((PreparedAdmission) null))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("prepared admission is required");
     assertThatThrownBy(() -> dao.enqueueAll(containsNull))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessage("prepared event is required");
+    assertThatThrownBy(() -> dao.enqueueAll(tooMany))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("prepared events must not exceed 1000");
+    assertThatThrownBy(() -> OpenLineageQueueDao.prepareAll(containsNullEvent))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("event is required");
+    assertThatThrownBy(
+            () ->
+                OpenLineageQueueDao.prepareAll(
+                    Collections.nCopies(
+                        OpenLineageQueueDao.MAX_ADMISSION_EVENTS + 1,
+                        runEvent("too-many", "START"))))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("events must not exceed 1000");
 
     try (Handle handle = jdbi.open()) {
       handle.setTransactionIsolationLevel(TransactionIsolationLevel.REPEATABLE_READ);
       assertThat(handle.attach(OpenLineageQueueDao.class).enqueueAll(List.of())).isZero();
+      assertThat(
+              handle
+                  .attach(OpenLineageQueueDao.class)
+                  .enqueueAll(OpenLineageQueueDao.prepareAll(List.of())))
+          .isZero();
       assertThat(handle.isInTransaction()).isFalse();
     }
 
@@ -438,30 +486,41 @@ class OpenLineageQueueDaoTest {
   }
 
   @Test
-  void twoReadCommittedTransactionsSkipLockedHeadsWithoutOverlap() {
-    long first = dao.enqueue(runEvent("split-a", "START"));
-    long second = dao.enqueue(runEvent("split-b", "START"));
+  void twoReadCommittedTransactionsSkipLockedBatchHeadsWithoutOverlap() {
+    List<UUID> lanes =
+        List.of(UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID());
+    dao.enqueueAll(
+        List.of(
+            new PreparedEvent(lanes.get(0), payloadJson(1)),
+            new PreparedEvent(lanes.get(1), payloadJson(2)),
+            new PreparedEvent(lanes.get(2), payloadJson(3)),
+            new PreparedEvent(lanes.get(3), payloadJson(4))));
+    List<Long> expectedIds = queueIds();
     setAllHeadsAvailableAt(Instant.parse("2000-01-01T00:00:00Z"));
 
     try (Handle firstHandle = jdbi.open();
         Handle secondHandle = jdbi.open()) {
       firstHandle.begin();
       secondHandle.begin();
-      OpenLineageQueueRow firstLocked =
-          firstHandle.attach(OpenLineageQueueDao.class).lockNextDue().orElseThrow();
-      OpenLineageQueueRow secondLocked =
-          secondHandle.attach(OpenLineageQueueDao.class).lockNextDue().orElseThrow();
+      List<OpenLineageQueueRow> firstLocked =
+          firstHandle.attach(OpenLineageQueueDao.class).lockNextDueBatch(2);
+      List<OpenLineageQueueRow> secondLocked =
+          secondHandle.attach(OpenLineageQueueDao.class).lockNextDueBatch(2);
 
-      assertThat(firstLocked.id()).isIn(first, second);
-      assertThat(secondLocked.id()).isIn(first, second).isNotEqualTo(firstLocked.id());
-      assertThat(firstLocked.attemptCount()).isEqualTo(1);
-      assertThat(secondLocked.attemptCount()).isEqualTo(1);
+      List<Long> firstIds = firstLocked.stream().map(OpenLineageQueueRow::id).toList();
+      List<Long> secondIds = secondLocked.stream().map(OpenLineageQueueRow::id).toList();
+      List<Long> allLocked = new ArrayList<>(firstIds);
+      allLocked.addAll(secondIds);
+      assertThat(firstIds).hasSize(2).doesNotContainAnyElementsOf(secondIds);
+      assertThat(secondIds).hasSize(2);
+      assertThat(allLocked).containsExactlyInAnyOrderElementsOf(expectedIds);
+      assertThat(firstLocked).extracting(OpenLineageQueueRow::attemptCount).containsOnly(1);
+      assertThat(secondLocked).extracting(OpenLineageQueueRow::attemptCount).containsOnly(1);
       firstHandle.rollback();
       secondHandle.rollback();
     }
 
-    assertThat(headAttempt(orderingKey(first))).isZero();
-    assertThat(headAttempt(orderingKey(second))).isZero();
+    lanes.forEach(lane -> assertThat(headAttempt(lane)).isZero());
     assertQueueIntegrity();
   }
 
@@ -488,11 +547,38 @@ class OpenLineageQueueDaoTest {
     assertThat(claimed)
         .extracting(OpenLineageQueueRow::admissionId)
         .containsOnly(admissionId(expectedIds.get(0)));
-    assertThat(claimed)
-        .filteredOn(row -> row.orderingKey().equals(firstLane))
-        .extracting(OpenLineageQueueRow::refreshDueOnAdvance)
-        .containsExactly(false, true);
     assertThat(claimed.get(2).attemptCount()).isEqualTo(1);
+    assertQueueIntegrity();
+  }
+
+  @Test
+  void batchClaimTestsOnlyTheImmediateSuccessorAgainstTheAdmissionBoundary() {
+    UUID lane = UUID.randomUUID();
+    long first = dao.enqueue(lane, payloadJson(1));
+    long intervening = dao.enqueue(lane, payloadJson(2));
+    long laterMatching = dao.enqueue(lane, payloadJson(3));
+    jdbi.useHandle(
+        handle ->
+            handle
+                .createUpdate(
+                    """
+                    UPDATE open_lineage_queue
+                    SET admission_id = CASE WHEN id = :intervening THEN 82 ELSE 81 END
+                    WHERE ordering_key = :lane
+                    """)
+                .bind("intervening", intervening)
+                .bind("lane", lane)
+                .execute());
+    setHeadAvailableAt(lane, Instant.parse("2000-01-01T00:00:00Z"));
+
+    List<OpenLineageQueueRow> claimed =
+        jdbi.inTransaction(
+            TransactionIsolationLevel.READ_COMMITTED,
+            handle -> handle.attach(OpenLineageQueueDao.class).lockNextDueBatch(3));
+
+    assertThat(claimed).extracting(OpenLineageQueueRow::id).containsExactly(first);
+    assertThat(claimed.get(0).admissionId()).isEqualTo(81L);
+    assertThat(queueIds()).containsExactly(first, intervening, laterMatching);
     assertQueueIntegrity();
   }
 
@@ -563,7 +649,7 @@ class OpenLineageQueueDaoTest {
           assertThat(claimed)
               .extracting(OpenLineageQueueRow::id)
               .containsExactly(ids.get(0), ids.get(1));
-          transactional.ackLockedAll(claimed);
+          transactional.ackLockedAll(new LinkedList<>(claimed));
         });
 
     HeadState state = headState(lane);
@@ -572,6 +658,28 @@ class OpenLineageQueueDaoTest {
     assertThat(headAvailableAtBytes(lane)).isNotEqualTo(originalSchedule);
     assertThat(queueIds()).containsExactly(ids.get(2));
     assertQueueIntegrity();
+  }
+
+  @Test
+  void batchAcknowledgementRejectsNonIncreasingDuplicateAndMixedAdmissionRowsBeforeSql() {
+    OpenLineageQueueRow first = lockedRow(51, UUID.randomUUID(), 7L);
+    OpenLineageQueueRow second = lockedRow(52, UUID.randomUUID(), 7L);
+    OpenLineageQueueRow otherAdmission = lockedRow(53, UUID.randomUUID(), 8L);
+    OpenLineageQueueDao transactional = transactionalQueueDaoMock();
+
+    assertThatThrownBy(() -> transactional.ackLockedAll(List.of(second, first)))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("locked rows must be strictly ordered by event ID");
+    assertThatThrownBy(() -> transactional.ackLockedAll(List.of(first, first)))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("locked rows must be strictly ordered by event ID");
+    assertThatThrownBy(() -> transactional.ackLockedAll(List.of(first, otherAdmission)))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("locked rows must belong to one admission");
+
+    verify(transactional, never()).acquireOrderingKeyLocks(any(UUID[].class));
+    verify(transactional, never())
+        .acknowledgeLockedPrefixesAfterLaneLocks(any(UUID[].class), any(long[].class));
   }
 
   @Test
@@ -641,7 +749,7 @@ class OpenLineageQueueDaoTest {
 
     assertThat(claimed).hasSize(1);
     assertThat(claimed.get(0).id()).isNotEqualTo(first.id());
-    assertThat(claimed.get(0).refreshDueOnAdvance()).isTrue();
+    assertThat(headState(lane).refreshDueOnAdvance()).isTrue();
     assertQueueIntegrity();
   }
 
@@ -778,183 +886,46 @@ class OpenLineageQueueDaoTest {
   }
 
   @Test
-  void q2HintRoutesTheExpectedUpdateFirstAndRetainsTheOppositeFallback() {
-    UUID key = UUID.randomUUID();
-    long eventId = 41L;
-
-    OpenLineageQueueDao preserving = transactionalQueueDaoMock();
-    doReturn(Optional.of(false))
-        .when(preserving)
-        .acquireOrderingKeyLockAndReadRefreshDue(key, eventId);
-    doReturn(1).when(preserving).advanceLockedHeadPreservingDue(key, eventId);
-    doReturn(1).when(preserving).deleteEvent(key, eventId);
-
-    preserving.ackLocked(key, eventId);
-
-    InOrder preserveCalls = inOrder(preserving);
-    preserveCalls.verify(preserving).acquireOrderingKeyLockAndReadRefreshDue(key, eventId);
-    preserveCalls.verify(preserving).advanceLockedHeadPreservingDue(key, eventId);
-    preserveCalls.verify(preserving).deleteEvent(key, eventId);
-    verify(preserving, never()).advanceLockedHeadRefreshingDue(key, eventId);
-    verify(preserving, never()).deleteLockedHead(key, eventId);
-
-    OpenLineageQueueDao refreshing = transactionalQueueDaoMock();
-    doReturn(Optional.of(true))
-        .when(refreshing)
-        .acquireOrderingKeyLockAndReadRefreshDue(key, eventId);
-    doReturn(1).when(refreshing).advanceLockedHeadRefreshingDue(key, eventId);
-    doReturn(1).when(refreshing).deleteEvent(key, eventId);
-
-    refreshing.ackLocked(key, eventId);
-
-    InOrder refreshCalls = inOrder(refreshing);
-    refreshCalls.verify(refreshing).acquireOrderingKeyLockAndReadRefreshDue(key, eventId);
-    refreshCalls.verify(refreshing).advanceLockedHeadRefreshingDue(key, eventId);
-    refreshCalls.verify(refreshing).deleteEvent(key, eventId);
-    verify(refreshing, never()).advanceLockedHeadPreservingDue(key, eventId);
-    verify(refreshing, never()).deleteLockedHead(key, eventId);
-
-    OpenLineageQueueDao fallingBack = transactionalQueueDaoMock();
-    doReturn(Optional.of(false))
-        .when(fallingBack)
-        .acquireOrderingKeyLockAndReadRefreshDue(key, eventId);
-    doReturn(0).when(fallingBack).advanceLockedHeadPreservingDue(key, eventId);
-    doReturn(1).when(fallingBack).advanceLockedHeadRefreshingDue(key, eventId);
-    doReturn(1).when(fallingBack).deleteEvent(key, eventId);
-
-    fallingBack.ackLocked(key, eventId);
-
-    InOrder fallbackCalls = inOrder(fallingBack);
-    fallbackCalls.verify(fallingBack).acquireOrderingKeyLockAndReadRefreshDue(key, eventId);
-    fallbackCalls.verify(fallingBack).advanceLockedHeadPreservingDue(key, eventId);
-    fallbackCalls.verify(fallingBack).advanceLockedHeadRefreshingDue(key, eventId);
-    fallbackCalls.verify(fallingBack).deleteEvent(key, eventId);
-  }
-
-  @Test
-  void afterLaneLockTransitionsDoNotAcquireTheAdvisoryLockAgain() {
+  void afterLaneLockTransitionsUseOneMutationWithoutAcquiringTheAdvisoryLockAgain() {
     UUID key = UUID.randomUUID();
     long eventId = 43L;
 
     OpenLineageQueueDao acknowledged = transactionalQueueDaoMock();
-    doReturn(1).when(acknowledged).advanceLockedHeadPreservingDue(key, eventId);
-    doReturn(1).when(acknowledged).deleteEvent(key, eventId);
-    acknowledged.ackLockedAfterLaneLock(key, eventId, false);
+    doReturn(1L).when(acknowledged).finishLockedHeadAfterLaneLock(key, eventId);
+    acknowledged.ackLockedAfterLaneLock(key, eventId);
 
-    verify(acknowledged, never()).acquireOrderingKeyLockAndReadRefreshDue(key, eventId);
-    verify(acknowledged).advanceLockedHeadPreservingDue(key, eventId);
-    verify(acknowledged).deleteEvent(key, eventId);
+    verify(acknowledged, never()).acquireOrderingKeyLock(key);
+    verify(acknowledged).finishLockedHeadAfterLaneLock(key, eventId);
 
     OpenLineageQueueDao dead = transactionalQueueDaoMock();
     doReturn(1).when(dead).insertDeadLetterLocked(key, eventId, 2, "poison");
-    doReturn(1).when(dead).advanceLockedHeadRefreshingDue(key, eventId);
-    doReturn(1).when(dead).deleteEvent(key, eventId);
-    dead.deadLetterLockedAfterLaneLock(key, eventId, 2, "poison", true);
+    doReturn(1L).when(dead).finishLockedHeadAfterLaneLock(key, eventId);
+    dead.deadLetterLockedAfterLaneLock(key, eventId, 2, "poison");
 
-    verify(dead, never()).acquireOrderingKeyLockAndReadRefreshDue(key, eventId);
-    verify(dead).insertDeadLetterLocked(key, eventId, 2, "poison");
-    verify(dead).advanceLockedHeadRefreshingDue(key, eventId);
-    verify(dead).deleteEvent(key, eventId);
-  }
-
-  @Test
-  void deadLetterPreservesTheBatchAdmissionForDiagnosis() {
-    UUID key = UUID.randomUUID();
-    dao.enqueueAll(List.of(new PreparedEvent(key, payloadJson(1))));
-    long eventId = queueIds().get(0);
-    Long admissionId = admissionId(eventId);
-
-    jdbi.useTransaction(
-        TransactionIsolationLevel.READ_COMMITTED,
-        handle -> {
-          OpenLineageQueueDao transactional = handle.attach(OpenLineageQueueDao.class);
-          OpenLineageQueueRow row = transactional.lockNextDue().orElseThrow();
-          transactional.deadLetterLocked(
-              row.orderingKey(), row.id(), row.attemptCount(), "diagnostic");
-        });
-
-    assertThat(deadAdmissionId(eventId)).isEqualTo(admissionId);
-    assertThat(queueIds()).isEmpty();
-    assertQueueIntegrity();
-  }
-
-  @Test
-  void q2HintValidatesHeadPresenceAndKeepsEmptyAndDeadLetterTransitionsOrdered() {
-    UUID key = UUID.randomUUID();
-    long eventId = 42L;
-
-    OpenLineageQueueDao missing = transactionalQueueDaoMock();
-    doReturn(Optional.empty()).when(missing).acquireOrderingKeyLockAndReadRefreshDue(key, eventId);
-
-    assertThatThrownBy(() -> missing.ackLocked(key, eventId))
-        .isInstanceOf(IllegalStateException.class)
-        .hasMessageContaining("Expected exact locked OpenLineage queue head 42");
-    verify(missing, never()).advanceLockedHeadPreservingDue(key, eventId);
-    verify(missing, never()).advanceLockedHeadRefreshingDue(key, eventId);
-    verify(missing, never()).deleteLockedHead(key, eventId);
-    verify(missing, never()).deleteEvent(key, eventId);
-
-    OpenLineageQueueDao empty = transactionalQueueDaoMock();
-    doReturn(Optional.of(false)).when(empty).acquireOrderingKeyLockAndReadRefreshDue(key, eventId);
-    doReturn(0).when(empty).advanceLockedHeadPreservingDue(key, eventId);
-    doReturn(0).when(empty).advanceLockedHeadRefreshingDue(key, eventId);
-    doReturn(1).when(empty).deleteLockedHead(key, eventId);
-    doReturn(1).when(empty).deleteEvent(key, eventId);
-
-    empty.ackLocked(key, eventId);
-
-    InOrder emptyCalls = inOrder(empty);
-    emptyCalls.verify(empty).acquireOrderingKeyLockAndReadRefreshDue(key, eventId);
-    emptyCalls.verify(empty).advanceLockedHeadPreservingDue(key, eventId);
-    emptyCalls.verify(empty).advanceLockedHeadRefreshingDue(key, eventId);
-    emptyCalls.verify(empty).deleteLockedHead(key, eventId);
-    emptyCalls.verify(empty).deleteEvent(key, eventId);
-
-    OpenLineageQueueDao dead = transactionalQueueDaoMock();
-    doReturn(Optional.of(true)).when(dead).acquireOrderingKeyLockAndReadRefreshDue(key, eventId);
-    doReturn(1).when(dead).insertDeadLetterLocked(key, eventId, 3, "poison");
-    doReturn(1).when(dead).advanceLockedHeadRefreshingDue(key, eventId);
-    doReturn(1).when(dead).deleteEvent(key, eventId);
-
-    dead.deadLetterLocked(key, eventId, 3, "poison");
-
+    verify(dead, never()).acquireOrderingKeyLock(key);
     InOrder deadCalls = inOrder(dead);
-    deadCalls.verify(dead).acquireOrderingKeyLockAndReadRefreshDue(key, eventId);
-    deadCalls.verify(dead).insertDeadLetterLocked(key, eventId, 3, "poison");
-    deadCalls.verify(dead).advanceLockedHeadRefreshingDue(key, eventId);
-    deadCalls.verify(dead).deleteEvent(key, eventId);
-    verify(dead, never()).advanceLockedHeadPreservingDue(key, eventId);
-    verify(dead, never()).deleteLockedHead(key, eventId);
+    deadCalls.verify(dead).insertDeadLetterLocked(key, eventId, 2, "poison");
+    deadCalls.verify(dead).finishLockedHeadAfterLaneLock(key, eventId);
   }
 
   @Test
-  void q2HintReadsTheExactPostgresHeadAndSingleEventAckDeletesTheLane() {
+  void terminalMutationRejectsANonHeadAndSingleEventAckDeletesTheLane() {
     UUID key = UUID.randomUUID();
     long first = dao.enqueue(key, payloadJson(1));
     long second = dao.enqueue(key, payloadJson(2));
 
-    jdbi.useTransaction(
-        TransactionIsolationLevel.READ_COMMITTED,
-        handle -> {
-          OpenLineageQueueDao transactional = handle.attach(OpenLineageQueueDao.class);
-          OpenLineageQueueRow row = transactional.lockNextDue().orElseThrow();
-          assertThat(row.id()).isEqualTo(first);
-          assertThat(transactional.acquireOrderingKeyLockAndReadRefreshDue(key, second)).isEmpty();
-          assertThat(transactional.acquireOrderingKeyLockAndReadRefreshDue(key, first))
-              .contains(false);
-          transactional.ackLocked(key, first);
-        });
+    assertThatThrownBy(
+            () ->
+                jdbi.useTransaction(
+                    TransactionIsolationLevel.READ_COMMITTED,
+                    handle -> handle.attach(OpenLineageQueueDao.class).ackLocked(key, second)))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("acknowledge OpenLineage queue payload " + second);
 
-    jdbi.useTransaction(
-        TransactionIsolationLevel.READ_COMMITTED,
-        handle -> {
-          OpenLineageQueueDao transactional = handle.attach(OpenLineageQueueDao.class);
-          OpenLineageQueueRow row = transactional.lockNextDue().orElseThrow();
-          assertThat(row.id()).isEqualTo(second);
-          assertThat(transactional.acquireOrderingKeyLockAndReadRefreshDue(key, second))
-              .contains(true);
-          transactional.ackLocked(key, second);
-        });
+    assertThat(queueIds()).containsExactly(first, second);
+    assertThat(headId(key)).isEqualTo(first);
+    ackNext();
+    ackNext();
 
     assertThat(queueIds()).isEmpty();
     assertThat(headCount()).isZero();
@@ -994,7 +965,9 @@ class OpenLineageQueueDaoTest {
   @Test
   void deadLetterUsesQ2AndRetryRefreshesTheIndependentSchedule() {
     UUID key = UUID.randomUUID();
-    long first = dao.enqueue(key, payloadJson(1));
+    dao.enqueueAll(List.of(new PreparedEvent(key, payloadJson(1))));
+    long first = queueIds().get(0);
+    Long firstAdmission = admissionId(first);
     long second = dao.enqueue(key, payloadJson(2));
     long third = dao.enqueue(key, payloadJson(3));
     long fourth = dao.enqueue(key, payloadJson(4));
@@ -1038,142 +1011,9 @@ class OpenLineageQueueDaoTest {
     assertThat(retried.availableAt()).isAfter(retryTarget.availableAt());
     assertMillisecondAligned(retried.availableAt());
     assertThat(deadIds()).containsExactlyInAnyOrder(first, second);
+    assertThat(deadAdmissionId(first)).isEqualTo(firstAdmission);
     assertThat(queueIds()).containsExactly(fourth);
     assertQueueIntegrity();
-  }
-
-  @Test
-  void preservingAdvanceSqlDoesNotTargetIndexedDueColumn() throws Exception {
-    Method hint =
-        OpenLineageQueueDao.class.getMethod(
-            "acquireOrderingKeyLockAndReadRefreshDue", UUID.class, long.class);
-    Method preserving =
-        OpenLineageQueueDao.class.getMethod(
-            "advanceLockedHeadPreservingDue", UUID.class, long.class);
-    Method refreshing =
-        OpenLineageQueueDao.class.getMethod(
-            "advanceLockedHeadRefreshingDue", UUID.class, long.class);
-    String preservingSql = preserving.getAnnotation(SqlUpdate.class).value();
-    String refreshingSql = refreshing.getAnnotation(SqlUpdate.class).value();
-    String hintSql = hint.getAnnotation(SqlQuery.class).value().toLowerCase(Locale.ROOT);
-
-    assertThat(hintSql)
-        .contains(
-            "ordering_lane_lock as materialized",
-            "pg_advisory_xact_lock",
-            "from ordering_lane_lock",
-            "cross join open_lineage_queue_heads as head",
-            "head.ordering_key = :orderingkey",
-            "head.event_id = :eventid",
-            "(select count(*) from ordering_lane_lock) = 1",
-            "(select count(*) from locked_head) = 1",
-            "else null");
-    assertThat(updateTargetList(preservingSql))
-        .contains("refresh_due_on_advance")
-        .doesNotContain("available_at");
-    assertThat(updateTargetList(refreshingSql)).contains("available_at");
-    assertThat(OpenLineageQueueDao.LOCK_NEXT_DUE_SQL.toLowerCase(Locale.ROOT))
-        .contains(
-            "with candidate as materialized",
-            "from open_lineage_queue_heads as head",
-            "for update of head skip locked",
-            "order by head.available_at",
-            "limit 1",
-            "from candidate",
-            "join open_lineage_queue as queued");
-  }
-
-  @Test
-  void sqlObjectAdmissionsKeepSeparateMetricIdentifiedLockAndInsertStatements() throws Exception {
-    Method acquire = OpenLineageQueueDao.class.getMethod("acquireOrderingKeyLock", UUID.class);
-    Method insert =
-        OpenLineageQueueDao.class.getMethod(
-            "insertEventAndMaybeHeadAfterLock", UUID.class, String.class);
-    Method bulkAcquire =
-        OpenLineageQueueDao.class.getMethod("acquireOrderingKeyLocks", UUID[].class);
-    Method bulkInsert =
-        OpenLineageQueueDao.class.getMethod(
-            "insertEventsAndMaybeHeadsAfterLocks", UUID[].class, String[].class);
-    String acquireSql = acquire.getAnnotation(SqlQuery.class).value().toLowerCase(Locale.ROOT);
-    String insertSql = insert.getAnnotation(SqlQuery.class).value().toLowerCase(Locale.ROOT);
-    String bulkAcquireSql =
-        bulkAcquire.getAnnotation(SqlQuery.class).value().toLowerCase(Locale.ROOT);
-    String bulkInsertSql =
-        bulkInsert.getAnnotation(SqlQuery.class).value().toLowerCase(Locale.ROOT);
-
-    assertThat(acquireSql)
-        .contains("pg_advisory_xact_lock", "open_lineage_queue:")
-        .doesNotContain("insert into");
-    assertThat(insertSql)
-        .contains(
-            "insert into open_lineage_queue (ordering_key, event)",
-            "insert into open_lineage_queue_heads (ordering_key, event_id)",
-            "where not exists",
-            "select id",
-            "from inserted")
-        .doesNotContain("pg_advisory_xact_lock");
-    assertThat(bulkAcquireSql)
-        .contains(
-            "ordered_lock_keys as materialized",
-            "select distinct",
-            "hashtextextended",
-            "order by lock_key",
-            "pg_advisory_xact_lock",
-            "select count(*)",
-            "from acquired")
-        .doesNotContain("insert into");
-    assertThat(bulkInsertSql)
-        .contains(
-            "admission as materialized",
-            "nextval('open_lineage_queue_admission_id_seq')",
-            "insert into open_lineage_queue (ordering_key, event, admission_id)",
-            "unnest(",
-            "with ordinality",
-            "order by requested.ordinality",
-            "offset 0",
-            "insert into open_lineage_queue_heads (ordering_key, event_id)",
-            "min(inserted.id)",
-            "group by inserted.ordering_key",
-            "select count(*)",
-            "from inserted")
-        .doesNotContain("pg_advisory_xact_lock", "jsonb");
-  }
-
-  @Test
-  void batchClaimAndAcknowledgementSqlKeepTheirBoundedLockingContracts() throws Exception {
-    Method claim = OpenLineageQueueDao.class.getMethod("lockNextDueBatchRows", int.class);
-    Method acknowledge =
-        OpenLineageQueueDao.class.getMethod(
-            "acknowledgeLockedPrefixesAfterLaneLocks", UUID[].class, long[].class);
-    String claimSql = claim.getAnnotation(SqlQuery.class).value().toLowerCase(Locale.ROOT);
-    String acknowledgeSql =
-        acknowledge.getAnnotation(SqlQuery.class).value().toLowerCase(Locale.ROOT);
-
-    assertThat(claimSql)
-        .contains(
-            "seed as materialized",
-            "peer_heads as materialized",
-            "for update of head skip locked",
-            "limit greatest(cast(:maxevents as integer) - 1, 0)",
-            "locked_heads as materialized",
-            "locked_count as materialized",
-            "cross join lateral",
-            "queued.id > locked.event_id",
-            "locked.refresh_due_on_advance = false",
-            "follower.admission_id = locked.admission_id",
-            "order by claimed.id")
-        .doesNotContain("pg_advisory_xact_lock");
-    assertThat(acknowledgeSql)
-        .contains(
-            "acknowledged as materialized",
-            "current_prefix.event_ids = lane.event_ids",
-            "case when head.refresh_due_on_advance then 1 else 2 end",
-            "preserved as (",
-            "refreshed as (",
-            "emptied as (",
-            "transition_summary as materialized",
-            "delete from open_lineage_queue as queued")
-        .doesNotContain("pg_advisory_xact_lock");
   }
 
   @Test
@@ -1247,8 +1087,16 @@ class OpenLineageQueueDaoTest {
     List<JsonNode> nodes = planNodes(claimPlan);
     JsonNode admissionIndex =
         planNodeWithValue(nodes, "Index Name", "open_lineage_queue_admission_idx");
+    List<JsonNode> payloadIndexes =
+        nodes.stream()
+            .filter(node -> "open_lineage_queue_pkey".equals(node.path("Index Name").asText()))
+            .toList();
     assertThat(admissionIndex.path("Node Type").asText()).contains("Index");
     assertThat(admissionIndex.path("Actual Rows").asLong()).isBetween(1L, 32L);
+    assertThat(payloadIndexes)
+        .isNotEmpty()
+        .allSatisfy(node -> assertThat(node.path("Actual Rows").asLong()).isBetween(0L, 2L));
+    assertThat(planValues(nodes, "Node Type")).doesNotContain("Seq Scan");
     assertThat(claimPlan.path("Actual Rows").asLong()).isEqualTo(32);
     assertQueueIntegrity();
   }
@@ -1335,15 +1183,12 @@ class OpenLineageQueueDaoTest {
     }
 
     List<JsonNode> claimNodes = planNodes(claimPlan);
-    JsonNode candidateLimit = planNodeWithValue(claimNodes, "Subplan Name", "CTE candidate");
     JsonNode dueIndex =
         planNodeWithValue(claimNodes, "Index Name", "open_lineage_queue_heads_due_idx");
     JsonNode payloadIndex = planNodeWithValue(claimNodes, "Index Name", "open_lineage_queue_pkey");
     JsonNode lockRows = planNodeWithValue(claimNodes, "Node Type", "LockRows");
 
     assertThat(claimPlan.path("Actual Rows").asLong()).isEqualTo(1);
-    assertThat(candidateLimit.path("Node Type").asText()).isEqualTo("Limit");
-    assertThat(candidateLimit.path("Actual Rows").asLong()).isEqualTo(1);
     assertThat(lockRows.path("Actual Rows").asLong()).isEqualTo(1);
     assertThat(dueIndex.path("Node Type").asText()).isEqualTo("Index Scan");
     assertThat(dueIndex.path("Actual Loops").asLong()).isEqualTo(1);
@@ -1355,7 +1200,7 @@ class OpenLineageQueueDaoTest {
         .isEqualTo(1);
     assertThat(payloadIndex.path("Actual Rows").asLong()).isEqualTo(1);
     assertThat(planValues(claimNodes, "Node Type"))
-        .contains("Limit", "LockRows", "CTE Scan", "Nested Loop")
+        .contains("Limit", "LockRows", "Nested Loop")
         .doesNotContain("Sort", "Incremental Sort", "Seq Scan");
     assertThat(planValues(claimNodes, "Index Name"))
         .contains("open_lineage_queue_heads_due_idx", "open_lineage_queue_pkey");
@@ -1381,6 +1226,10 @@ class OpenLineageQueueDaoTest {
     doReturn(true).when(transactional).isInTransaction();
     doReturn(handle).when(transactional).getHandle();
     return transactional;
+  }
+
+  private static OpenLineageQueueRow lockedRow(long id, UUID orderingKey, Long admissionId) {
+    return new OpenLineageQueueRow(id, orderingKey, "{}", 1, admissionId);
   }
 
   private static OpenLineageQueueRow deadLetterNext(String error) {
@@ -1742,15 +1591,6 @@ class OpenLineageQueueDaoTest {
       }
     }
     return values;
-  }
-
-  private static String updateTargetList(String sql) {
-    String normalized = sql.toLowerCase(Locale.ROOT);
-    int set = normalized.indexOf("set ");
-    int fromFollower = normalized.indexOf("from follower", set);
-    assertThat(set).isGreaterThanOrEqualTo(0);
-    assertThat(fromFollower).isGreaterThan(set);
-    return normalized.substring(set, fromFollower);
   }
 
   private static UUID orderingKey(long id) {

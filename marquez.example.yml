@@ -52,7 +52,7 @@ db:
 #   cleanDisabled: true
 
 # Enables database migration on startup (default: true). If false, run this source version's
-# db-migrate command to apply durable-intake migrations V77 through V80 before starting the application.
+# db-migrate command before starting the application.
 migrateOnStartup: ${MIGRATE_ON_STARTUP:-true}
 
 # Enabled the Graphql endpoint
@@ -90,10 +90,8 @@ logging:
 openLineage:
   # Concurrent event processors per application instance; total database concurrency scales with replicas.
   workerThreads: ${OPEN_LINEAGE_WORKER_THREADS:-8}
-  # Maximum events from one durable batch admission projected in one transaction (1-64). This
-  # includes an optional same-lane follower selected to preserve the queue's scheduling quantum.
-  # Set to 1 for singleton projection. This is independent of the HTTP batch limit of 1000 and the
-  # worker never waits for a batch to fill.
+  # Maximum events from one admitted batch projected per transaction (1-64); set to 1 to retain
+  # singleton projection. This is independent of the HTTP batch limit; claims may be smaller.
   projectionBatchSize: ${OPEN_LINEAGE_PROJECTION_BATCH_SIZE:-8}
   # Delay between database polls while no due work is found.
   pollIntervalMillis: ${OPEN_LINEAGE_POLL_INTERVAL_MILLIS:-1000}

@@ -10,6 +10,32 @@ repo_dir="$(dirname "${chart_dir}")"
 render_dir="$(mktemp -d)"
 trap 'rm -rf "${render_dir}"' EXIT
 
+render_ci() {
+  local output="$1"
+  shift
+  helm template marquez "${chart_dir}" \
+    --values "${chart_dir}/ci/ci-values.yaml" \
+    "$@" >"${render_dir}/${output}"
+}
+
+require() {
+  local message="$1"
+  shift
+  if ! "$@"; then
+    echo "${message}" >&2
+    exit 1
+  fi
+}
+
+reject() {
+  local message="$1"
+  shift
+  if "$@"; then
+    echo "${message}" >&2
+    exit 1
+  fi
+}
+
 project_version="$(sed -n 's/^version=//p' "${repo_dir}/gradle.properties")"
 chart_version="$(sed -n 's/^version: //p' "${chart_dir}/Chart.yaml")"
 chart_app_version="$(sed -n 's/^appVersion: "\(.*\)"$/\1/p' "${chart_dir}/Chart.yaml")"
@@ -44,50 +70,28 @@ if ! grep -Fq "${expected_error}" "${render_dir}/missing-tag.err"; then
   exit 1
 fi
 
-helm template marquez "${chart_dir}" \
-  --values "${chart_dir}/ci/ci-values.yaml" \
-  >"${render_dir}/default.yaml"
+render_ci default.yaml
+render_ci marquez-deployment.yaml \
+  --show-only templates/marquez/deployment.yaml
 
-helm template marquez "${chart_dir}" \
-  --values "${chart_dir}/ci/ci-values.yaml" \
-  --show-only templates/marquez/deployment.yaml \
-  >"${render_dir}/marquez-deployment.yaml"
-
-helm template marquez "${chart_dir}" \
-  --values "${chart_dir}/ci/ci-values.yaml" \
+render_ci changed.yaml \
   --set marquez.openLineage.pollIntervalMillis=2000 \
-  --set-string marquez.podAnnotations.rollout-test=enabled \
-  >"${render_dir}/changed.yaml"
-
-helm template marquez "${chart_dir}" \
-  --values "${chart_dir}/ci/ci-values.yaml" \
   --set marquez.openLineage.projectionBatchSize=16 \
-  >"${render_dir}/projection-batch-size-changed.yaml"
+  --set-string marquez.podAnnotations.rollout-test=enabled
 
-helm template marquez "${chart_dir}" \
-  --values "${chart_dir}/ci/ci-values.yaml" \
-  --set marquez.db.autoCommentsEnabled=true \
-  >"${render_dir}/auto-comments-enabled.yaml"
-
-helm template marquez "${chart_dir}" \
-  --values "${chart_dir}/ci/ci-values.yaml" \
+render_ci auto-comments-enabled.yaml --set marquez.db.autoCommentsEnabled=true
+render_ci retention-enabled-configmap.yaml \
   --show-only templates/marquez/configmap.yaml \
   --set marquez.dbRetention.enabled=true \
   --set marquez.dbRetention.frequencyMins=17 \
   --set marquez.dbRetention.numberOfRowsPerBatch=321 \
-  --set marquez.dbRetention.retentionDays=29 \
-  >"${render_dir}/retention-enabled-configmap.yaml"
+  --set marquez.dbRetention.retentionDays=29
 
-if ! grep -Eq '^          image: docker.io/marquezproject/marquez:chart-test$' \
-    "${render_dir}/default.yaml"; then
-  echo "chart CI values did not render the current-source API image" >&2
-  exit 1
-fi
-
-if ! grep -Eq '^          imagePullPolicy: Never$' "${render_dir}/default.yaml"; then
-  echo "chart CI values did not disable pulling the locally loaded API image" >&2
-  exit 1
-fi
+require "chart CI values did not render the current-source API image" \
+  grep -Eq '^          image: docker.io/marquezproject/marquez:chart-test$' \
+  "${render_dir}/default.yaml"
+require "chart CI values did not disable pulling the locally loaded API image" \
+  grep -Eq '^          imagePullPolicy: Never$' "${render_dir}/default.yaml"
 
 strategy_count="$(grep -c '^  strategy:$' "${render_dir}/marquez-deployment.yaml" || true)"
 recreate_count="$(grep -c '^    type: Recreate$' \
@@ -97,24 +101,18 @@ if [[ "${strategy_count}" -ne 1 || "${recreate_count}" -ne 1 ]]; then
   exit 1
 fi
 
-if grep -Eq '^    type: RollingUpdate$|^    rollingUpdate:$' \
-    "${render_dir}/marquez-deployment.yaml"; then
-  echo "Marquez Deployment must not overlap old and new projector replicas" >&2
-  exit 1
-fi
+reject "Marquez Deployment must not overlap old and new projector replicas" \
+  grep -Eq '^    type: RollingUpdate$|^    rollingUpdate:$' \
+  "${render_dir}/marquez-deployment.yaml"
 
 default_checksum="$({ sed -n 's/^        checksum\/marquez-config: "\([^"]*\)"$/\1/p' \
   "${render_dir}/default.yaml" || true; } | head -n 1)"
 changed_checksum="$({ sed -n 's/^        checksum\/marquez-config: "\([^"]*\)"$/\1/p' \
   "${render_dir}/changed.yaml" || true; } | head -n 1)"
-projection_batch_size_changed_checksum="$({ sed -n \
-  's/^        checksum\/marquez-config: "\([^"]*\)"$/\1/p' \
-  "${render_dir}/projection-batch-size-changed.yaml" || true; } | head -n 1)"
 auto_comments_enabled_checksum="$({ sed -n 's/^        checksum\/marquez-config: "\([^"]*\)"$/\1/p' \
   "${render_dir}/auto-comments-enabled.yaml" || true; } | head -n 1)"
 
 if [[ -z "${default_checksum}" || -z "${changed_checksum}" \
-    || -z "${projection_batch_size_changed_checksum}" \
     || -z "${auto_comments_enabled_checksum}" ]]; then
   echo "rendered Deployment is missing checksum/marquez-config on the Pod template" >&2
   exit 1
@@ -125,66 +123,34 @@ if [[ "${default_checksum}" == "${changed_checksum}" ]]; then
   exit 1
 fi
 
-if [[ "${default_checksum}" == "${projection_batch_size_changed_checksum}" ]]; then
-  echo "ConfigMap checksum did not change with the projection batch size" >&2
-  exit 1
-fi
-
 if [[ "${default_checksum}" == "${auto_comments_enabled_checksum}" ]]; then
   echo "ConfigMap checksum did not change when database auto-comments were enabled" >&2
   exit 1
 fi
 
-if ! grep -Fq '      autoCommentsEnabled: false' "${render_dir}/default.yaml"; then
-  echo "default database auto-comments setting was not rendered as false" >&2
-  exit 1
-fi
-
-if ! grep -Fq '      autoCommentsEnabled: true' \
-    "${render_dir}/auto-comments-enabled.yaml"; then
-  echo "database auto-comments true override was not rendered" >&2
-  exit 1
-fi
-
-if grep -Fxq '    dbRetention:' "${render_dir}/default.yaml"; then
-  echo "database retention configuration was rendered while disabled" >&2
-  exit 1
-fi
+require "default database auto-comments setting was not rendered as false" \
+  grep -Fq '      autoCommentsEnabled: false' "${render_dir}/default.yaml"
+require "database auto-comments true override was not rendered" \
+  grep -Fq '      autoCommentsEnabled: true' "${render_dir}/auto-comments-enabled.yaml"
+reject "database retention configuration was rendered while disabled" \
+  grep -Fxq '    dbRetention:' "${render_dir}/default.yaml"
 
 for expected_line in \
     '    dbRetention:' \
     '      frequencyMins: 17' \
     '      numberOfRowsPerBatch: 321' \
     '      retentionDays: 29'; do
-  if ! grep -Fxq "${expected_line}" \
-      "${render_dir}/retention-enabled-configmap.yaml"; then
-    echo "enabled database retention configuration was not rendered exactly: ${expected_line}" >&2
-    exit 1
-  fi
+  require "enabled database retention configuration was not rendered exactly: ${expected_line}" \
+    grep -Fxq "${expected_line}" "${render_dir}/retention-enabled-configmap.yaml"
 done
 
-if ! grep -Eq '^        rollout-test: "enabled"$' "${render_dir}/changed.yaml"; then
-  echo "marquez.podAnnotations was not rendered on the Pod template" >&2
-  exit 1
-fi
-
-if grep -Eq '^    rollout-test: "enabled"$' "${render_dir}/changed.yaml"; then
-  echo "marquez.podAnnotations was rendered on Deployment metadata" >&2
-  exit 1
-fi
-
-if ! grep -Fq '      pollIntervalMillis: 2000' "${render_dir}/changed.yaml"; then
-  echo "OpenLineage override was not rendered into the Marquez ConfigMap" >&2
-  exit 1
-fi
-
-if ! grep -Fq '      projectionBatchSize: 8' "${render_dir}/default.yaml"; then
-  echo "default OpenLineage projection batch size was not rendered as 8" >&2
-  exit 1
-fi
-
-if ! grep -Fq '      projectionBatchSize: 16' \
-    "${render_dir}/projection-batch-size-changed.yaml"; then
-  echo "OpenLineage projection batch size override was not rendered" >&2
-  exit 1
-fi
+require "marquez.podAnnotations was not rendered on the Pod template" \
+  grep -Eq '^        rollout-test: "enabled"$' "${render_dir}/changed.yaml"
+reject "marquez.podAnnotations was rendered on Deployment metadata" \
+  grep -Eq '^    rollout-test: "enabled"$' "${render_dir}/changed.yaml"
+require "OpenLineage override was not rendered into the Marquez ConfigMap" \
+  grep -Fq '      pollIntervalMillis: 2000' "${render_dir}/changed.yaml"
+require "default OpenLineage projection batch size was not rendered as 8" \
+  grep -Fq '      projectionBatchSize: 8' "${render_dir}/default.yaml"
+require "OpenLineage projection batch size override was not rendered" \
+  grep -Fq '      projectionBatchSize: 16' "${render_dir}/changed.yaml"

@@ -10,7 +10,7 @@ import static marquez.tracing.SentryPropagating.withSentry;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import java.time.ZoneId;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -48,6 +48,7 @@ import marquez.service.models.DatasetEvent;
 import marquez.service.models.JobEvent;
 import marquez.service.models.LineageEvent;
 import marquez.service.models.RunMeta;
+import org.postgresql.util.PGobject;
 
 @Slf4j
 public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao {
@@ -76,22 +77,14 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
     this.executor = executor;
   }
 
-  record QueuedEvent(long queueId, BaseEvent event, String eventJson) {
-    QueuedEvent {
+  /** A committed queue projection awaiting best-effort post-commit publication. */
+  record CommittedEvent(long queueId, LineageEvent event, UpdateLineageRow update) {
+    CommittedEvent {
       if (queueId <= 0) {
         throw new IllegalArgumentException("queueId must be positive");
       }
       Objects.requireNonNull(event, "event");
-      Objects.requireNonNull(eventJson, "eventJson");
-    }
-  }
-
-  record ProjectedEvent(long queueId, BaseEvent event, @Nullable UpdateLineageRow update) {
-    ProjectedEvent {
-      if (queueId <= 0) {
-        throw new IllegalArgumentException("queueId must be positive");
-      }
-      Objects.requireNonNull(event, "event");
+      Objects.requireNonNull(update, "update");
     }
   }
 
@@ -108,97 +101,45 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
    */
   UpdateLineageRow processQueuedInTransaction(
       BaseEvent event, String eventJson, OpenLineageDao transactionalDao) {
-    ProjectionOrder order =
-        new ProjectionOrder(
-            eventTime(event).withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
-            Utils.sha256Utf8(eventJson));
-    if (event instanceof DatasetEvent datasetEvent) {
-      transactionalDao.createDatasetEvent(
-          datasetEvent.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
+    Instant eventInstant = eventInstant(event);
+    ProjectionOrder order = new ProjectionOrder(eventInstant, Utils.sha256Utf8(eventJson));
+    if (event instanceof LineageEvent) {
+      UpdateLineageRow update = projectEvent(event, transactionalDao, order, false);
+      writeRawEvent(
+          event,
+          eventInstant,
+          transactionalDao,
           OpenLineageDao.createJsonObject(eventJson),
-          datasetEvent.getProducer());
-      transactionalDao.updateMarquezModel(datasetEvent, mapper, order);
-      return null;
-    }
-
-    if (event instanceof JobEvent jobEvent) {
-      transactionalDao.createJobEvent(
-          jobEvent.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
-          jobEvent.getJob().getName(),
-          jobEvent.getJob().getNamespace(),
-          OpenLineageDao.createJsonObject(eventJson),
-          jobEvent.getProducer());
-      transactionalDao.updateMarquezModel(jobEvent, mapper, order);
-      return null;
-    }
-
-    if (event instanceof LineageEvent lineageEvent) {
-      boolean listenerSnapshotRequired =
-          lineageEvent.getEventType() != null && runService.hasRunTransitionListeners();
-      UpdateLineageRow update =
-          transactionalDao.updateMarquezModel(
-              lineageEvent, mapper, listenerSnapshotRequired, order);
-      UUID effectiveRunUuid = effectiveRunUuid(update);
-      transactionalDao.createLineageEvent(
-          lineageEvent.getEventType() == null ? "" : lineageEvent.getEventType(),
-          lineageEvent.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
-          effectiveRunUuid,
-          lineageEvent.getJob().getName(),
-          lineageEvent.getJob().getNamespace(),
-          OpenLineageDao.createJsonObject(eventJson),
-          lineageEvent.getProducer());
+          effectiveRunUuid(update));
       return update;
     }
 
-    throw new IllegalArgumentException(
-        "Unsupported OpenLineage event type: " + event.getClass().getName());
+    writeRawEvent(
+        event, eventInstant, transactionalDao, OpenLineageDao.createJsonObject(eventJson), null);
+    projectEvent(event, transactionalDao, order, false);
+    return null;
   }
 
-  /**
-   * Persists an ordered batch through a caller-owned transaction.
-   *
-   * <p>This deliberately reuses the mature single-event projector. Any failure stops the batch and
-   * escapes so the caller can roll back its batch savepoint before retrying events individually.
-   */
-  List<ProjectedEvent> processQueuedBatchInTransaction(
-      List<QueuedEvent> queuedEvents, OpenLineageDao transactionalDao) {
-    Objects.requireNonNull(transactionalDao, "transactionalDao");
-    List<QueuedEvent> orderedEvents =
-        List.copyOf(Objects.requireNonNull(queuedEvents, "queuedEvents"));
-    List<ProjectedEvent> projectedEvents = new ArrayList<>(orderedEvents.size());
-    for (QueuedEvent queuedEvent : orderedEvents) {
-      UpdateLineageRow update =
-          processQueuedInTransaction(
-              queuedEvent.event(), queuedEvent.eventJson(), transactionalDao);
-      projectedEvents.add(new ProjectedEvent(queuedEvent.queueId(), queuedEvent.event(), update));
-    }
-    return List.copyOf(projectedEvents);
-  }
-
-  private static java.time.ZonedDateTime eventTime(BaseEvent event) {
+  private static Instant eventInstant(BaseEvent event) {
     if (event instanceof DatasetEvent datasetEvent) {
-      return datasetEvent.getEventTime();
+      return datasetEvent.getEventTime().toInstant();
     }
     if (event instanceof JobEvent jobEvent) {
-      return jobEvent.getEventTime();
+      return jobEvent.getEventTime().toInstant();
     }
     if (event instanceof LineageEvent lineageEvent) {
-      return lineageEvent.getEventTime();
+      return lineageEvent.getEventTime().toInstant();
     }
     throw new IllegalArgumentException(
         "Unsupported OpenLineage event type: " + event.getClass().getName());
   }
 
   /** Publishes non-transactional projections after the queue ACK has committed. */
-  int publishQueuedEventBestEffort(BaseEvent event, UpdateLineageRow update) {
-    if (!(event instanceof LineageEvent lineageEvent)) {
-      return 0;
-    }
-
+  int publishQueuedEventBestEffort(LineageEvent event, UpdateLineageRow update) {
     int failures = 0;
     if (searchService != null) {
       try {
-        if (!searchService.indexEvent(lineageEvent, effectiveRunUuid(update))) {
+        if (!searchService.indexEvent(event, effectiveRunUuid(update))) {
           failures++;
         }
       } catch (RuntimeException e) {
@@ -207,9 +148,9 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
       }
     }
 
-    if (lineageEvent.getEventType() != null && runService.hasRunTransitionListeners()) {
+    if (event.getEventType() != null && runService.hasRunTransitionListeners()) {
       try {
-        failures += notifyListeners(lineageEvent, update);
+        failures += notifyListeners(event, update);
       } catch (RuntimeException e) {
         failures++;
         log.error("Failed to notify listeners for queued OpenLineage event", e);
@@ -219,48 +160,51 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
   }
 
   /** Publishes an ordered batch after its queue transaction has committed. */
-  int publishQueuedEventsBestEffort(List<ProjectedEvent> committedEvents) {
-    List<ProjectedEvent> orderedEvents =
-        List.copyOf(Objects.requireNonNull(committedEvents, "committedEvents"));
+  int publishQueuedEventsBestEffort(List<CommittedEvent> committedEvents) {
+    Objects.requireNonNull(committedEvents, "committedEvents");
     int failures = 0;
 
     if (searchService != null) {
-      List<SearchService.IndexEntry> indexEntries = new ArrayList<>(orderedEvents.size());
-      for (ProjectedEvent projectedEvent : orderedEvents) {
-        if (!(projectedEvent.event() instanceof LineageEvent lineageEvent)) {
-          continue;
-        }
+      List<SearchService.IndexEntry> indexEntries = new ArrayList<>(committedEvents.size());
+      for (CommittedEvent committedEvent : committedEvents) {
         try {
           indexEntries.add(
               new SearchService.IndexEntry(
-                  lineageEvent, effectiveRunUuid(projectedEvent.update())));
+                  committedEvent.event(), effectiveRunUuid(committedEvent.update())));
         } catch (RuntimeException e) {
           failures++;
           log.error(
               "Failed to prepare queued OpenLineage event {} for indexing",
-              projectedEvent.queueId(),
+              committedEvent.queueId(),
               e);
         }
       }
       if (!indexEntries.isEmpty()) {
-        failures += searchService.indexEventsBestEffort(List.copyOf(indexEntries));
+        try {
+          failures += searchService.indexEventsBestEffort(indexEntries);
+        } catch (RuntimeException e) {
+          failures += indexEntries.size();
+          log.error(
+              "Failed to bulk index {} committed queued OpenLineage event(s)",
+              indexEntries.size(),
+              e);
+        }
       }
     }
 
-    for (ProjectedEvent projectedEvent : orderedEvents) {
-      if (!(projectedEvent.event() instanceof LineageEvent lineageEvent)
-          || lineageEvent.getEventType() == null) {
+    for (CommittedEvent committedEvent : committedEvents) {
+      if (committedEvent.event().getEventType() == null) {
         continue;
       }
       try {
         if (runService.hasRunTransitionListeners()) {
-          failures += notifyListeners(lineageEvent, projectedEvent.update());
+          failures += notifyListeners(committedEvent.event(), committedEvent.update());
         }
       } catch (RuntimeException e) {
         failures++;
         log.error(
             "Failed to notify listeners for queued OpenLineage event {}",
-            projectedEvent.queueId(),
+            committedEvent.queueId(),
             e);
       }
     }
@@ -282,11 +226,9 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
         () ->
             attemptBoth(
                 () ->
-                    createDatasetEvent(
-                        event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
-                        createJsonArray(event, mapper),
-                        event.getProducer()),
-                () -> updateMarquezModel(event, mapper)));
+                    writeRawEvent(
+                        event, eventInstant(event), this, createJsonArray(event, mapper), null),
+                () -> projectEvent(event, this, null, true)));
   }
 
   public CompletableFuture<Void> createAsync(JobEvent event) {
@@ -294,13 +236,9 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
         () ->
             attemptBoth(
                 () ->
-                    createJobEvent(
-                        event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
-                        event.getJob().getName(),
-                        event.getJob().getNamespace(),
-                        createJsonArray(event, mapper),
-                        event.getProducer()),
-                () -> updateMarquezModel(event, mapper)));
+                    writeRawEvent(
+                        event, eventInstant(event), this, createJsonArray(event, mapper), null),
+                () -> projectEvent(event, this, null, true)));
   }
 
   // Legacy non-queued intake intentionally retains split raw/projection writes; effective run
@@ -312,28 +250,78 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
             searchService.indexEvent(event);
           }
 
-          UUID runUuid = runUuidFromEvent(event.getRun());
+          UUID runUuid = Utils.openLineageRunUuid(event.getRun().getRunId());
           attemptBoth(
               () ->
-                  createLineageEvent(
-                      event.getEventType() == null ? "" : event.getEventType(),
-                      event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
-                      runUuid,
-                      event.getJob().getName(),
-                      event.getJob().getNamespace(),
-                      createJsonArray(event, mapper),
-                      event.getProducer()),
-              () -> updateMarquezModelAndNotifyListeners(event));
+                  writeRawEvent(
+                      event, eventInstant(event), this, createJsonArray(event, mapper), runUuid),
+              () -> projectEvent(event, this, null, true));
         });
   }
 
-  private void updateMarquezModelAndNotifyListeners(LineageEvent event) {
-    boolean listenerSnapshotRequired =
-        event.getEventType() != null && runService.hasRunTransitionListeners();
-    UpdateLineageRow update = updateMarquezModel(event, mapper, listenerSnapshotRequired);
-    if (listenerSnapshotRequired) {
-      notifyListeners(event, update);
+  private UpdateLineageRow projectEvent(
+      BaseEvent event,
+      OpenLineageDao dao,
+      @Nullable ProjectionOrder order,
+      boolean notifyAfterProjection) {
+    if (event instanceof DatasetEvent datasetEvent) {
+      return order == null
+          ? dao.updateMarquezModel(datasetEvent, mapper)
+          : dao.updateMarquezModel(datasetEvent, mapper, order);
     }
+    if (event instanceof JobEvent jobEvent) {
+      return order == null
+          ? dao.updateMarquezModel(jobEvent, mapper)
+          : dao.updateMarquezModel(jobEvent, mapper, order);
+    }
+    if (event instanceof LineageEvent lineageEvent) {
+      boolean listenerSnapshotRequired =
+          lineageEvent.getEventType() != null && runService.hasRunTransitionListeners();
+      UpdateLineageRow update =
+          order == null
+              ? dao.updateMarquezModel(lineageEvent, mapper, listenerSnapshotRequired)
+              : dao.updateMarquezModel(lineageEvent, mapper, listenerSnapshotRequired, order);
+      if (notifyAfterProjection && listenerSnapshotRequired) {
+        notifyListeners(lineageEvent, update);
+      }
+      return update;
+    }
+    throw new IllegalArgumentException(
+        "Unsupported OpenLineage event type: " + event.getClass().getName());
+  }
+
+  private static void writeRawEvent(
+      BaseEvent event,
+      Instant eventInstant,
+      OpenLineageDao dao,
+      PGobject rawEvent,
+      @Nullable UUID lineageRunUuid) {
+    if (event instanceof DatasetEvent datasetEvent) {
+      dao.createDatasetEvent(eventInstant, rawEvent, datasetEvent.getProducer());
+      return;
+    }
+    if (event instanceof JobEvent jobEvent) {
+      dao.createJobEvent(
+          eventInstant,
+          jobEvent.getJob().getName(),
+          jobEvent.getJob().getNamespace(),
+          rawEvent,
+          jobEvent.getProducer());
+      return;
+    }
+    if (event instanceof LineageEvent lineageEvent) {
+      dao.createLineageEvent(
+          lineageEvent.getEventType() == null ? "" : lineageEvent.getEventType(),
+          eventInstant,
+          Objects.requireNonNull(lineageRunUuid, "lineageRunUuid"),
+          lineageEvent.getJob().getName(),
+          lineageEvent.getJob().getNamespace(),
+          rawEvent,
+          lineageEvent.getProducer());
+      return;
+    }
+    throw new IllegalArgumentException(
+        "Unsupported OpenLineage event type: " + event.getClass().getName());
   }
 
   private CompletableFuture<Void> submit(Runnable task) {
@@ -381,17 +369,6 @@ public class OpenLineageService extends DelegatingDaos.DelegatingOpenLineageDao 
     }
     failures += buildRunTransition(update).map(runService::notify).orElse(0);
     return failures;
-  }
-
-  /**
-   * Try to convert the run id to a UUID. If it isn't a properly formatted UUID, generate one from
-   * the string bytes
-   *
-   * @param run
-   * @return the {@link UUID} for the run
-   */
-  private UUID runUuidFromEvent(LineageEvent.Run run) {
-    return Utils.openLineageRunUuid(run.getRunId());
   }
 
   private Optional<JobOutputUpdate> buildJobOutputUpdate(UpdateLineageRow record) {

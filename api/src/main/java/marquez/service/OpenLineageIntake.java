@@ -9,6 +9,7 @@ import java.util.List;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 import marquez.db.OpenLineageQueueDao;
+import marquez.db.OpenLineageQueueDao.PreparedAdmission;
 import marquez.db.OpenLineageQueueDao.PreparedEvent;
 import marquez.service.models.BaseEvent;
 
@@ -47,20 +48,23 @@ public final class OpenLineageIntake {
   }
 
   /**
-   * Atomically enqueues an ordered batch already validated and serialized by durable admission. The
-   * queue retains this call's membership under one internal nullable BIGINT admission ID; the
-   * unchanged singleton path uses NULL. Existing durable queue IDs carry input order without a
-   * separate admission ordinal. Workers may consume only currently ready members in one or more
-   * bounded subsets, so this admission boundary is not a whole-batch projection barrier. Returns
-   * the admitted count after the batch commits. Waking the worker remains a best-effort
-   * optimization because polling and restart recovery make every committed event visible.
+   * Atomically enqueues a prepared admission. Workers may project ready subsets independently, so
+   * admission is not a completion barrier. Returns the admitted count after commit; waking the
+   * worker remains a best-effort optimization.
    */
+  public int enqueueAll(@NonNull final PreparedAdmission admission) {
+    return admission.size() == 0 ? 0 : wakeAfterBatch(queueDao.enqueueAll(admission));
+  }
+
+  /** Compatibility overload for callers that prepare events individually. */
   public int enqueueAll(@NonNull final List<PreparedEvent> events) {
     if (events.isEmpty()) {
       return 0;
     }
+    return wakeAfterBatch(queueDao.enqueueAll(events));
+  }
 
-    final int admitted = queueDao.enqueueAll(events);
+  private int wakeAfterBatch(int admitted) {
     try {
       wakeUp.run();
     } catch (RuntimeException wakeFailure) {

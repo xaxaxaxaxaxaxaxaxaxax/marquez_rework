@@ -10,12 +10,14 @@ $ yarn
 
 ### Generating Docs
 
+API pages are generated from the canonical `../spec/openapi.yml` file. To clean stale pages and
+regenerate them explicitly:
+
 ```bash
-# clean
-yarn docusaurus clean-api-docs all
-# generate
-yarn docusaurus gen-api-docs all
+yarn api-docs:sync
 ```
+
+The `start`, `build`, and `deploy` scripts run this synchronization automatically first.
 
 ### Local Development
 

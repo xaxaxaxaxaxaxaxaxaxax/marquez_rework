@@ -287,7 +287,7 @@ class OpenLineageDurabilityIntegrationTest {
   }
 
   @Test
-  void failedProjectionBatchRollsBackItsAdmissionAndLeavesAnotherAdmissionIndependent() {
+  void failedProjectionBatchFallsBackAndLeavesAnotherAdmissionIndependent() throws Exception {
     UUID goodRun = UUID.randomUUID();
     UUID failingRun = UUID.randomUUID();
     UUID independentRun = UUID.randomUUID();
@@ -313,36 +313,41 @@ class OpenLineageDurabilityIntegrationTest {
     OpenLineageService failingService =
         new FailAfterProjectionService(
             baseDao(), runService(), failingRun, "START", "batch projection failure");
+    OpenLineageWorker worker = newWorker(failingService, 1);
+    AtomicBoolean allowClaim = new AtomicBoolean(true);
 
-    assertThatThrownBy(() -> processNextBatchSuccess(failingService, 8))
-        .isInstanceOf(RuntimeException.class)
-        .hasMessage("batch projection failure");
+    assertThat(worker.processTask(() -> allowClaim.getAndSet(false)))
+        .isEqualTo(new OpenLineageWorker.TaskResult(2, OpenLineageWorker.EventOutcome.RETRIED));
 
-    assertThat(liveEventIds())
-        .containsExactly(failedAdmissionIds.get(0), failedAdmissionIds.get(1), independentId);
-    assertThat(head(goodKey)).isEqualTo(new HeadState(failedAdmissionIds.get(0), 0, null));
-    assertThat(head(failingKey)).isEqualTo(new HeadState(failedAdmissionIds.get(1), 0, null));
+    assertThat(liveEventIds()).containsExactly(failedAdmissionIds.get(1), independentId);
+    assertThat(head(failingKey))
+        .isEqualTo(
+            new HeadState(
+                failedAdmissionIds.get(1),
+                1,
+                "java.lang.IllegalStateException: batch projection failure"));
     assertThat(head(independentKey)).isEqualTo(new HeadState(independentId, 0, null));
-    assertThat(rawEventCount(goodRun)).isZero();
+    assertThat(headCount()).isEqualTo(2);
+    assertThat(rawEventCount(goodRun)).isEqualTo(1);
     assertThat(rawEventCount(failingRun)).isZero();
     assertThat(rawEventCount(independentRun)).isZero();
+    assertThat(runCount(goodRun)).isEqualTo(1);
+    assertThat(runCount(failingRun)).isZero();
     assertThat(deadLetterCount()).isZero();
 
-    setScheduleAt(goodKey, Instant.parse("2100-01-01T00:00:00Z"));
     setScheduleAt(failingKey, Instant.parse("2100-01-01T00:00:00Z"));
     setScheduleAt(independentKey, Instant.parse("2000-01-01T00:00:00Z"));
     TransactionResult projected = processNext(newService(), 3, 0);
     assertThat(projected.outcome()).isEqualTo(TransactionOutcome.SUCCESS);
     assertThat(projected.row().id()).isEqualTo(independentId);
     assertThat(rawEventCount(independentRun)).isEqualTo(1);
-    assertThat(rawEventCount(goodRun)).isZero();
+    assertThat(rawEventCount(goodRun)).isEqualTo(1);
     assertThat(rawEventCount(failingRun)).isZero();
-    assertThat(liveEventIds())
-        .containsExactly(failedAdmissionIds.get(0), failedAdmissionIds.get(1));
+    assertThat(liveEventIds()).containsExactly(failedAdmissionIds.get(1));
   }
 
   @Test
-  void backendTerminationAfterProjectionRollsBackWithoutCountingAttempt() throws Exception {
+  void backendTerminationMidBatchRollsBackWithoutCountingAttempt() throws Exception {
     UUID firstRunId = UUID.randomUUID();
     UUID secondRunId = UUID.randomUUID();
     LineageEvent first = runEvent(firstRunId, "START", EVENT_TIME, "terminated-projection-job-a");
@@ -432,8 +437,7 @@ class OpenLineageDurabilityIntegrationTest {
       MetricRegistry metrics = new MetricRegistry();
       OpenLineageService service = spy(newService());
       OpenLineageWorker ambiguousWorker =
-          new OpenLineageWorker(
-              ambiguousJdbi, queueDao, service, workerConfig(1, 3, 1_000), metrics);
+          new OpenLineageWorker(ambiguousJdbi, service, workerConfig(1, 3, 1_000), metrics);
       workers.add(ambiguousWorker);
 
       assertThatThrownBy(() -> ambiguousWorker.processTask(() -> true))
@@ -1276,7 +1280,6 @@ class OpenLineageDurabilityIntegrationTest {
     assertThat(recovered.row().id()).isEqualTo(eventId);
     assertThat(recovered.row().eventJson()).isEqualTo(eventJson);
     assertThat(recovered.row().attemptCount()).isEqualTo(2);
-    assertThat(recovered.row().lastError()).contains("failure after partial projection");
 
     assertThat(rawEventTypes(runId)).containsExactly("START");
     assertThat(runCount(runId)).isEqualTo(1);
@@ -1416,7 +1419,6 @@ class OpenLineageDurabilityIntegrationTest {
     OpenLineageWorker worker =
         new OpenLineageWorker(
             jdbi,
-            queueDao,
             service,
             workerConfig(workerThreads, maxAttempts, shutdownGracePeriodMillis),
             new MetricRegistry());
@@ -1491,23 +1493,18 @@ class OpenLineageDurabilityIntegrationTest {
             return List.of();
           }
 
-          List<OpenLineageService.QueuedEvent> queuedEvents = new ArrayList<>(rows.size());
+          OpenLineageDao transactionalOpenLineage = handle.attach(OpenLineageDao.class);
           for (OpenLineageQueueRow row : rows) {
             try {
-              queuedEvents.add(
-                  new OpenLineageService.QueuedEvent(
-                      row.id(),
-                      Utils.getMapper().readValue(row.eventJson(), BaseEvent.class),
-                      row.eventJson()));
+              BaseEvent event = Utils.getMapper().readValue(row.eventJson(), BaseEvent.class);
+              service.processQueuedInTransaction(event, row.eventJson(), transactionalOpenLineage);
             } catch (IOException failure) {
               throw new IllegalArgumentException(
                   "test queue payload could not be deserialized", failure);
             }
           }
-          service.processQueuedBatchInTransaction(
-              queuedEvents, handle.attach(OpenLineageDao.class));
           transactionalQueue.ackLockedAll(rows);
-          return List.copyOf(rows);
+          return rows;
         });
   }
 
@@ -2358,9 +2355,8 @@ class OpenLineageDurabilityIntegrationTest {
                     SELECT queued.id,
                            queued.ordering_key,
                            queued.event AS event_json,
-                           queued.enqueued_at,
                            head.attempt_count,
-                           head.last_error
+                           queued.admission_id
                     FROM open_lineage_queue_heads AS head
                     JOIN open_lineage_queue AS queued
                       ON queued.ordering_key = head.ordering_key
@@ -2374,9 +2370,8 @@ class OpenLineageDurabilityIntegrationTest {
                             resultSet.getLong("id"),
                             resultSet.getObject("ordering_key", UUID.class),
                             resultSet.getString("event_json"),
-                            resultSet.getTimestamp("enqueued_at").toInstant(),
                             resultSet.getInt("attempt_count"),
-                            resultSet.getString("last_error")))
+                            resultSet.getObject("admission_id", Long.class)))
                 .one());
   }
 

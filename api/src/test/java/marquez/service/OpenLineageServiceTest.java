@@ -42,8 +42,7 @@ import marquez.db.models.RunIoSnapshot;
 import marquez.db.models.RunRow;
 import marquez.db.models.RunStateRow;
 import marquez.db.models.UpdateLineageRow;
-import marquez.service.OpenLineageService.ProjectedEvent;
-import marquez.service.OpenLineageService.QueuedEvent;
+import marquez.service.OpenLineageService.CommittedEvent;
 import marquez.service.RunTransitionListener.JobInputUpdate;
 import marquez.service.RunTransitionListener.JobOutputUpdate;
 import marquez.service.RunTransitionListener.RunTransition;
@@ -344,101 +343,6 @@ class OpenLineageServiceTest {
   }
 
   @Test
-  void queuedBatchProjectsInInputOrderAndReturnsImmutableCorrelatedResults() {
-    OpenLineageDao transactionalDao = mock(OpenLineageDao.class);
-    UpdateLineageRow firstUpdate = mock(UpdateLineageRow.class);
-    UpdateLineageRow secondUpdate = mock(UpdateLineageRow.class);
-    UUID secondEffectiveRunId = UUID.fromString("853daabc-939a-4af1-bc73-f175d2f25110");
-    RunRow firstRun = mock(RunRow.class);
-    RunRow secondRun = mock(RunRow.class);
-    when(firstRun.getUuid()).thenReturn(EFFECTIVE_RUN_ID);
-    when(secondRun.getUuid()).thenReturn(secondEffectiveRunId);
-    when(firstUpdate.getRun()).thenReturn(firstRun);
-    when(secondUpdate.getRun()).thenReturn(secondRun);
-    LineageEvent firstEvent = lineageEvent("START");
-    LineageEvent secondEvent = lineageEvent("COMPLETE");
-    when(transactionalDao.updateMarquezModel(
-            eq(firstEvent), any(ObjectMapper.class), eq(false), any(ProjectionOrder.class)))
-        .thenReturn(firstUpdate);
-    when(transactionalDao.updateMarquezModel(
-            eq(secondEvent), any(ObjectMapper.class), eq(false), any(ProjectionOrder.class)))
-        .thenReturn(secondUpdate);
-    OpenLineageService service = service(Runnable::run);
-
-    List<ProjectedEvent> projectedEvents =
-        service.processQueuedBatchInTransaction(
-            List.of(
-                new QueuedEvent(41, firstEvent, "{\"event\":1}"),
-                new QueuedEvent(42, secondEvent, "{\"event\":2}")),
-            transactionalDao);
-
-    assertThat(projectedEvents).extracting(ProjectedEvent::queueId).containsExactly(41L, 42L);
-    assertThat(projectedEvents)
-        .extracting(ProjectedEvent::event)
-        .containsExactly(firstEvent, secondEvent);
-    assertThat(projectedEvents)
-        .extracting(ProjectedEvent::update)
-        .containsExactly(firstUpdate, secondUpdate);
-    assertThrows(
-        UnsupportedOperationException.class, () -> projectedEvents.add(projectedEvents.get(0)));
-    InOrder order = inOrder(transactionalDao);
-    order
-        .verify(transactionalDao)
-        .updateMarquezModel(
-            eq(firstEvent), any(ObjectMapper.class), eq(false), any(ProjectionOrder.class));
-    order
-        .verify(transactionalDao)
-        .createLineageEvent(any(), any(), eq(EFFECTIVE_RUN_ID), any(), any(), any(), any());
-    order
-        .verify(transactionalDao)
-        .updateMarquezModel(
-            eq(secondEvent), any(ObjectMapper.class), eq(false), any(ProjectionOrder.class));
-    order
-        .verify(transactionalDao)
-        .createLineageEvent(any(), any(), eq(secondEffectiveRunId), any(), any(), any(), any());
-  }
-
-  @Test
-  void queuedBatchStopsAtFirstProjectionFailure() {
-    OpenLineageDao transactionalDao = mock(OpenLineageDao.class);
-    LineageEvent firstEvent = lineageEvent("START");
-    LineageEvent failingEvent = lineageEvent("RUNNING");
-    LineageEvent unattemptedEvent = lineageEvent("ABORT");
-    UpdateLineageRow firstUpdate = mock(UpdateLineageRow.class);
-    RunRow firstRun = mock(RunRow.class);
-    when(firstRun.getUuid()).thenReturn(EFFECTIVE_RUN_ID);
-    when(firstUpdate.getRun()).thenReturn(firstRun);
-    when(transactionalDao.updateMarquezModel(
-            eq(firstEvent), any(ObjectMapper.class), eq(false), any(ProjectionOrder.class)))
-        .thenReturn(firstUpdate);
-    RuntimeException projectionFailure = new RuntimeException("projection failed");
-    when(transactionalDao.updateMarquezModel(
-            eq(failingEvent), any(ObjectMapper.class), eq(false), any(ProjectionOrder.class)))
-        .thenThrow(projectionFailure);
-    OpenLineageService service = service(Runnable::run);
-
-    RuntimeException thrown =
-        assertThrows(
-            RuntimeException.class,
-            () ->
-                service.processQueuedBatchInTransaction(
-                    List.of(
-                        new QueuedEvent(51, firstEvent, "{\"event\":1}"),
-                        new QueuedEvent(52, failingEvent, "{\"event\":2}"),
-                        new QueuedEvent(53, unattemptedEvent, "{\"event\":3}")),
-                    transactionalDao));
-
-    assertThat(thrown).isSameAs(projectionFailure);
-    verify(transactionalDao, never())
-        .updateMarquezModel(
-            eq(unattemptedEvent),
-            any(ObjectMapper.class),
-            anyBoolean(),
-            any(ProjectionOrder.class));
-    verifyNoInteractions(searchService);
-  }
-
-  @Test
   void jsonObjectPreservesExactSerializedValueAndRejectsNull() {
     String eventJson = "{\n  \"number\" : 1.00, \"text\" : \"exact\"\n}";
 
@@ -548,7 +452,6 @@ class OpenLineageServiceTest {
     UpdateLineageRow secondUpdate = updateWithRun(secondEffectiveRunId);
     LineageEvent firstEvent = lineageEvent("START");
     LineageEvent secondEvent = lineageEvent("COMPLETE");
-    DatasetEvent datasetEvent = datasetEvent();
     when(searchService.indexEventsBestEffort(any())).thenReturn(2);
     OpenLineageService service = service(Runnable::run);
     ArgumentCaptor<List<SearchService.IndexEntry>> entries = ArgumentCaptor.forClass(List.class);
@@ -556,9 +459,8 @@ class OpenLineageServiceTest {
     int failures =
         service.publishQueuedEventsBestEffort(
             List.of(
-                new ProjectedEvent(61, firstEvent, firstUpdate),
-                new ProjectedEvent(62, datasetEvent, null),
-                new ProjectedEvent(63, secondEvent, secondUpdate)));
+                new CommittedEvent(61, firstEvent, firstUpdate),
+                new CommittedEvent(63, secondEvent, secondUpdate)));
 
     assertThat(failures).isEqualTo(2);
     verify(searchService).indexEventsBestEffort(entries.capture());
@@ -569,6 +471,15 @@ class OpenLineageServiceTest {
         .extracting(SearchService.IndexEntry::effectiveRunUuid)
         .containsExactly(EFFECTIVE_RUN_ID, secondEffectiveRunId);
     verify(searchService, never()).indexEvent(any(LineageEvent.class), any(UUID.class));
+  }
+
+  @Test
+  void committedEventRequiresLineageProjectionState() {
+    LineageEvent event = lineageEvent();
+    UpdateLineageRow eventUpdate = updateWithRun(EFFECTIVE_RUN_ID);
+
+    assertThrows(NullPointerException.class, () -> new CommittedEvent(61, null, eventUpdate));
+    assertThrows(NullPointerException.class, () -> new CommittedEvent(61, event, null));
   }
 
   @Test
@@ -586,8 +497,8 @@ class OpenLineageServiceTest {
     int failures =
         service.publishQueuedEventsBestEffort(
             List.of(
-                new ProjectedEvent(64, lineageEvent("START"), failingUpdate),
-                new ProjectedEvent(65, followingEvent, followingUpdate)));
+                new CommittedEvent(64, lineageEvent("START"), failingUpdate),
+                new CommittedEvent(65, followingEvent, followingUpdate)));
 
     assertThat(failures).isEqualTo(4);
     verify(searchService).indexEventsBestEffort(entries.capture());
@@ -615,8 +526,8 @@ class OpenLineageServiceTest {
     int failures =
         service.publishQueuedEventsBestEffort(
             List.of(
-                new ProjectedEvent(71, lineageEvent("COMPLETE"), firstUpdate),
-                new ProjectedEvent(72, lineageEvent("COMPLETE"), secondUpdate)));
+                new CommittedEvent(71, lineageEvent("COMPLETE"), firstUpdate),
+                new CommittedEvent(72, lineageEvent("COMPLETE"), secondUpdate)));
 
     assertThat(failures).isEqualTo(14);
     InOrder order = inOrder(searchService, runService);
@@ -639,22 +550,24 @@ class OpenLineageServiceTest {
   }
 
   @Test
-  void queuedBatchPostCommitIsolatesListenerRuntimeFailurePerEvent() {
+  void queuedBatchPostCommitIsolatesBulkAndListenerRuntimeFailures() {
     UpdateLineageRow failingUpdate = updateWithRun(EFFECTIVE_RUN_ID);
     RuntimeException listenerFailure = new RuntimeException("listener build failed");
     when(failingUpdate.getRunIoSnapshot()).thenThrow(listenerFailure);
     UpdateLineageRow followingUpdate =
         listenerUpdate(UUID.fromString("753d98cf-9e04-4bc6-989b-757ebbf88c3c"));
     when(runService.hasRunTransitionListeners()).thenReturn(true);
+    when(searchService.indexEventsBestEffort(any()))
+        .thenThrow(new IllegalStateException("bulk search failed"));
     OpenLineageService service = service(Runnable::run);
 
     int failures =
         service.publishQueuedEventsBestEffort(
             List.of(
-                new ProjectedEvent(81, lineageEvent("COMPLETE"), failingUpdate),
-                new ProjectedEvent(82, lineageEvent("COMPLETE"), followingUpdate)));
+                new CommittedEvent(81, lineageEvent("COMPLETE"), failingUpdate),
+                new CommittedEvent(82, lineageEvent("COMPLETE"), followingUpdate)));
 
-    assertThat(failures).isEqualTo(1);
+    assertThat(failures).isEqualTo(3);
     verify(searchService).indexEventsBestEffort(any());
     verify(runService).notify(any(JobOutputUpdate.class));
     verify(runService).notify(any(JobInputUpdate.class));
@@ -662,10 +575,10 @@ class OpenLineageServiceTest {
   }
 
   @Test
-  void queuedBatchPostCommitDoesNotCatchError() {
+  void queuedBatchPostCommitDoesNotCatchBulkError() {
     AssertionError fatal = new AssertionError("fatal");
-    UpdateLineageRow fatalUpdate = mock(UpdateLineageRow.class);
-    when(fatalUpdate.getRun()).thenThrow(fatal);
+    UpdateLineageRow update = updateWithRun(EFFECTIVE_RUN_ID);
+    when(searchService.indexEventsBestEffort(any())).thenThrow(fatal);
     OpenLineageService service = service(Runnable::run);
 
     AssertionError thrown =
@@ -673,10 +586,10 @@ class OpenLineageServiceTest {
             AssertionError.class,
             () ->
                 service.publishQueuedEventsBestEffort(
-                    List.of(new ProjectedEvent(91, lineageEvent(), fatalUpdate))));
+                    List.of(new CommittedEvent(91, lineageEvent(), update))));
 
     assertThat(thrown).isSameAs(fatal);
-    verify(searchService, never()).indexEventsBestEffort(any());
+    verify(searchService).indexEventsBestEffort(any());
   }
 
   private OpenLineageService service(Executor executor) {

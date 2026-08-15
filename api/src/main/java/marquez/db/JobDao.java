@@ -16,6 +16,11 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
+import lombok.AccessLevel;
+import lombok.AllArgsConstructor;
+import lombok.Value;
+import lombok.experimental.Accessors;
 import marquez.common.models.DatasetId;
 import marquez.common.models.DatasetName;
 import marquez.common.models.JobName;
@@ -37,6 +42,7 @@ import marquez.service.models.JobMeta;
 import marquez.service.models.Run;
 import org.jdbi.v3.sqlobject.config.RegisterRowMapper;
 import org.jdbi.v3.sqlobject.customizer.BindList;
+import org.jdbi.v3.sqlobject.customizer.BindMethods;
 import org.jdbi.v3.sqlobject.statement.SqlQuery;
 import org.jdbi.v3.sqlobject.statement.SqlUpdate;
 import org.postgresql.util.PGobject;
@@ -631,6 +637,62 @@ public interface JobDao extends BaseDao {
         jobMeta.getRunId().map(RunId::getValue).orElse(null));
   }
 
+  /**
+   * The sole binding shape for job snapshot upserts. Construction is private so production callers
+   * cannot combine an ordered snapshot with a current-run pointer or construct half a projection
+   * order. Raw compatibility overloads deliberately bind their time/key values without validating
+   * them first, preserving PostgreSQL constraint failures for malformed legacy calls.
+   */
+  @Value
+  @Accessors(fluent = true)
+  @AllArgsConstructor(access = AccessLevel.PRIVATE)
+  class JobUpsertRequest {
+    UUID uuid;
+    UUID parentJobUuid;
+    JobType type;
+    Instant now;
+    UUID namespaceUuid;
+    String namespaceName;
+    String name;
+    String description;
+    String location;
+    UUID symlinkTargetId;
+    PGobject inputs;
+    UUID currentRunUuid;
+    Instant projectionTime;
+    byte[] projectionKey;
+
+    public static JobUpsertRequest forOpenLineageProjection(
+        UUID uuid,
+        @Nullable UUID parentJobUuid,
+        JobType type,
+        Instant now,
+        UUID namespaceUuid,
+        String namespaceName,
+        String name,
+        @Nullable String description,
+        @Nullable String location,
+        @Nullable UUID symlinkTargetId,
+        @Nullable PGobject inputs,
+        @Nullable ProjectionOrder order) {
+      return new JobUpsertRequest(
+          uuid,
+          parentJobUuid,
+          type,
+          now,
+          namespaceUuid,
+          namespaceName,
+          name,
+          description,
+          location,
+          symlinkTargetId,
+          inputs,
+          null,
+          order == null ? null : order.getEventTime(),
+          order == null ? null : order.getEventKey());
+    }
+  }
+
   default String toUrlString(URL url) {
     if (url == null) {
       return null;
@@ -674,45 +736,7 @@ public interface JobDao extends BaseDao {
         null);
   }
 
-  /*
-   * Note: following SQL never executes. There is database trigger on `jobs_view`
-   * that replaces following SQL
-   * with rewrite_jobs_fqn_table plpgsql function. Code of that function is at
-   * R__1 migration file.
-   */
-  @SqlQuery(
-      """
-        INSERT INTO jobs_view AS j (
-          uuid,
-          type,
-          created_at,
-          updated_at,
-          namespace_uuid,
-          namespace_name,
-          name,
-          description,
-          current_location,
-          current_inputs,
-          symlink_target_uuid,
-          parent_job_uuid_string,
-          current_run_uuid
-        ) VALUES (
-          :uuid,
-          :type,
-          :now,
-          :now,
-          :namespaceUuid,
-          :namespaceName,
-          :name,
-          :description,
-          :location,
-          :inputs,
-          :symlinkTargetId,
-          '',
-          :currentRunUuid
-        ) RETURNING *
-      """)
-  JobRow upsertJob(
+  default JobRow upsertJob(
       UUID uuid,
       JobType type,
       Instant now,
@@ -723,74 +747,23 @@ public interface JobDao extends BaseDao {
       String location,
       UUID symlinkTargetId,
       PGobject inputs,
-      UUID currentRunUuid);
+      UUID currentRunUuid) {
+    return upsertJob(
+        uuid,
+        null,
+        type,
+        now,
+        namespaceUuid,
+        namespaceName,
+        name,
+        description,
+        location,
+        symlinkTargetId,
+        inputs,
+        currentRunUuid);
+  }
 
-  /** Ordered OpenLineage snapshot upsert; the run pointer is advanced only after its row exists. */
-  @SqlQuery(
-      """
-        INSERT INTO jobs_view AS j (
-          uuid, type, created_at, updated_at, namespace_uuid, namespace_name, name, description,
-          current_location, current_inputs, symlink_target_uuid, parent_job_uuid_string,
-          open_lineage_snapshot_time, open_lineage_snapshot_key
-        ) VALUES (
-          :uuid, :type, :now, :now, :namespaceUuid, :namespaceName, :name, :description,
-          :location, :inputs, :symlinkTargetId, '', :projectionTime, :projectionKey
-        ) RETURNING *
-      """)
-  JobRow upsertOpenLineageJob(
-      UUID uuid,
-      JobType type,
-      Instant now,
-      UUID namespaceUuid,
-      String namespaceName,
-      String name,
-      String description,
-      String location,
-      UUID symlinkTargetId,
-      PGobject inputs,
-      Instant projectionTime,
-      byte[] projectionKey);
-
-  /*
-   * Note: following SQL never executes. There is database trigger on `jobs_view`
-   * that replaces following SQL
-   * with rewrite_jobs_fqn_table plpgsql function. Code of that function is at
-   * R__1 migration file.
-   */
-  @SqlQuery(
-      """
-        INSERT INTO jobs_view AS j (
-          uuid,
-          parent_job_uuid,
-          type,
-          created_at,
-          updated_at,
-          namespace_uuid,
-          namespace_name,
-          name,
-          description,
-          current_location,
-          current_inputs,
-          symlink_target_uuid,
-          current_run_uuid
-        ) VALUES (
-          :uuid,
-          :parentJobUuid,
-          :type,
-          :now,
-          :now,
-          :namespaceUuid,
-          :namespaceName,
-          :name,
-          :description,
-          :location,
-          :inputs,
-          :symlinkTargetId,
-          :currentRunUuid
-        )
-        RETURNING *
-      """)
-  JobRow upsertJob(
+  default JobRow upsertJob(
       UUID uuid,
       UUID parentJobUuid,
       JobType type,
@@ -802,91 +775,160 @@ public interface JobDao extends BaseDao {
       String location,
       UUID symlinkTargetId,
       PGobject inputs,
-      UUID currentRunUuid);
+      UUID currentRunUuid) {
+    return upsertJob(
+        new JobUpsertRequest(
+            uuid,
+            parentJobUuid,
+            type,
+            now,
+            namespaceUuid,
+            namespaceName,
+            name,
+            description,
+            location,
+            symlinkTargetId,
+            inputs,
+            currentRunUuid,
+            null,
+            null));
+  }
 
-  /** Parent-aware ordered OpenLineage snapshot upsert. */
+  default JobRow upsertOpenLineageJob(
+      UUID uuid,
+      JobType type,
+      Instant now,
+      UUID namespaceUuid,
+      String namespaceName,
+      String name,
+      String description,
+      String location,
+      UUID symlinkTargetId,
+      PGobject inputs,
+      Instant projectionTime,
+      byte[] projectionKey) {
+    return upsertOpenLineageJob(
+        uuid,
+        null,
+        type,
+        now,
+        namespaceUuid,
+        namespaceName,
+        name,
+        description,
+        location,
+        symlinkTargetId,
+        inputs,
+        projectionTime,
+        projectionKey);
+  }
+
+  /** Raw compatibility entry point; PostgreSQL remains responsible for validating the pair. */
+  default JobRow upsertOpenLineageJob(
+      UUID uuid,
+      UUID parentJobUuid,
+      JobType type,
+      Instant now,
+      UUID namespaceUuid,
+      String namespaceName,
+      String name,
+      String description,
+      String location,
+      UUID symlinkTargetId,
+      PGobject inputs,
+      Instant projectionTime,
+      byte[] projectionKey) {
+    return upsertJob(
+        new JobUpsertRequest(
+            uuid,
+            parentJobUuid,
+            type,
+            now,
+            namespaceUuid,
+            namespaceName,
+            name,
+            description,
+            location,
+            symlinkTargetId,
+            inputs,
+            null,
+            projectionTime,
+            projectionKey));
+  }
+
+  default JobRow upsertOpenLineageJob(
+      UUID uuid,
+      JobType type,
+      Instant now,
+      UUID namespaceUuid,
+      String namespaceName,
+      String name,
+      String description,
+      String location,
+      UUID symlinkTargetId,
+      PGobject inputs,
+      ProjectionOrder order) {
+    return upsertOpenLineageJob(
+        uuid,
+        null,
+        type,
+        now,
+        namespaceUuid,
+        namespaceName,
+        name,
+        description,
+        location,
+        symlinkTargetId,
+        inputs,
+        order);
+  }
+
+  default JobRow upsertOpenLineageJob(
+      UUID uuid,
+      UUID parentJobUuid,
+      JobType type,
+      Instant now,
+      UUID namespaceUuid,
+      String namespaceName,
+      String name,
+      String description,
+      String location,
+      UUID symlinkTargetId,
+      PGobject inputs,
+      ProjectionOrder order) {
+    return upsertJob(
+        JobUpsertRequest.forOpenLineageProjection(
+            uuid,
+            parentJobUuid,
+            type,
+            now,
+            namespaceUuid,
+            namespaceName,
+            name,
+            description,
+            location,
+            symlinkTargetId,
+            inputs,
+            order));
+  }
+
+  /*
+   * This INSERT is rewritten by the jobs_view trigger into rewrite_jobs_fqn_table(). Nullable
+   * parent and projection fields encode the independent hierarchy and projection-order axes.
+   */
   @SqlQuery(
       """
         INSERT INTO jobs_view AS j (
           uuid, parent_job_uuid, type, created_at, updated_at, namespace_uuid, namespace_name,
           name, description, current_location, current_inputs, symlink_target_uuid,
-          open_lineage_snapshot_time, open_lineage_snapshot_key
+          current_run_uuid, open_lineage_snapshot_time, open_lineage_snapshot_key
         ) VALUES (
           :uuid, :parentJobUuid, :type, :now, :now, :namespaceUuid, :namespaceName,
           :name, :description, :location, :inputs, :symlinkTargetId,
-          :projectionTime, :projectionKey
+          :currentRunUuid, :projectionTime, :projectionKey
         ) RETURNING *
       """)
-  JobRow upsertOpenLineageJob(
-      UUID uuid,
-      UUID parentJobUuid,
-      JobType type,
-      Instant now,
-      UUID namespaceUuid,
-      String namespaceName,
-      String name,
-      String description,
-      String location,
-      UUID symlinkTargetId,
-      PGobject inputs,
-      Instant projectionTime,
-      byte[] projectionKey);
-
-  default JobRow upsertOpenLineageJob(
-      UUID uuid,
-      JobType type,
-      Instant now,
-      UUID namespaceUuid,
-      String namespaceName,
-      String name,
-      String description,
-      String location,
-      UUID symlinkTargetId,
-      PGobject inputs,
-      ProjectionOrder order) {
-    return upsertOpenLineageJob(
-        uuid,
-        type,
-        now,
-        namespaceUuid,
-        namespaceName,
-        name,
-        description,
-        location,
-        symlinkTargetId,
-        inputs,
-        order.getEventTime(),
-        order.getEventKey());
-  }
-
-  default JobRow upsertOpenLineageJob(
-      UUID uuid,
-      UUID parentJobUuid,
-      JobType type,
-      Instant now,
-      UUID namespaceUuid,
-      String namespaceName,
-      String name,
-      String description,
-      String location,
-      UUID symlinkTargetId,
-      PGobject inputs,
-      ProjectionOrder order) {
-    return upsertOpenLineageJob(
-        uuid,
-        parentJobUuid,
-        type,
-        now,
-        namespaceUuid,
-        namespaceName,
-        name,
-        description,
-        location,
-        symlinkTargetId,
-        inputs,
-        order.getEventTime(),
-        order.getEventKey());
-  }
+  JobRow upsertJob(@BindMethods JobUpsertRequest request);
 
   @SqlUpdate(
       """

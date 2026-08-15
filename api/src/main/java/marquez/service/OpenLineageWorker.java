@@ -18,8 +18,10 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Savepoint;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -45,9 +47,10 @@ import marquez.db.OpenLineageDao;
 import marquez.db.OpenLineageQueueDao;
 import marquez.db.models.OpenLineageQueueRow;
 import marquez.db.models.UpdateLineageRow;
-import marquez.service.OpenLineageService.ProjectedEvent;
-import marquez.service.OpenLineageService.QueuedEvent;
+import marquez.service.OpenLineageService.CommittedEvent;
 import marquez.service.models.BaseEvent;
+import marquez.service.models.LineageEvent;
+import org.jdbi.v3.core.Handle;
 import org.jdbi.v3.core.Jdbi;
 import org.slf4j.MDC;
 
@@ -75,18 +78,15 @@ public final class OpenLineageWorker implements Managed {
   private final Semaphore freeTaskSlots;
   private final ArrayBlockingQueue<Object> wakeSignals = new ArrayBlockingQueue<>(1);
   private final ThreadPoolExecutor processors;
-  private final AtomicBoolean started = new AtomicBoolean();
-  private final AtomicBoolean running = new AtomicBoolean();
-  private final AtomicBoolean stopping = new AtomicBoolean();
-  private final AtomicBoolean closed = new AtomicBoolean();
-  private final AtomicInteger consecutivePollFailures = new AtomicInteger();
+  private final AtomicReference<Lifecycle> lifecycle = new AtomicReference<>(Lifecycle.NEW);
+  private final AtomicReference<PollFailure> pollFailure = new AtomicReference<>();
   private final AtomicReference<Throwable> taskFailure = new AtomicReference<>();
   private volatile Thread coordinator;
   private volatile Throwable coordinatorFailure;
-  private volatile Throwable lastPollFailure;
 
   private final Object activeConnectionMonitor = new Object();
-  private final Set<ConnectionRegistration> activeConnections = new HashSet<>();
+  private final Set<Connection> activeConnections =
+      Collections.newSetFromMap(new IdentityHashMap<>());
   private boolean abortActiveConnections;
   private boolean connectionAbortFailed;
 
@@ -111,13 +111,11 @@ public final class OpenLineageWorker implements Managed {
 
   public OpenLineageWorker(
       Jdbi jdbi,
-      OpenLineageQueueDao queueDao,
       OpenLineageService openLineageService,
       OpenLineageConfig config,
       MetricRegistry metricRegistry) {
     this(
         jdbi,
-        queueDao,
         openLineageService,
         config,
         metricRegistry,
@@ -126,14 +124,12 @@ public final class OpenLineageWorker implements Managed {
 
   OpenLineageWorker(
       Jdbi jdbi,
-      OpenLineageQueueDao queueDao,
       OpenLineageService openLineageService,
       OpenLineageConfig config,
       MetricRegistry metricRegistry,
       DoubleSupplier randomDouble) {
     this(
         jdbi,
-        queueDao,
         openLineageService,
         config,
         metricRegistry,
@@ -143,14 +139,12 @@ public final class OpenLineageWorker implements Managed {
 
   OpenLineageWorker(
       Jdbi jdbi,
-      OpenLineageQueueDao queueDao,
       OpenLineageService openLineageService,
       OpenLineageConfig config,
       MetricRegistry metricRegistry,
       DoubleSupplier randomDouble,
       IntFunction<ThreadPoolExecutor> processorFactory) {
     this.jdbi = Objects.requireNonNull(jdbi, "jdbi");
-    Objects.requireNonNull(queueDao, "queueDao");
     this.openLineageService = Objects.requireNonNull(openLineageService, "openLineageService");
     Objects.requireNonNull(config, "config");
     Objects.requireNonNull(metricRegistry, "metricRegistry");
@@ -197,7 +191,8 @@ public final class OpenLineageWorker implements Managed {
     postCommitDuration = metricRegistry.timer(metricName("post_commit_duration"));
     claimSize = metricRegistry.histogram(metricName("claim_size"));
     inFlight = metricRegistry.counter(metricName("in_flight"));
-    metricRegistry.register(metricName("running"), (Gauge<Integer>) () -> running.get() ? 1 : 0);
+    metricRegistry.register(
+        metricName("running"), (Gauge<Integer>) () -> lifecycle.get() == Lifecycle.RUNNING ? 1 : 0);
     metricRegistry.register(
         metricName("coordinator_alive"),
         (Gauge<Integer>)
@@ -213,16 +208,24 @@ public final class OpenLineageWorker implements Managed {
 
   @Override
   public synchronized void start() {
-    if (closed.get()) {
+    Lifecycle state = lifecycle.get();
+    if (state == Lifecycle.STOPPING || state == Lifecycle.STOPPED) {
       throw new IllegalStateException("OpenLineage worker has already been stopped");
     }
-    if (!started.compareAndSet(false, true)) {
+    if (state != Lifecycle.NEW) {
       return;
     }
 
-    running.set(true);
-    coordinator = namedThreadFactory("open-lineage-coordinator-%d").newThread(this::coordinate);
-    coordinator.start();
+    try {
+      coordinator = namedThreadFactory("open-lineage-coordinator-%d").newThread(this::coordinate);
+      lifecycle.set(Lifecycle.RUNNING);
+      coordinator.start();
+    } catch (RuntimeException | Error failure) {
+      coordinatorFailure = failure;
+      coordinatorFailures.mark();
+      lifecycle.set(Lifecycle.COORDINATOR_FAILED);
+      throw failure;
+    }
     wakeUp();
     log.info("Started OpenLineage worker {} with {} processor threads", workerId, workerThreads);
   }
@@ -233,6 +236,7 @@ public final class OpenLineageWorker implements Managed {
   }
 
   HealthStatus healthStatus() {
+    Lifecycle state = lifecycle.get();
     Throwable fatalFailure = coordinatorFailure;
     if (fatalFailure != null) {
       return new HealthStatus(false, "OpenLineage worker coordinator failed", fatalFailure);
@@ -241,60 +245,42 @@ public final class OpenLineageWorker implements Managed {
     if (fatalFailure != null) {
       return new HealthStatus(false, "OpenLineage worker task failed", fatalFailure);
     }
-    Throwable pollFailure = lastPollFailure;
-    if (pollFailure != null && consecutivePollFailures.get() >= PERSISTENT_POLL_FAILURES) {
+    PollFailure currentPollFailure = pollFailure.get();
+    if (currentPollFailure != null
+        && currentPollFailure.consecutiveFailures() >= PERSISTENT_POLL_FAILURES) {
       return new HealthStatus(
-          false, "OpenLineage queue polling is persistently failing", pollFailure);
+          false, "OpenLineage queue polling is persistently failing", currentPollFailure.failure());
     }
-    if (!started.get()) {
+    if (state == Lifecycle.NEW) {
       return new HealthStatus(false, "OpenLineage worker has not started", null);
     }
-    if (stopping.get() || closed.get()) {
+    if (state == Lifecycle.STOPPING || state == Lifecycle.STOPPED) {
       return new HealthStatus(false, "OpenLineage worker is stopping or stopped", null);
     }
 
     Thread coordinatorThread = coordinator;
-    if (!running.get() || coordinatorThread == null || !coordinatorThread.isAlive()) {
+    if (state != Lifecycle.RUNNING || coordinatorThread == null || !coordinatorThread.isAlive()) {
       return new HealthStatus(false, "OpenLineage worker coordinator is not running", null);
-    }
-
-    fatalFailure = coordinatorFailure;
-    if (fatalFailure != null) {
-      return new HealthStatus(false, "OpenLineage worker coordinator failed", fatalFailure);
-    }
-    fatalFailure = taskFailure.get();
-    if (fatalFailure != null) {
-      return new HealthStatus(false, "OpenLineage worker task failed", fatalFailure);
-    }
-    pollFailure = lastPollFailure;
-    if (pollFailure != null && consecutivePollFailures.get() >= PERSISTENT_POLL_FAILURES) {
-      return new HealthStatus(
-          false, "OpenLineage queue polling is persistently failing", pollFailure);
-    }
-    if (stopping.get() || closed.get() || !running.get()) {
-      return new HealthStatus(false, "OpenLineage worker is stopping or stopped", null);
     }
     return new HealthStatus(true, "OpenLineage worker is running", null);
   }
 
   /** Submits one generic drain task per currently free processor slot. */
   int runOneCycle() {
-    if (stopping.get() || closed.get()) {
+    if (isStopping()) {
       return 0;
     }
 
     int submitted = 0;
     int available = freeTaskSlots.availablePermits();
-    for (int slot = 0;
-        slot < available && !stopping.get() && !closed.get() && freeTaskSlots.tryAcquire();
-        slot++) {
+    for (int slot = 0; slot < available && !isStopping() && freeTaskSlots.tryAcquire(); slot++) {
       DrainTask task = new DrainTask();
       try {
         processors.execute(task);
         submitted++;
       } catch (RejectedExecutionException failure) {
         task.cancelBeforeStart();
-        if (!stopping.get() && !closed.get()) {
+        if (!isStopping()) {
           throw failure;
         }
         break;
@@ -314,8 +300,7 @@ public final class OpenLineageWorker implements Managed {
     EventOutcome lastOutcome = EventOutcome.IDLE;
     while (claimedEvents < projectionBatchSize
         && runtimeRunning.getAsBoolean()
-        && !stopping.get()
-        && !closed.get()
+        && !isStopping()
         && !Thread.currentThread().isInterrupted()) {
       ClaimResult result = processNextClaim(projectionBatchSize - claimedEvents);
       if (result.outcome() == EventOutcome.IDLE || result.outcome() == EventOutcome.POLL_FAILED) {
@@ -332,67 +317,65 @@ public final class OpenLineageWorker implements Managed {
   }
 
   private ClaimResult processNextClaim(int maxEvents) {
-    AtomicReference<List<OpenLineageQueueRow>> lockedRows = new AtomicReference<>();
+    ClaimAttempt attempt = new ClaimAttempt();
     TransactionBatch transactionBatch;
-    try {
-      transactionBatch =
-          jdbi.withHandle(
-              handle -> {
-                ConnectionRegistration registration = registerConnection(handle.getConnection());
-                try {
-                  return handle.inTransaction(
-                      transactionHandle -> {
-                        OpenLineageQueueDao transactionalQueueDao =
-                            transactionHandle.attach(OpenLineageQueueDao.class);
-                        List<OpenLineageQueueRow> rows;
-                        Timer.Context pollTimer = pollDuration.time();
-                        try {
-                          rows = transactionalQueueDao.lockNextDueBatch(maxEvents);
-                        } finally {
-                          pollTimer.stop();
-                        }
-                        if (rows == null) {
-                          throw new IllegalStateException("OpenLineage queue claim returned null");
-                        }
-                        if (rows.isEmpty()) {
-                          pollEmpty.inc();
-                          return TransactionBatch.idle();
-                        }
+    try (Handle handle = jdbi.open()) {
+      Connection connection = handle.getConnection();
+      registerConnection(connection);
+      try {
+        transactionBatch =
+            handle.inTransaction(
+                transactionHandle -> {
+                  OpenLineageQueueDao transactionalQueueDao =
+                      transactionHandle.attach(OpenLineageQueueDao.class);
+                  List<OpenLineageQueueRow> rows;
+                  try (Timer.Context ignored = pollDuration.time()) {
+                    rows = transactionalQueueDao.lockNextDueBatch(maxEvents);
+                  }
+                  if (rows == null) {
+                    throw new IllegalStateException("OpenLineage queue claim returned null");
+                  }
+                  if (rows.isEmpty()) {
+                    pollEmpty.inc();
+                    return TransactionBatch.idle();
+                  }
 
-                        lockedRows.set(rows);
-                        List<OpenLineageQueueRow> claimed = List.copyOf(rows);
-                        lockedRows.set(claimed);
-                        claimSize.update(claimed.size());
-                        selections.mark(claimed.size());
-                        validateClaim(claimed, maxEvents);
-                        Timer.Context processingTimer = processingDuration.time();
-                        try {
-                          return processLockedClaim(
-                              transactionHandle.getConnection(),
-                              transactionHandle.attach(OpenLineageDao.class),
-                              transactionalQueueDao,
-                              claimed);
-                        } finally {
-                          processingTimer.stop();
-                        }
-                      });
-                } finally {
-                  // withHandle closes (and may pool) the connection only after this callback
-                  // returns. Closing the registration here therefore follows commit/rollback and
-                  // cannot race a forced abort against later pool reuse.
-                  registration.close();
-                }
-              });
+                  attempt.selected = true;
+                  claimSize.update(rows.size());
+                  selections.mark(rows.size());
+                  validateClaim(rows, maxEvents);
+                  try (Timer.Context ignored = processingDuration.time()) {
+                    return processLockedClaim(
+                        transactionHandle.getConnection(),
+                        transactionHandle.attach(OpenLineageDao.class),
+                        transactionalQueueDao,
+                        rows);
+                  }
+                });
+        attempt.commitObserved = true;
+      } finally {
+        // The transaction has completed before this unregister. The enclosing resource closes
+        // (and may pool) the connection only afterward, so abort cannot race later pool reuse.
+        unregisterConnection(connection);
+      }
     } catch (Error failure) {
-      recordTaskFailure(failure);
+      if (attempt.commitObserved) {
+        recordUnexpectedPostCommitFailure(failure);
+      } else {
+        recordTaskFailure(failure);
+      }
       throw failure;
     } catch (RuntimeException failure) {
-      if (lockedRows.get() == null) {
+      if (attempt.commitObserved) {
+        recordUnexpectedPostCommitFailure(failure);
+        throw failure;
+      }
+      if (!attempt.selected) {
         recordPollFailure(failure);
         return ClaimResult.special(EventOutcome.POLL_FAILED);
       }
       if (isCancellation(failure)) {
-        if (stopping.get() || closed.get()) {
+        if (isStopping()) {
           return ClaimResult.special(EventOutcome.CANCELLED);
         }
         recordTaskFailure(failure);
@@ -408,10 +391,10 @@ public final class OpenLineageWorker implements Managed {
     clearPollFailure();
     try {
       return publishCommittedBatch(transactionBatch);
-    } catch (Error failure) {
+    } catch (RuntimeException | Error failure) {
       // Projection and acknowledgement have already committed. Preserve that durable result while
-      // making the fatal post-commit failure visible to health checks.
-      recordPostCommitFatalFailure(failure);
+      // making the unexpected post-commit failure visible to health checks.
+      recordUnexpectedPostCommitFailure(failure);
       throw failure;
     }
   }
@@ -444,21 +427,11 @@ public final class OpenLineageWorker implements Managed {
       OpenLineageQueueDao transactionalQueueDao,
       List<OpenLineageQueueRow> rows) {
     Savepoint projection = setSavepoint(connection, rows.get(0).id());
-    List<ProjectedEvent> projected;
+    List<TransactionResult> results = new ArrayList<>(rows.size());
     try {
-      List<QueuedEvent> queuedEvents = new ArrayList<>(rows.size());
       for (OpenLineageQueueRow row : rows) {
-        if (row.attemptCount() > maxAttempts) {
-          throw new IllegalArgumentException("maximum processing attempts exceeded");
-        }
-        queuedEvents.add(
-            new QueuedEvent(
-                row.id(), mapper.readValue(row.eventJson(), BaseEvent.class), row.eventJson()));
+        results.add(projectQueued(row, transactionalOpenLineageDao));
       }
-
-      projected =
-          openLineageService.processQueuedBatchInTransaction(
-              List.copyOf(queuedEvents), transactionalOpenLineageDao);
     } catch (Error failure) {
       throw failure;
     } catch (Exception failure) {
@@ -470,17 +443,10 @@ public final class OpenLineageWorker implements Managed {
       return processFallback(connection, transactionalOpenLineageDao, transactionalQueueDao, rows);
     }
 
-    validateProjectedEvents(rows, projected);
     releaseSavepoint(connection, projection, rows.get(0).id());
     transitionBatch(
         "acknowledge an OpenLineage queue claim", () -> transactionalQueueDao.ackLockedAll(rows));
-
-    List<TransactionResult> results = new ArrayList<>(rows.size());
-    for (int index = 0; index < rows.size(); index++) {
-      ProjectedEvent event = projected.get(index);
-      results.add(TransactionResult.succeeded(rows.get(index), event.event(), event.update()));
-    }
-    return new TransactionBatch(rows, List.copyOf(results));
+    return new TransactionBatch(rows, results);
   }
 
   private TransactionBatch processFallback(
@@ -509,7 +475,7 @@ public final class OpenLineageWorker implements Managed {
         blockedLanes.add(row.orderingKey());
       }
     }
-    return new TransactionBatch(rows, List.copyOf(results));
+    return new TransactionBatch(rows, results);
   }
 
   private TransactionResult processLockedWithMdc(
@@ -535,16 +501,9 @@ public final class OpenLineageWorker implements Managed {
       OpenLineageQueueRow row,
       boolean laneLockHeld) {
     Savepoint projection = setSavepoint(connection, row.id());
-    BaseEvent event;
-    UpdateLineageRow update;
+    TransactionResult result;
     try {
-      if (row.attemptCount() > maxAttempts) {
-        throw new IllegalArgumentException("maximum processing attempts exceeded");
-      }
-      event = mapper.readValue(row.eventJson(), BaseEvent.class);
-      update =
-          openLineageService.processQueuedInTransaction(
-              event, row.eventJson(), transactionalOpenLineageDao);
+      result = projectQueued(row, transactionalOpenLineageDao);
     } catch (Error failure) {
       throw failure;
     } catch (Exception failure) {
@@ -562,11 +521,7 @@ public final class OpenLineageWorker implements Managed {
             () -> {
               if (laneLockHeld) {
                 transactionalQueueDao.deadLetterLockedAfterLaneLock(
-                    row.orderingKey(),
-                    row.id(),
-                    row.attemptCount(),
-                    error,
-                    row.refreshDueOnAdvance());
+                    row.orderingKey(), row.id(), row.attemptCount(), error);
               } else {
                 transactionalQueueDao.deadLetterLocked(
                     row.orderingKey(), row.id(), row.attemptCount(), error);
@@ -593,12 +548,24 @@ public final class OpenLineageWorker implements Managed {
         "acknowledge",
         () -> {
           if (laneLockHeld) {
-            transactionalQueueDao.ackLockedAfterLaneLock(
-                row.orderingKey(), row.id(), row.refreshDueOnAdvance());
+            transactionalQueueDao.ackLockedAfterLaneLock(row.orderingKey(), row.id());
           } else {
             transactionalQueueDao.ackLocked(row.orderingKey(), row.id());
           }
         });
+    return result;
+  }
+
+  private TransactionResult projectQueued(
+      OpenLineageQueueRow row, OpenLineageDao transactionalOpenLineageDao)
+      throws JsonProcessingException {
+    if (row.attemptCount() > maxAttempts) {
+      throw new IllegalArgumentException("maximum processing attempts exceeded");
+    }
+    BaseEvent event = mapper.readValue(row.eventJson(), BaseEvent.class);
+    UpdateLineageRow update =
+        openLineageService.processQueuedInTransaction(
+            event, row.eventJson(), transactionalOpenLineageDao);
     return TransactionResult.succeeded(row, event, update);
   }
 
@@ -606,62 +573,41 @@ public final class OpenLineageWorker implements Managed {
     if (batch.claimedRows().isEmpty()) {
       return ClaimResult.special(EventOutcome.IDLE);
     }
-    if (batch.claimedRows().size() == 1) {
-      return new ClaimResult(1, 1, publishCommittedSingleton(batch.results().get(0)));
-    }
 
-    List<ProjectedEvent> committedEvents = new ArrayList<>();
+    int completionCount = 0;
+    TransactionResult completedResult = null;
     EventOutcome lastOutcome = EventOutcome.IDLE;
     for (TransactionResult result : batch.results()) {
-      OpenLineageQueueRow row = result.row();
-      Map<String, String> previousMdc = MDC.getCopyOfContextMap();
-      installMdc(row);
-      try {
-        if (result.outcome() == EventOutcome.RETRIED) {
-          retries.mark();
-          log.warn(
-              "Queued OpenLineage event {} failed on attempt {}; retrying in {} ms: {}",
-              row.id(),
-              row.attemptCount(),
-              result.retryDelayMillis(),
-              result.error());
-        } else if (result.outcome() == EventOutcome.DEAD_LETTERED) {
-          deadLetters.mark();
-          log.error(
-              "Dead-lettered queued OpenLineage event {} after attempt {}: {}",
-              row.id(),
-              row.attemptCount(),
-              result.error());
-        } else {
+      switch (result.outcome()) {
+        case COMPLETED -> {
           successes.mark();
-          committedEvents.add(new ProjectedEvent(row.id(), result.event(), result.update()));
+          completionCount++;
+          completedResult = result;
         }
-      } finally {
-        restoreMdc(previousMdc);
+        case RETRIED, DEAD_LETTERED -> recordCommittedFailure(result);
+        default ->
+            throw new IllegalStateException(
+                "Unexpected committed OpenLineage outcome " + result.outcome());
       }
       lastOutcome = result.outcome();
     }
 
-    if (!committedEvents.isEmpty()) {
+    if (completionCount > 0) {
       Map<String, String> previousMdc = MDC.getCopyOfContextMap();
-      installClaimMdc(batch.claimedRows());
-      Timer.Context postCommitTimer = postCommitDuration.time();
+      if (batch.claimedRows().size() == 1) {
+        installMdc(batch.claimedRows().get(0));
+      } else {
+        installClaimMdc(batch.claimedRows());
+      }
       try {
-        try {
+        try (Timer.Context ignored = postCommitDuration.time()) {
           int failures =
-              openLineageService.publishQueuedEventsBestEffort(List.copyOf(committedEvents));
+              publishCompletedBestEffort(batch.results(), completionCount, completedResult);
           if (failures > 0) {
             postCommitFailures.mark(failures);
           }
-        } catch (RuntimeException failure) {
-          postCommitFailures.mark();
-          log.error(
-              "Unexpected post-commit failure for OpenLineage queue claim containing {} event(s)",
-              committedEvents.size(),
-              failure);
         }
       } finally {
-        postCommitTimer.stop();
         restoreMdc(previousMdc);
       }
     }
@@ -669,56 +615,64 @@ public final class OpenLineageWorker implements Managed {
     return new ClaimResult(batch.claimedRows().size(), batch.results().size(), lastOutcome);
   }
 
-  private EventOutcome publishCommittedSingleton(TransactionResult result) {
-    OpenLineageQueueRow row = result.row();
-    if (result.outcome() == EventOutcome.RETRIED) {
-      retries.mark();
-      log.warn(
-          "Queued OpenLineage event {} failed on attempt {}; retrying in {} ms: {}",
-          row.id(),
-          row.attemptCount(),
-          result.retryDelayMillis(),
-          result.error());
-      return EventOutcome.RETRIED;
-    }
-    if (result.outcome() == EventOutcome.DEAD_LETTERED) {
-      deadLetters.mark();
-      log.error(
-          "Dead-lettered queued OpenLineage event {} after attempt {}: {}",
-          row.id(),
-          row.attemptCount(),
-          result.error());
-      return EventOutcome.DEAD_LETTERED;
+  private int publishCompletedBestEffort(
+      List<TransactionResult> results, int completionCount, TransactionResult completedResult) {
+    if (completionCount == 1) {
+      return completedResult.event() instanceof LineageEvent lineageEvent
+          ? openLineageService.publishQueuedEventBestEffort(lineageEvent, completedResult.update())
+          : 0;
     }
 
-    successes.mark();
-    Timer.Context postCommitTimer = postCommitDuration.time();
-    try {
-      try {
-        int failures =
-            openLineageService.publishQueuedEventBestEffort(result.event(), result.update());
-        if (failures > 0) {
-          postCommitFailures.mark(failures);
+    List<CommittedEvent> committedEvents = null;
+    for (TransactionResult result : results) {
+      if (result.outcome() == EventOutcome.COMPLETED
+          && result.event() instanceof LineageEvent lineageEvent) {
+        if (committedEvents == null) {
+          committedEvents = new ArrayList<>(completionCount);
         }
-      } catch (RuntimeException failure) {
-        postCommitFailures.mark();
+        committedEvents.add(new CommittedEvent(result.row().id(), lineageEvent, result.update()));
+      }
+    }
+    return committedEvents == null
+        ? 0
+        : openLineageService.publishQueuedEventsBestEffort(committedEvents);
+  }
+
+  private void recordCommittedFailure(TransactionResult result) {
+    OpenLineageQueueRow row = result.row();
+    Map<String, String> previousMdc = MDC.getCopyOfContextMap();
+    installMdc(row);
+    try {
+      if (result.outcome() == EventOutcome.RETRIED) {
+        retries.mark();
+        log.warn(
+            "Queued OpenLineage event {} failed on attempt {}; retrying in {} ms: {}",
+            row.id(),
+            row.attemptCount(),
+            result.retryDelayMillis(),
+            result.error());
+      } else {
+        deadLetters.mark();
         log.error(
-            "Unexpected post-commit failure for queued OpenLineage event {}", row.id(), failure);
+            "Dead-lettered queued OpenLineage event {} after attempt {}: {}",
+            row.id(),
+            row.attemptCount(),
+            result.error());
       }
     } finally {
-      postCommitTimer.stop();
+      restoreMdc(previousMdc);
     }
-    return EventOutcome.COMPLETED;
   }
 
   @Override
   public synchronized void stop() throws InterruptedException {
-    if (!stopping.compareAndSet(false, true)) {
+    Lifecycle state = lifecycle.get();
+    if (state == Lifecycle.STOPPING || state == Lifecycle.STOPPED) {
       return;
     }
+    lifecycle.set(Lifecycle.STOPPING);
 
     long softDeadline = shutdownDeadline();
-    running.set(false);
     processors.shutdown();
     wakeUp();
     Thread coordinatorThread = coordinator;
@@ -726,24 +680,8 @@ public final class OpenLineageWorker implements Managed {
       coordinatorThread.interrupt();
     }
 
-    InterruptedException interruption = null;
-    if (coordinatorThread != null) {
-      try {
-        joinUntil(coordinatorThread, softDeadline);
-      } catch (InterruptedException interrupted) {
-        interruption = interrupted;
-      }
-    }
-    long drainNanos = remainingNanos(softDeadline);
-    if (drainNanos > 0) {
-      try {
-        processors.awaitTermination(drainNanos, TimeUnit.NANOSECONDS);
-      } catch (InterruptedException interrupted) {
-        if (interruption == null) {
-          interruption = interrupted;
-        }
-      }
-    }
+    InterruptedException interruption =
+        awaitWorkerTermination(coordinatorThread, softDeadline, null);
 
     boolean forcedShutdown = false;
     boolean coordinatorAlive = coordinatorThread != null && coordinatorThread.isAlive();
@@ -768,28 +706,10 @@ public final class OpenLineageWorker implements Managed {
           interruption != null,
           neverStarted.size());
 
-      if (coordinatorThread != null) {
-        try {
-          joinUntil(coordinatorThread, hardDeadline);
-        } catch (InterruptedException interrupted) {
-          if (interruption == null) {
-            interruption = interrupted;
-          }
-        }
-      }
-      long cancelNanos = remainingNanos(hardDeadline);
-      if (cancelNanos > 0) {
-        try {
-          processors.awaitTermination(cancelNanos, TimeUnit.NANOSECONDS);
-        } catch (InterruptedException interrupted) {
-          if (interruption == null) {
-            interruption = interrupted;
-          }
-        }
-      }
+      interruption = awaitWorkerTermination(coordinatorThread, hardDeadline, interruption);
     }
 
-    closed.set(true);
+    lifecycle.set(Lifecycle.STOPPED);
     coordinatorAlive = coordinatorThread != null && coordinatorThread.isAlive();
     boolean processorsTerminated = processors.isTerminated();
     boolean connectionsRemain = activeConnectionCount() != 0;
@@ -816,13 +736,13 @@ public final class OpenLineageWorker implements Managed {
 
   private void coordinate() {
     try {
-      while (running.get()) {
+      while (lifecycle.get() == Lifecycle.RUNNING) {
         runOneCycle();
-        if (running.get()) {
+        if (lifecycle.get() == Lifecycle.RUNNING) {
           try {
             wakeSignals.poll(pollIntervalMillis, TimeUnit.MILLISECONDS);
           } catch (InterruptedException ignored) {
-            if (!running.get()) {
+            if (lifecycle.get() != Lifecycle.RUNNING) {
               return;
             }
           }
@@ -837,24 +757,31 @@ public final class OpenLineageWorker implements Managed {
       coordinatorFailures.mark();
       log.error("OpenLineage worker coordinator failed", failure);
     } finally {
-      running.set(false);
+      lifecycle.compareAndSet(Lifecycle.RUNNING, Lifecycle.COORDINATOR_FAILED);
     }
   }
 
   private void recordPollFailure(Throwable failure) {
     pollFailures.mark();
-    lastPollFailure = failure;
-    int failures = consecutivePollFailures.incrementAndGet();
+    PollFailure current =
+        pollFailure.updateAndGet(
+            previous ->
+                new PollFailure(
+                    previous == null
+                        ? 1
+                        : previous.consecutiveFailures() == Integer.MAX_VALUE
+                            ? Integer.MAX_VALUE
+                            : previous.consecutiveFailures() + 1,
+                    failure));
     log.error(
         "OpenLineage queue poll failed ({} consecutive failure{}); polling will continue",
-        failures,
-        failures == 1 ? "" : "s",
+        current.consecutiveFailures(),
+        current.consecutiveFailures() == 1 ? "" : "s",
         failure);
   }
 
   private void clearPollFailure() {
-    consecutivePollFailures.set(0);
-    lastPollFailure = null;
+    pollFailure.set(null);
   }
 
   private void recordTaskFailure(Throwable failure) {
@@ -866,7 +793,7 @@ public final class OpenLineageWorker implements Managed {
         failure);
   }
 
-  private void recordPostCommitFatalFailure(Throwable failure) {
+  private void recordUnexpectedPostCommitFailure(Throwable failure) {
     postCommitFailures.mark();
     taskFailures.mark();
     taskFailure.compareAndSet(null, failure);
@@ -876,23 +803,39 @@ public final class OpenLineageWorker implements Managed {
         failure);
   }
 
-  private ConnectionRegistration registerConnection(Connection connection) {
-    ConnectionRegistration registration = new ConnectionRegistration(connection);
+  private void registerConnection(Connection connection) {
+    Objects.requireNonNull(connection, "connection");
     synchronized (activeConnectionMonitor) {
-      activeConnections.add(registration);
+      activeConnections.add(connection);
       if (abortActiveConnections) {
-        registration.abort();
+        abortConnection(connection);
       }
     }
-    return registration;
+  }
+
+  private void unregisterConnection(Connection connection) {
+    synchronized (activeConnectionMonitor) {
+      activeConnections.remove(connection);
+    }
   }
 
   private void abortRegisteredConnections() {
     synchronized (activeConnectionMonitor) {
       abortActiveConnections = true;
-      for (ConnectionRegistration registration : new ArrayList<>(activeConnections)) {
-        registration.abort();
+      for (Connection connection : activeConnections) {
+        abortConnection(connection);
       }
+    }
+  }
+
+  private void abortConnection(Connection connection) {
+    try {
+      // pgjdbc schedules its abort command on the supplied executor. Running it directly keeps the
+      // active transaction registered until the socket has actually been closed.
+      connection.abort(Runnable::run);
+    } catch (SQLException | RuntimeException failure) {
+      connectionAbortFailed = true;
+      log.error("Failed to abort an active OpenLineage worker database connection", failure);
     }
   }
 
@@ -904,10 +847,6 @@ public final class OpenLineageWorker implements Managed {
 
   int availableTaskCapacity() {
     return freeTaskSlots.availablePermits();
-  }
-
-  int queuedProcessorTaskCount() {
-    return processors.getQueue().size();
   }
 
   long retryDelayMillis(int attemptCount) {
@@ -945,24 +884,6 @@ public final class OpenLineageWorker implements Managed {
     if (admissionId == null && rows.size() != 1) {
       throw new IllegalStateException(
           "Legacy OpenLineage queue admissions must be claimed as singletons");
-    }
-  }
-
-  private static void validateProjectedEvents(
-      List<OpenLineageQueueRow> rows, List<ProjectedEvent> projected) {
-    if (projected == null || projected.size() != rows.size()) {
-      throw new BatchProjectionContractException(
-          "Expected "
-              + rows.size()
-              + " projected OpenLineage events, but received "
-              + (projected == null ? "null" : projected.size()));
-    }
-    for (int index = 0; index < rows.size(); index++) {
-      ProjectedEvent event = projected.get(index);
-      if (event == null || event.queueId() != rows.get(index).id()) {
-        throw new BatchProjectionContractException(
-            "OpenLineage batch projection result does not match queue event at index " + index);
-      }
     }
   }
 
@@ -1145,12 +1066,43 @@ public final class OpenLineageWorker implements Managed {
     return Math.max(0, deadlineNanos - System.nanoTime());
   }
 
+  private boolean isStopping() {
+    Lifecycle state = lifecycle.get();
+    return state == Lifecycle.STOPPING || state == Lifecycle.STOPPED;
+  }
+
   private void cancelUnstartedTasks(List<Runnable> neverStarted) {
     for (Runnable runnable : neverStarted) {
       if (runnable instanceof DrainTask task) {
         task.cancelBeforeStart();
       }
     }
+  }
+
+  private InterruptedException awaitWorkerTermination(
+      Thread coordinatorThread, long deadlineNanos, InterruptedException firstInterruption) {
+    InterruptedException interruption = firstInterruption;
+    if (coordinatorThread != null) {
+      try {
+        joinUntil(coordinatorThread, deadlineNanos);
+      } catch (InterruptedException interrupted) {
+        if (interruption == null) {
+          interruption = interrupted;
+        }
+      }
+    }
+
+    long remainingNanos = remainingNanos(deadlineNanos);
+    if (remainingNanos > 0) {
+      try {
+        processors.awaitTermination(remainingNanos, TimeUnit.NANOSECONDS);
+      } catch (InterruptedException interrupted) {
+        if (interruption == null) {
+          interruption = interrupted;
+        }
+      }
+    }
+    return interruption;
   }
 
   private long shutdownDeadline() {
@@ -1167,6 +1119,14 @@ public final class OpenLineageWorker implements Managed {
     thread.join(remainingMillis, extraNanos);
   }
 
+  private enum Lifecycle {
+    NEW,
+    RUNNING,
+    COORDINATOR_FAILED,
+    STOPPING,
+    STOPPED
+  }
+
   enum EventOutcome {
     IDLE,
     COMPLETED,
@@ -1180,6 +1140,8 @@ public final class OpenLineageWorker implements Managed {
 
   record HealthStatus(boolean healthy, String message, Throwable failure) {}
 
+  private record PollFailure(int consecutiveFailures, Throwable failure) {}
+
   private record ClaimResult(int claimedEvents, int processedEvents, EventOutcome outcome) {
     private static ClaimResult special(EventOutcome outcome) {
       return new ClaimResult(0, 0, outcome);
@@ -1188,11 +1150,6 @@ public final class OpenLineageWorker implements Managed {
 
   private record TransactionBatch(
       List<OpenLineageQueueRow> claimedRows, List<TransactionResult> results) {
-    private TransactionBatch {
-      claimedRows = List.copyOf(claimedRows);
-      results = List.copyOf(results);
-    }
-
     private static TransactionBatch idle() {
       return new TransactionBatch(List.of(), List.of());
     }
@@ -1231,11 +1188,11 @@ public final class OpenLineageWorker implements Managed {
       inFlight.inc();
       TaskResult result = new TaskResult(0, EventOutcome.IDLE);
       try {
-        result = processTask(() -> !stopping.get() && !Thread.currentThread().isInterrupted());
+        result = processTask(() -> !isStopping() && !Thread.currentThread().isInterrupted());
       } finally {
         inFlight.dec();
         freeTaskSlots.release();
-        if (result.processedEvents() > 0 && running.get()) {
+        if (result.processedEvents() > 0 && lifecycle.get() == Lifecycle.RUNNING) {
           wakeUp();
         }
       }
@@ -1244,42 +1201,6 @@ public final class OpenLineageWorker implements Managed {
     private void cancelBeforeStart() {
       if (started.compareAndSet(false, true)) {
         freeTaskSlots.release();
-      }
-    }
-  }
-
-  private final class ConnectionRegistration implements AutoCloseable {
-    private final Connection connection;
-    private boolean closed;
-    private boolean aborted;
-
-    private ConnectionRegistration(Connection connection) {
-      this.connection = Objects.requireNonNull(connection, "connection");
-    }
-
-    private void abort() {
-      if (closed || aborted) {
-        return;
-      }
-      aborted = true;
-      try {
-        // pgjdbc schedules its abort command on the supplied executor. Running it directly keeps
-        // the active-transaction registration until the socket has actually been closed.
-        connection.abort(Runnable::run);
-      } catch (SQLException | RuntimeException failure) {
-        connectionAbortFailed = true;
-        log.error("Failed to abort an active OpenLineage worker database connection", failure);
-      }
-    }
-
-    @Override
-    public void close() {
-      synchronized (activeConnectionMonitor) {
-        if (closed) {
-          return;
-        }
-        activeConnections.remove(this);
-        closed = true;
       }
     }
   }
@@ -1302,9 +1223,8 @@ public final class OpenLineageWorker implements Managed {
     }
   }
 
-  private static final class BatchProjectionContractException extends RuntimeException {
-    private BatchProjectionContractException(String message) {
-      super(message);
-    }
+  private static final class ClaimAttempt {
+    private boolean selected;
+    private boolean commitObserved;
   }
 }

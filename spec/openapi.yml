@@ -634,21 +634,13 @@ paths:
         prepared before queue admission. Admission is atomic: the whole batch is committed in one
         queue transaction or none of it is committed; a batch is never partially admitted. A 204
         response confirms only that the entire batch was committed to the intake queue. Derived
-        lineage projections are processed asynchronously and may not be visible immediately. The
-        queue retains the request's membership under one internal nullable BIGINT admission ID; NULL
-        is reserved for unchanged singleton and legacy rows. Within a non-null admission, the
-        existing durable queue ID carries original event order, so no separate ordinal is stored.
-        Workers process currently ready events from that admission in ascending request order within
-        one or more bounded subsets while preserving ordering-lane heads and scheduling quanta. A
-        blocked or retrying ordering lane may split the request across subsets, so atomic admission
-        does not imply atomic projection visibility for the whole request. A successful batched
-        fast-path subset commits atomically. If ordinary fast-path projection fails, Marquez rolls
-        that subset back and falls back, in the same claim transaction, to the existing per-event
-        retry and dead-letter behavior. The queue retries database projection failures and can
-        ultimately dead-letter an event after repeated failures. Search indexing and run-transition
-        listener delivery happen after a queue
-        item is acknowledged and are best effort: they have no durable delivery guarantee, may be
-        missing, concurrent, or out of order, and are not retried by the intake queue. Any 5xx
+        lineage projections are processed asynchronously in bounded subsets and may not be visible
+        immediately. Atomic durable admission does not imply atomic projection visibility for the
+        whole batch. The queue retries database projection failures and can ultimately dead-letter an
+        event after repeated failures. Search indexing and run-transition listener delivery happen
+        after a queue item is acknowledged and are best effort: they have no durable delivery
+        guarantee, may be missing, concurrent, or out of order, and are not retried by the intake
+        queue. Any 5xx
         response during queue admission is commit-indeterminate: the entire queue transaction may
         already have committed even if Marquez did not observe the commit result. Clients that retry
         must tolerate duplicate events for every event in the batch.
@@ -1201,6 +1193,16 @@ components:
           maxItems: 1000
           items:
             $ref: '#/components/schemas/StatsPoint'
+      example:
+        metric: LINEAGE_EVENTS_START
+        scope: GLOBAL
+        startAt: '2024-01-01T00:00:00Z'
+        endAt: '2024-01-01T01:00:00Z'
+        rollup: PT1H
+        points:
+          - startInterval: '2024-01-01T00:00:00Z'
+            endInterval: '2024-01-01T01:00:00Z'
+            value: 0
 
     StatsError:
       type: object
@@ -1662,7 +1664,8 @@ components:
           description:  The description of the dataset.
           type: string
         createdByRun:
-          $ref: '#/components/schemas/Run'
+          allOf:
+            - $ref: '#/components/schemas/Run'
         facets:
           $ref: '#/components/schemas/DatasetFacets'
       required:
@@ -1876,7 +1879,8 @@ components:
           description: The description of the job.
           type: string
         latestRun:
-          $ref: '#/components/schemas/Run'
+          allOf:
+            - $ref: '#/components/schemas/Run'
         latestRuns:
           type: array
           items:
@@ -1966,7 +1970,8 @@ components:
           type: object
           deprecated: true
         latestRun:
-          $ref: '#/components/schemas/Run'
+          allOf:
+            - $ref: '#/components/schemas/Run'
         facets:
           $ref: '#/components/schemas/JobFacets'
       example:

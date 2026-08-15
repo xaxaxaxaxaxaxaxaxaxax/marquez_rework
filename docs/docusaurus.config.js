@@ -189,7 +189,7 @@ const config = {
                 docsPluginId: "classic",
                 config: {
                     burgers: {
-                        specPath: "openapi.yml",
+                        specPath: "../spec/openapi.yml",
                         outputDir: "docs/api",
                     }
                 }

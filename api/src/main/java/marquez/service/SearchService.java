@@ -5,17 +5,15 @@
 
 package marquez.service;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Base64;
-import java.util.BitSet;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import javax.validation.Valid;
@@ -39,7 +37,8 @@ import org.opensearch.client.opensearch.core.SearchResponse;
 import org.opensearch.client.opensearch.core.bulk.BulkOperation;
 import org.opensearch.client.opensearch.core.bulk.BulkResponseItem;
 import org.opensearch.client.opensearch.core.search.BuiltinHighlighterType;
-import org.opensearch.client.opensearch.core.search.HighlighterType;
+import org.opensearch.client.opensearch.core.search.Highlight;
+import org.opensearch.client.opensearch.core.search.HighlightField;
 import org.opensearch.client.transport.OpenSearchTransport;
 import org.opensearch.client.transport.endpoints.BooleanResponse;
 import org.opensearch.client.transport.rest_client.RestClientTransport;
@@ -49,6 +48,55 @@ public class SearchService {
   private static final Base64.Encoder ID_COMPONENT_ENCODER =
       Base64.getUrlEncoder().withoutPadding();
 
+  private enum DocumentKind {
+    DATASET(
+        "datasets",
+        "DATASET",
+        List.of(
+            "run_id",
+            "name",
+            "namespace",
+            "facets.schema.fields.name",
+            "facets.schema.fields.type",
+            "facets.columnLineage.fields.*.inputFields.name",
+            "facets.columnLineage.fields.*.inputFields.namespace",
+            "facets.columnLineage.fields.*.inputFields.field",
+            "facets.columnLineage.fields.*.transformationDescription",
+            "facets.columnLineage.fields.*.transformationType")),
+    JOB(
+        "jobs",
+        "JOB",
+        List.of(
+            "facets.sql.query",
+            "facets.sourceCode.sourceCode",
+            "facets.sourceCode.language",
+            "runFacets.processing_engine.name",
+            "run_id",
+            "name",
+            "namespace",
+            "type"));
+
+    private final String indexName;
+    private final String idDomain;
+    private final List<String> fields;
+    private final Highlight highlight;
+
+    DocumentKind(String indexName, String idDomain, List<String> fields) {
+      this.indexName = indexName;
+      this.idDomain = idDomain;
+      this.fields = fields;
+      HighlightField plainHighlight =
+          HighlightField.of(
+              field -> field.type(type -> type.builtin(BuiltinHighlighterType.Plain)));
+      this.highlight =
+          Highlight.of(
+              builder -> {
+                fields.forEach(field -> builder.fields(field, plainHighlight));
+                return builder;
+              });
+    }
+  }
+
   record IndexEntry(LineageEvent event, UUID effectiveRunUuid) {
     IndexEntry {
       Objects.requireNonNull(event, "event");
@@ -56,29 +104,25 @@ public class SearchService {
     }
   }
 
-  String[] DATASET_FIELDS = {
-    "run_id",
-    "name",
-    "namespace",
-    "facets.schema.fields.name",
-    "facets.schema.fields.type",
-    "facets.columnLineage.fields.*.inputFields.name",
-    "facets.columnLineage.fields.*.inputFields.namespace",
-    "facets.columnLineage.fields.*.inputFields.field",
-    "facets.columnLineage.fields.*.transformationDescription",
-    "facets.columnLineage.fields.*.transformationType"
-  };
+  @JsonInclude(JsonInclude.Include.ALWAYS)
+  private record JobIndexDocument(
+      @JsonProperty("run_id") String runId,
+      String eventType,
+      String name,
+      String type,
+      String namespace,
+      LineageEvent.JobFacet facets,
+      LineageEvent.RunFacet runFacets) {}
 
-  String[] JOB_FIELDS = {
-    "facets.sql.query",
-    "facets.sourceCode.sourceCode",
-    "facets.sourceCode.language",
-    "runFacets.processing_engine.name",
-    "run_id",
-    "name",
-    "namespace",
-    "type"
-  };
+  @JsonInclude(JsonInclude.Include.ALWAYS)
+  private record DatasetIndexDocument(
+      @JsonProperty("run_id") String runId,
+      String eventType,
+      String name,
+      LineageEvent.InputDatasetFacets inputFacets,
+      LineageEvent.OutputDatasetFacets outputFacets,
+      String namespace,
+      LineageEvent.DatasetFacets facets) {}
 
   private final OpenSearchClient openSearchClient;
   private final SearchConfig searchConfig;
@@ -127,57 +171,28 @@ public class SearchService {
   }
 
   public SearchResponse<ObjectNode> searchDatasets(String query) throws IOException {
-    return this.openSearchClient.search(
-        s ->
-            s.index("datasets")
-                .query(
-                    q ->
-                        q.multiMatch(
-                            m ->
-                                m.query(query)
-                                    .type(TextQueryType.PhrasePrefix)
-                                    .fields(Arrays.stream(DATASET_FIELDS).toList())
-                                    .operator(Operator.Or)))
-                .highlight(
-                    hl -> {
-                      for (String field : DATASET_FIELDS) {
-                        hl.fields(
-                            field,
-                            f ->
-                                f.type(
-                                    HighlighterType.of(
-                                        fn -> fn.builtin(BuiltinHighlighterType.Plain))));
-                      }
-                      return hl;
-                    }),
-        ObjectNode.class);
+    return search(DocumentKind.DATASET, query);
   }
 
   public SearchResponse<ObjectNode> searchJobs(String query) throws IOException {
+    return search(DocumentKind.JOB, query);
+  }
+
+  private SearchResponse<ObjectNode> search(DocumentKind kind, String query) throws IOException {
     return this.openSearchClient.search(
-        s -> {
-          s.index("jobs")
-              .query(
-                  q ->
-                      q.multiMatch(
-                          m ->
-                              m.query(query)
-                                  .type(TextQueryType.PhrasePrefix)
-                                  .fields(Arrays.stream(JOB_FIELDS).toList())
-                                  .operator(Operator.Or)));
-          s.highlight(
-              hl -> {
-                for (String field : JOB_FIELDS) {
-                  hl.fields(
-                      field,
-                      f ->
-                          f.type(
-                              HighlighterType.of(fn -> fn.builtin(BuiltinHighlighterType.Plain))));
-                }
-                return hl;
-              });
-          return s;
-        },
+        request ->
+            request
+                .index(kind.indexName)
+                .query(
+                    queryBuilder ->
+                        queryBuilder.multiMatch(
+                            multiMatch ->
+                                multiMatch
+                                    .query(query)
+                                    .type(TextQueryType.PhrasePrefix)
+                                    .fields(kind.fields)
+                                    .operator(Operator.Or)))
+                .highlight(kind.highlight),
         ObjectNode.class);
   }
 
@@ -203,81 +218,77 @@ public class SearchService {
       return 0;
     }
 
+    int entryCount = orderedEntries.size();
     List<BulkOperation> operations = new ArrayList<>();
-    List<Integer> operationOwners = new ArrayList<>();
-    BitSet failedEntries = new BitSet(orderedEntries.size());
-    BitSet submittedEntries = new BitSet(orderedEntries.size());
+    int[] operationEnds = new int[entryCount];
+    int materializationFailures = 0;
 
-    for (int entryIndex = 0; entryIndex < orderedEntries.size(); entryIndex++) {
+    for (int entryIndex = 0; entryIndex < entryCount; entryIndex++) {
       try {
         IndexEntry entry = orderedEntries.get(entryIndex);
         List<BulkOperation> entryOperations =
             buildIndexOperations(entry.event(), entry.effectiveRunUuid());
         operations.addAll(entryOperations);
-        for (int operation = 0; operation < entryOperations.size(); operation++) {
-          operationOwners.add(entryIndex);
-        }
-        submittedEntries.set(entryIndex);
       } catch (RuntimeException e) {
-        failedEntries.set(entryIndex);
+        materializationFailures++;
         log.error(
             "Failed to materialize OpenSearch operations for queued event at batch index {}",
             entryIndex,
             e);
       }
+      operationEnds[entryIndex] = operations.size();
     }
 
     if (operations.isEmpty()) {
-      return failedEntries.cardinality();
+      return materializationFailures;
     }
 
     try {
       BulkResponse response = openSearchClient.bulk(BulkRequest.of(b -> b.operations(operations)));
       if (!response.errors()) {
-        return failedEntries.cardinality();
+        return materializationFailures;
       }
 
       List<BulkResponseItem> responseItems = response.items();
       if (responseItems == null || responseItems.size() != operations.size()) {
-        failedEntries.or(submittedEntries);
         log.error(
             "OpenSearch bulk response could not be aligned to queued events: expected {} items, "
                 + "received {}",
             operations.size(),
             responseItems == null ? null : responseItems.size());
-        return failedEntries.cardinality();
+        return entryCount;
       }
 
-      boolean foundItemFailure = false;
+      int itemFailures = 0;
+      int entryIndex = 0;
+      int lastFailedEntry = -1;
       for (int operationIndex = 0; operationIndex < responseItems.size(); operationIndex++) {
+        while (operationIndex >= operationEnds[entryIndex]) {
+          entryIndex++;
+        }
         BulkResponseItem item = responseItems.get(operationIndex);
         if (item == null) {
-          failedEntries.or(submittedEntries);
           log.error("OpenSearch bulk response contained a null item");
-          return failedEntries.cardinality();
+          return entryCount;
         }
-        if (item.error() != null) {
-          foundItemFailure = true;
-          int entryIndex = operationOwners.get(operationIndex);
-          if (!failedEntries.get(entryIndex)) {
-            failedEntries.set(entryIndex);
-            log.error(
-                "OpenSearch bulk indexing failed for queued event at batch index {}: {}",
-                entryIndex,
-                describeFailure(item));
-          }
+        if (entryIndex != lastFailedEntry && item.error() != null) {
+          itemFailures++;
+          lastFailedEntry = entryIndex;
+          log.error(
+              "OpenSearch bulk indexing failed for queued event at batch index {}: {}",
+              entryIndex,
+              describeFailure(item));
         }
       }
 
-      if (!foundItemFailure) {
-        failedEntries.or(submittedEntries);
+      if (itemFailures == 0) {
         log.error("OpenSearch bulk response reported errors without a failed item");
+        return entryCount;
       }
-      return failedEntries.cardinality();
+      return materializationFailures + itemFailures;
     } catch (IOException | RuntimeException e) {
-      failedEntries.or(submittedEntries);
       log.error("Failed to bulk index queued OpenLineage events", e);
-      return failedEntries.cardinality();
+      return entryCount;
     }
   }
 
@@ -306,18 +317,14 @@ public class SearchService {
   }
 
   private List<BulkOperation> buildIndexOperations(LineageEvent event, UUID runUuid) {
-    int operationCount = 1;
-    if (event.getInputs() != null) {
-      operationCount += event.getInputs().size();
-    }
-    if (event.getOutputs() != null) {
-      operationCount += event.getOutputs().size();
-    }
+    List<LineageEvent.Dataset> inputs = Objects.requireNonNullElse(event.getInputs(), List.of());
+    List<LineageEvent.Dataset> outputs = Objects.requireNonNullElse(event.getOutputs(), List.of());
 
-    List<BulkOperation> operations = new ArrayList<>(operationCount);
-    addDatasetOperations(operations, event.getInputs(), runUuid, event);
-    addDatasetOperations(operations, event.getOutputs(), runUuid, event);
-    operations.add(buildJobIndexOperation(runUuid, event));
+    String runId = runUuid.toString();
+    List<BulkOperation> operations = new ArrayList<>(1 + inputs.size() + outputs.size());
+    addDatasetOperations(operations, inputs, runId, event);
+    addDatasetOperations(operations, outputs, runId, event);
+    operations.add(buildJobIndexOperation(runId, event));
     return operations;
   }
 
@@ -325,71 +332,74 @@ public class SearchService {
     return Utils.openLineageRunUuid(run.getRunId());
   }
 
-  private Map<String, Object> buildJobIndexRequest(
-      UUID runUuid, LineageEvent event, String canonicalNamespace) {
-    Map<String, Object> jsonMap = new HashMap<>();
-
-    jsonMap.put("run_id", runUuid.toString());
-    jsonMap.put("eventType", event.getEventType());
-    jsonMap.put("name", event.getJob().getName());
-    jsonMap.put("type", event.getJob().isStreamingJob() ? "STREAM" : "BATCH");
-    jsonMap.put("namespace", canonicalNamespace);
-    jsonMap.put("facets", event.getJob().getFacets());
-    jsonMap.put("runFacets", event.getRun().getFacets());
-    return jsonMap;
+  private JobIndexDocument buildJobIndexRequest(
+      String runId, LineageEvent event, String canonicalNamespace) {
+    LineageEvent.Job job = event.getJob();
+    return new JobIndexDocument(
+        runId,
+        event.getEventType(),
+        job.getName(),
+        job.isStreamingJob() ? "STREAM" : "BATCH",
+        canonicalNamespace,
+        job.getFacets(),
+        event.getRun().getFacets());
   }
 
-  private Map<String, Object> buildDatasetIndexRequest(
-      UUID runUuid, LineageEvent.Dataset dataset, LineageEvent event, String canonicalNamespace) {
-    Map<String, Object> jsonMap = new HashMap<>();
-    jsonMap.put("run_id", runUuid.toString());
-    jsonMap.put("eventType", event.getEventType());
-    jsonMap.put("name", dataset.getName());
-    jsonMap.put("inputFacets", dataset.getInputFacets());
-    jsonMap.put("outputFacets", dataset.getOutputFacets());
-    jsonMap.put("namespace", canonicalNamespace);
-    jsonMap.put("facets", dataset.getFacets());
-    return jsonMap;
+  private DatasetIndexDocument buildDatasetIndexRequest(
+      String runId, LineageEvent.Dataset dataset, LineageEvent event, String canonicalNamespace) {
+    return new DatasetIndexDocument(
+        runId,
+        event.getEventType(),
+        dataset.getName(),
+        dataset.getInputFacets(),
+        dataset.getOutputFacets(),
+        canonicalNamespace,
+        dataset.getFacets());
   }
 
-  private BulkOperation buildJobIndexOperation(UUID runUuid, LineageEvent event) {
+  private BulkOperation buildJobIndexOperation(String runId, LineageEvent event) {
     String canonicalNamespace = Utils.sanitizeOpenLineageNamespace(event.getJob().getNamespace());
     return BulkOperation.of(
         operation ->
             operation.index(
                 index ->
                     index
-                        .index("jobs")
-                        .id(indexDocumentId("JOB", canonicalNamespace, event.getJob().getName()))
-                        .document(buildJobIndexRequest(runUuid, event, canonicalNamespace))));
+                        .index(DocumentKind.JOB.indexName)
+                        .id(
+                            indexDocumentId(
+                                DocumentKind.JOB, canonicalNamespace, event.getJob().getName()))
+                        .document(buildJobIndexRequest(runId, event, canonicalNamespace))));
   }
 
   private void addDatasetOperations(
       List<BulkOperation> operations,
       List<LineageEvent.Dataset> datasets,
-      UUID runUuid,
+      String runId,
       LineageEvent event) {
-    if (datasets == null) {
-      return;
-    }
     for (LineageEvent.Dataset dataset : datasets) {
       String canonicalNamespace = Utils.sanitizeOpenLineageNamespace(dataset.getNamespace());
-      Map<String, Object> document =
-          buildDatasetIndexRequest(runUuid, dataset, event, canonicalNamespace);
+      DatasetIndexDocument document =
+          buildDatasetIndexRequest(runId, dataset, event, canonicalNamespace);
       operations.add(
           BulkOperation.of(
               operation ->
                   operation.index(
                       index ->
                           index
-                              .index("datasets")
-                              .id(indexDocumentId("DATASET", canonicalNamespace, dataset.getName()))
+                              .index(DocumentKind.DATASET.indexName)
+                              .id(
+                                  indexDocumentId(
+                                      DocumentKind.DATASET, canonicalNamespace, dataset.getName()))
                               .document(document))));
     }
   }
 
-  private static String indexDocumentId(String kind, String canonicalNamespace, String name) {
-    return kind + "." + encodeIdComponent(canonicalNamespace) + "." + encodeIdComponent(name);
+  private static String indexDocumentId(DocumentKind kind, String canonicalNamespace, String name) {
+    return kind.idDomain
+        + "."
+        + encodeIdComponent(canonicalNamespace)
+        + "."
+        + encodeIdComponent(name);
   }
 
   private static String encodeIdComponent(String value) {
