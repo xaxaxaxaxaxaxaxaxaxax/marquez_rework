@@ -1,0 +1,608 @@
+{
+  "$schema": "./performance-history.schema.json",
+  "schemaVersion": 1,
+  "runs": [
+    {
+      "id": "cumulative_2026-08-16_4a58567f",
+      "recordedAt": "2026-08-16",
+      "sourceRevision": "4a58567f5155867fb68e759641a4be25d45b4400",
+      "environment": {
+        "java": "17",
+        "postgresql": "14",
+        "databaseIsolation": "fresh Testcontainers database per variant",
+        "productionCapacityTest": false
+      },
+      "comparisons": [
+        {
+          "id": "native_hot_paths",
+          "baseline": {
+            "label": "upstream",
+            "gitRevision": "180f37b22387146187af1ef0279e3ee1d1ccd789"
+          },
+          "candidate": {
+            "label": "optimized_hot_paths",
+            "gitRevision": "6232e5ebd0d6c4bc32eee5334deb61fa039dfe1a"
+          },
+          "fixture": {
+            "jobs": 5000,
+            "jobVersions": 25000,
+            "runs": 10000,
+            "datasets": 20000,
+            "jobVersionIoMappings": 100030,
+            "columnLineageRows": 40000,
+            "warmupsPerOperation": 1,
+            "measurementsPerOperation": 7
+          },
+          "correctnessGates": [
+            "equal result checksums",
+            "one warm-up and seven measurements per operation"
+          ],
+          "scenarios": [
+            {
+              "id": "list_jobs_with_runs",
+              "label": "List 100 jobs with runs",
+              "metrics": {
+                "latencyMedian": {"baseline": 15224.6, "candidate": 29.9, "unit": "ms", "direction": "lower"},
+                "sqlCallsPerOperation": {"baseline": 301, "candidate": 2, "unit": "count", "direction": "lower"},
+                "explainActualTime": {"baseline": 490.2, "candidate": 1.89, "unit": "ms", "direction": "lower"}
+              }
+            },
+            {
+              "id": "list_runs_for_hot_job",
+              "label": "List 100 runs for a 5,001-run job",
+              "metrics": {
+                "latencyMedian": {"baseline": 138.3, "candidate": 16.5, "unit": "ms", "direction": "lower"},
+                "sqlCallsPerOperation": {"baseline": 1, "candidate": 1, "unit": "count", "direction": "lower"},
+                "explainActualTime": {"baseline": 131.2, "candidate": 5.7, "unit": "ms", "direction": "lower"}
+              }
+            },
+            {
+              "id": "job_lineage_depth_10",
+              "label": "Job lineage, depth 10",
+              "metrics": {
+                "latencyMedian": {"baseline": 304.8, "candidate": 4.34, "unit": "ms", "direction": "lower"},
+                "sqlCallsPerOperation": {"baseline": 1, "candidate": 1, "unit": "count", "direction": "lower"},
+                "explainActualTime": {"baseline": 313.3, "candidate": 1.31, "unit": "ms", "direction": "lower"}
+              }
+            },
+            {
+              "id": "lineage_service_depth_10",
+              "label": "Lineage service, depth 10",
+              "metrics": {
+                "latencyMedian": {"baseline": 323.5, "candidate": 12.6, "unit": "ms", "direction": "lower"},
+                "sqlCallsPerOperation": {"baseline": 25, "candidate": 4, "unit": "count", "direction": "lower"}
+              }
+            },
+            {
+              "id": "replace_job_version_inputs",
+              "label": "Replace 1,000 job-version input edges",
+              "metrics": {
+                "latencyMedian": {"baseline": 572.5, "candidate": 38.4, "unit": "ms", "direction": "lower"},
+                "sqlCallsPerOperation": {"baseline": 2000, "candidate": 2, "unit": "count", "direction": "lower"}
+              }
+            },
+            {
+              "id": "column_edges_32x4",
+              "label": "Upsert and read back 32 x 4 column edges",
+              "metrics": {
+                "latencyMedian": {"baseline": 14.1, "candidate": 8.62, "unit": "ms", "direction": "lower"},
+                "sqlCallsPerOperation": {"baseline": 64, "candidate": 2, "unit": "count", "direction": "lower"}
+              }
+            }
+          ]
+        },
+        {
+          "id": "lineage_http_cumulative",
+          "baseline": {
+            "label": "U74",
+            "gitRevision": "180f37b22387146187af1ef0279e3ee1d1ccd789"
+          },
+          "candidate": {
+            "label": "P76",
+            "gitRevision": "6232e5ebd0d6c4bc32eee5334deb61fa039dfe1a"
+          },
+          "fixture": {
+            "clients": 4,
+            "databases": 48,
+            "trialsPerCell": 3
+          },
+          "correctnessGates": [
+            "all requests returned HTTP 201",
+            "paired semantic-state SHA-256 digests matched",
+            "U74 and P74 schema and index fingerprints matched"
+          ],
+          "scenarios": [
+            {
+              "id": "m0",
+              "label": "Required-only event",
+              "metrics": {
+                "requestP50": {"baseline": 23.3, "candidate": 22.8, "unit": "ms", "direction": "lower"},
+                "requestP95": {"baseline": 29.7, "candidate": 31.5, "unit": "ms", "direction": "lower"},
+                "requestsPerSecond": {"baseline": 166, "candidate": 170, "unit": "requests/s", "direction": "higher"},
+                "sqlCallsPerRequest": {"baseline": 12, "candidate": 16.1, "unit": "count", "direction": "lower"},
+                "lsnBytesPerRequest": {"baseline": 2540, "candidate": 2629, "unit": "bytes", "direction": "lower"}
+              }
+            },
+            {
+              "id": "m1",
+              "label": "START/COMPLETE with 6 datasets and 8 fields",
+              "metrics": {
+                "requestP50": {"baseline": 54.6, "candidate": 32.1, "unit": "ms", "direction": "lower"},
+                "requestP95": {"baseline": 592.9, "candidate": 64, "unit": "ms", "direction": "lower"},
+                "requestsPerSecond": {"baseline": 13.3, "candidate": 101.3, "unit": "requests/s", "direction": "higher"},
+                "sqlCallsPerRequest": {"baseline": 152.6, "candidate": 112.5, "unit": "count", "direction": "lower"},
+                "lsnBytesPerRequest": {"baseline": 29094, "candidate": 29406, "unit": "bytes", "direction": "lower"}
+              }
+            },
+            {
+              "id": "m3",
+              "label": "M1 with 32 fields and 256 column edges",
+              "metrics": {
+                "requestP50": {"baseline": 57, "candidate": 35.1, "unit": "ms", "direction": "lower"},
+                "requestP95": {"baseline": 1855, "candidate": 106, "unit": "ms", "direction": "lower"},
+                "requestsPerSecond": {"baseline": 4.32, "candidate": 68.2, "unit": "requests/s", "direction": "higher"},
+                "sqlCallsPerRequest": {"baseline": 924.7, "candidate": 749.2, "unit": "count", "direction": "lower"},
+                "lsnBytesPerRequest": {"baseline": 201876, "candidate": 179377, "unit": "bytes", "direction": "lower"}
+              }
+            },
+            {
+              "id": "hot",
+              "label": "Identical COMPLETE replay",
+              "metrics": {
+                "requestP50": {"baseline": 513.7, "candidate": 51.7, "unit": "ms", "direction": "lower"},
+                "requestP95": {"baseline": 538.5, "candidate": 370.8, "unit": "ms", "direction": "lower"},
+                "requestsPerSecond": {"baseline": 7.73, "candidate": 37.8, "unit": "requests/s", "direction": "higher"},
+                "sqlCallsPerRequest": {"baseline": 243.1, "candidate": 155, "unit": "count", "direction": "lower"},
+                "lsnBytesPerRequest": {"baseline": 30689, "candidate": 30659, "unit": "bytes", "direction": "lower"}
+              }
+            }
+          ]
+        },
+        {
+          "id": "lineage_write_batching",
+          "baseline": {
+            "label": "hot_path_rework",
+            "gitRevision": "6232e5ebd0d6c4bc32eee5334deb61fa039dfe1a"
+          },
+          "candidate": {
+            "label": "write_batching",
+            "gitRevision": "b0e32478129e6165ecb1972c60f1c8b5c811c5dc"
+          },
+          "fixture": {
+            "clients": 4,
+            "databases": 32,
+            "minimumTrialsPerScenario": 3,
+            "m3Trials": 7
+          },
+          "correctnessGates": [
+            "all requests returned HTTP 201",
+            "all 16 paired semantic-state hashes matched"
+          ],
+          "scenarios": [
+            {
+              "id": "m0",
+              "label": "Required-only event",
+              "metrics": {
+                "requestP50": {"baseline": 23.5, "candidate": 23.2, "unit": "ms", "direction": "lower"},
+                "requestP95": {"baseline": 34.4, "candidate": 33.2, "unit": "ms", "direction": "lower"},
+                "requestsPerSecond": {"baseline": 156.9, "candidate": 168.1, "unit": "requests/s", "direction": "higher"},
+                "sqlCallsPerRequest": {"baseline": 16.1, "candidate": 11.1, "unit": "count", "direction": "lower"},
+                "sqlTimePerRequest": {"baseline": 0.53, "candidate": 0.52, "unit": "ms", "direction": "lower"},
+                "lsnBytesPerRequest": {"baseline": 2631, "candidate": 2629, "unit": "bytes", "direction": "lower"}
+              }
+            },
+            {
+              "id": "m1",
+              "label": "6 datasets and 8 fields",
+              "metrics": {
+                "requestP50": {"baseline": 31.3, "candidate": 31.9, "unit": "ms", "direction": "lower"},
+                "requestP95": {"baseline": 65.4, "candidate": 63.1, "unit": "ms", "direction": "lower"},
+                "requestsPerSecond": {"baseline": 104.3, "candidate": 108.5, "unit": "requests/s", "direction": "higher"},
+                "sqlCallsPerRequest": {"baseline": 112.5, "candidate": 74, "unit": "count", "direction": "lower"},
+                "sqlTimePerRequest": {"baseline": 2.62, "candidate": 2.39, "unit": "ms", "direction": "lower"},
+                "lsnBytesPerRequest": {"baseline": 29696, "candidate": 29933, "unit": "bytes", "direction": "lower"}
+              }
+            },
+            {
+              "id": "m3",
+              "label": "32 fields and 256 column edges",
+              "metrics": {
+                "requestP50": {"baseline": 41.5, "candidate": 36.8, "unit": "ms", "direction": "lower"},
+                "requestP95": {"baseline": 119.8, "candidate": 109.2, "unit": "ms", "direction": "lower"},
+                "requestsPerSecond": {"baseline": 59.7, "candidate": 64.6, "unit": "requests/s", "direction": "higher"},
+                "sqlCallsPerRequest": {"baseline": 749.2, "candidate": 638.2, "unit": "count", "direction": "lower"},
+                "sqlTimePerRequest": {"baseline": 10.11, "candidate": 10.3, "unit": "ms", "direction": "lower"},
+                "lsnBytesPerRequest": {"baseline": 179493, "candidate": 179165, "unit": "bytes", "direction": "lower"}
+              }
+            },
+            {
+              "id": "hot",
+              "label": "Identical COMPLETE replay",
+              "metrics": {
+                "requestP50": {"baseline": 53.6, "candidate": 47.7, "unit": "ms", "direction": "lower"},
+                "requestP95": {"baseline": 318.8, "candidate": 260, "unit": "ms", "direction": "lower"},
+                "requestsPerSecond": {"baseline": 37.9, "candidate": 40, "unit": "requests/s", "direction": "higher"},
+                "sqlCallsPerRequest": {"baseline": 155, "candidate": 83, "unit": "count", "direction": "lower"},
+                "sqlTimePerRequest": {"baseline": 126.69, "candidate": 119.6, "unit": "ms", "direction": "lower"},
+                "lsnBytesPerRequest": {"baseline": 29869, "candidate": 30281, "unit": "bytes", "direction": "lower"}
+              }
+            }
+          ]
+        },
+        {
+          "id": "lineage_transaction_compaction",
+          "baseline": {
+            "label": "write_batching",
+            "gitRevision": "b0e32478129e6165ecb1972c60f1c8b5c811c5dc"
+          },
+          "candidate": {
+            "label": "transaction_compaction",
+            "gitRevision": "7dc1343def36d707e3b515d78cf976c5de8e91bc"
+          },
+          "fixture": {
+            "clients": 4,
+            "databases": 24,
+            "trialsPerScenario": 3
+          },
+          "correctnessGates": [
+            "all requests returned HTTP 201",
+            "all 12 paired semantic-state SHA-256 digests matched"
+          ],
+          "scenarios": [
+            {
+              "id": "m0",
+              "label": "Required-only event",
+              "metrics": {
+                "requestP50": {"baseline": 25.3, "candidate": 24.9, "unit": "ms", "direction": "lower"},
+                "requestP95": {"baseline": 32.8, "candidate": 32.6, "unit": "ms", "direction": "lower"},
+                "requestsPerSecond": {"baseline": 154.5, "candidate": 156.5, "unit": "requests/s", "direction": "higher"},
+                "sqlCallsPerRequest": {"baseline": 11.1, "candidate": 9.1, "unit": "count", "direction": "lower"},
+                "sqlTimePerRequest": {"baseline": 0.51, "candidate": 0.56, "unit": "ms", "direction": "lower"},
+                "lsnBytesPerRequest": {"baseline": 2632, "candidate": 2627, "unit": "bytes", "direction": "lower"}
+              }
+            },
+            {
+              "id": "m1",
+              "label": "6 datasets and 8 fields",
+              "metrics": {
+                "requestP50": {"baseline": 34.3, "candidate": 34.2, "unit": "ms", "direction": "lower"},
+                "requestP95": {"baseline": 66.5, "candidate": 62, "unit": "ms", "direction": "lower"},
+                "requestsPerSecond": {"baseline": 96.8, "candidate": 105.8, "unit": "requests/s", "direction": "higher"},
+                "sqlCallsPerRequest": {"baseline": 74, "candidate": 61.5, "unit": "count", "direction": "lower"},
+                "sqlTimePerRequest": {"baseline": 2.52, "candidate": 2.44, "unit": "ms", "direction": "lower"},
+                "lsnBytesPerRequest": {"baseline": 29643, "candidate": 29929, "unit": "bytes", "direction": "lower"}
+              }
+            },
+            {
+              "id": "m3",
+              "label": "32 fields and 256 column edges",
+              "metrics": {
+                "requestP50": {"baseline": 40.9, "candidate": 38.1, "unit": "ms", "direction": "lower"},
+                "requestP95": {"baseline": 114.6, "candidate": 106.5, "unit": "ms", "direction": "lower"},
+                "requestsPerSecond": {"baseline": 64.1, "candidate": 66.2, "unit": "requests/s", "direction": "higher"},
+                "sqlCallsPerRequest": {"baseline": 638.2, "candidate": 625.6, "unit": "count", "direction": "lower"},
+                "sqlTimePerRequest": {"baseline": 9.76, "candidate": 9.36, "unit": "ms", "direction": "lower"},
+                "lsnBytesPerRequest": {"baseline": 178902, "candidate": 179740, "unit": "bytes", "direction": "lower"}
+              }
+            },
+            {
+              "id": "hot",
+              "label": "Identical COMPLETE replay",
+              "metrics": {
+                "requestP50": {"baseline": 65.7, "candidate": 54.3, "unit": "ms", "direction": "lower"},
+                "requestP95": {"baseline": 319.5, "candidate": 222.4, "unit": "ms", "direction": "lower"},
+                "requestsPerSecond": {"baseline": 35, "candidate": 42.5, "unit": "requests/s", "direction": "higher"},
+                "sqlCallsPerRequest": {"baseline": 83, "candidate": 62, "unit": "count", "direction": "lower"},
+                "sqlTimePerRequest": {"baseline": 133.86, "candidate": 109.92, "unit": "ms", "direction": "lower"},
+                "lsnBytesPerRequest": {"baseline": 29721, "candidate": 30091, "unit": "bytes", "direction": "lower"}
+              }
+            }
+          ]
+        },
+        {
+          "id": "durable_async_admission",
+          "baseline": {
+            "label": "synchronous",
+            "gitRevision": "7dc1343def36d707e3b515d78cf976c5de8e91bc"
+          },
+          "candidate": {
+            "label": "durable_running",
+            "gitRevision": "fabe1b495306bc8cad5351b2b1ac3308273459e4"
+          },
+          "fixture": {
+            "clients": 4,
+            "databases": 36,
+            "trialsPerCell": 3
+          },
+          "correctnessGates": [
+            "all requests returned HTTP 201",
+            "all 36 cells drained with zero live rows, dead letters, or unexpected retries",
+            "normalized semantic digests and integrity checks matched"
+          ],
+          "scenarios": [
+            {
+              "id": "m0",
+              "label": "Required-only event",
+              "metrics": {
+                "admissionP50": {"baseline": 25.7, "candidate": 12.3, "unit": "ms", "direction": "lower"},
+                "admissionP95": {"baseline": 31.5, "candidate": 18, "unit": "ms", "direction": "lower"},
+                "admissionRequestsPerSecond": {"baseline": 150.5, "candidate": 305.4, "unit": "requests/s", "direction": "higher"}
+              }
+            },
+            {
+              "id": "m1",
+              "label": "6 datasets and 8 fields",
+              "metrics": {
+                "admissionP50": {"baseline": 32.4, "candidate": 12.5, "unit": "ms", "direction": "lower"},
+                "admissionP95": {"baseline": 58.8, "candidate": 17.9, "unit": "ms", "direction": "lower"},
+                "admissionRequestsPerSecond": {"baseline": 111.7, "candidate": 301.8, "unit": "requests/s", "direction": "higher"}
+              }
+            },
+            {
+              "id": "m3",
+              "label": "32 fields and 256 column edges",
+              "metrics": {
+                "admissionP50": {"baseline": 40.1, "candidate": 16.4, "unit": "ms", "direction": "lower"},
+                "admissionP95": {"baseline": 119.5, "candidate": 26, "unit": "ms", "direction": "lower"},
+                "admissionRequestsPerSecond": {"baseline": 59.8, "candidate": 227.8, "unit": "requests/s", "direction": "higher"}
+              }
+            },
+            {
+              "id": "hot",
+              "label": "Identical COMPLETE replay",
+              "metrics": {
+                "admissionP50": {"baseline": 53.7, "candidate": 17.5, "unit": "ms", "direction": "lower"},
+                "admissionP95": {"baseline": 285.8, "candidate": 26.2, "unit": "ms", "direction": "lower"},
+                "admissionRequestsPerSecond": {"baseline": 42.3, "candidate": 204.5, "unit": "requests/s", "direction": "higher"}
+              }
+            }
+          ]
+        },
+        {
+          "id": "queue_head_selection",
+          "baseline": {
+            "label": "anti_predecessor"
+          },
+          "candidate": {
+            "label": "compact_heads"
+          },
+          "correctnessGates": [
+            "one unavailable hot head",
+            "100 independent due heads returned"
+          ],
+          "scenarios": [
+            {
+              "id": "100000_followers",
+              "label": "100,000 due followers behind the unavailable head",
+              "metrics": {
+                "selectionLatency": {"baseline": 308.49, "candidate": 0.842, "unit": "ms", "direction": "lower"},
+                "rowsVisited": {"baseline": 100099, "candidate": 101, "unit": "count", "direction": "lower"}
+              }
+            },
+            {
+              "id": "1000_followers",
+              "label": "1,000 due followers behind the unavailable head",
+              "metrics": {
+                "selectionLatency": {"baseline": 3.882, "candidate": 1.581, "unit": "ms", "direction": "lower"}
+              }
+            }
+          ]
+        }
+      ],
+      "snapshots": [
+        {
+          "id": "durable_async_running_end_to_end",
+          "revision": {
+            "label": "durable_running",
+            "gitRevision": "fabe1b495306bc8cad5351b2b1ac3308273459e4"
+          },
+          "fixture": {
+            "clients": 4,
+            "databases": 36,
+            "trialsPerCell": 3
+          },
+          "correctnessGates": [
+            "projection drain completed",
+            "semantic digests matched synchronous baseline"
+          ],
+          "scenarios": [
+            {
+              "id": "m0",
+              "label": "Required-only event",
+              "metrics": {
+                "endToEndRequestsPerSecond": {"value": 126.8, "unit": "requests/s", "direction": "higher"},
+                "pairedSynchronousRatio": {"value": 0.875, "unit": "ratio", "direction": "higher"},
+                "queueWalAtAdmission": {"value": 549, "unit": "bytes/request", "direction": "lower"}
+              }
+            },
+            {
+              "id": "m1",
+              "label": "6 datasets and 8 fields",
+              "metrics": {
+                "endToEndRequestsPerSecond": {"value": 95.8, "unit": "requests/s", "direction": "higher"},
+                "pairedSynchronousRatio": {"value": 0.869, "unit": "ratio", "direction": "higher"},
+                "queueWalAtAdmission": {"value": 713, "unit": "bytes/request", "direction": "lower"}
+              }
+            },
+            {
+              "id": "m3",
+              "label": "32 fields and 256 column edges",
+              "metrics": {
+                "endToEndRequestsPerSecond": {"value": 56.8, "unit": "requests/s", "direction": "higher"},
+                "pairedSynchronousRatio": {"value": 0.947, "unit": "ratio", "direction": "higher"},
+                "queueWalAtAdmission": {"value": 2196, "unit": "bytes/request", "direction": "lower"}
+              }
+            },
+            {
+              "id": "hot",
+              "label": "Identical COMPLETE replay",
+              "metrics": {
+                "endToEndRequestsPerSecond": {"value": 32.9, "unit": "requests/s", "direction": "higher"},
+                "pairedSynchronousRatio": {"value": 0.875, "unit": "ratio", "direction": "higher"},
+                "queueWalAtAdmission": {"value": 849, "unit": "bytes/request", "direction": "lower"}
+              }
+            }
+          ]
+        },
+        {
+          "id": "batch_admission_pre_v81",
+          "revision": {
+            "label": "pre_v81",
+            "gitRevision": "731ef8ea5945f39afb267ea0205424071e362bb8"
+          },
+          "fixture": {
+            "clients": 4,
+            "warmupEventsPerRoute": 8192,
+            "measuredEventsPerCell": 16384,
+            "trialsPerRoute": 7,
+            "eventsPerBatch": 128
+          },
+          "correctnessGates": [
+            "8,192 warm-up events per route",
+            "seven alternating measured cells per route",
+            "response, queue-row, unique-head, and zero-dead-letter invariants passed"
+          ],
+          "scenarios": [
+            {
+              "id": "single",
+              "label": "One event per POST /lineage request",
+              "metrics": {
+                "eventsPerSecond": {"value": 3084.5, "minimum": 2216.6, "maximum": 3154.4, "unit": "events/s", "direction": "higher"},
+                "requestsPerSecond": {"value": 3084.5, "unit": "requests/s", "direction": "higher"}
+              }
+            },
+            {
+              "id": "batch_128",
+              "label": "128 events per POST /lineage/batch request",
+              "metrics": {
+                "eventsPerSecond": {"value": 42223, "minimum": 39721.5, "maximum": 44812.4, "unit": "events/s", "direction": "higher"},
+                "requestsPerSecond": {"value": 329.9, "unit": "requests/s", "direction": "higher"},
+                "pairedThroughputGain": {"value": 13.88, "unit": "ratio", "direction": "higher"}
+              }
+            }
+          ]
+        },
+        {
+          "id": "stats_query",
+          "revision": {
+            "label": "bounded_stats_query",
+            "gitRevision": "122bb0802083b505b1e08e886513ae9f27fd8230"
+          },
+          "fixture": {
+            "lineageEvents": 100000,
+            "jobs": 5000,
+            "datasets": 20000,
+            "sources": 1000,
+            "buckets": 732,
+            "warmupsPerQuery": 1,
+            "measurementsPerQuery": 7
+          },
+          "correctnessGates": [
+            "732 fixed 12-hour buckets returned",
+            "one warm-up and seven alternating measurements",
+            "SHA-256 result checksums remained stable",
+            "EXPLAIN checks found no temporary spill"
+          ],
+          "scenarios": [
+            {
+              "id": "lineage_global",
+              "label": "Lineage, global",
+              "metrics": {"latency": {"value": 12.82, "minimum": 12.03, "maximum": 14.13, "unit": "ms", "direction": "lower"}}
+            },
+            {
+              "id": "lineage_hot_namespace",
+              "label": "Lineage, hot namespace",
+              "metrics": {"latency": {"value": 13.34, "minimum": 12.14, "maximum": 14.23, "unit": "ms", "direction": "lower"}}
+            },
+            {
+              "id": "lineage_rare_job",
+              "label": "Lineage, rare job",
+              "metrics": {"latency": {"value": 2.38, "minimum": 1.55, "maximum": 3.04, "unit": "ms", "direction": "lower"}}
+            },
+            {
+              "id": "lineage_rare_run",
+              "label": "Lineage, rare run",
+              "metrics": {"latency": {"value": 2.21, "minimum": 1.21, "maximum": 3.09, "unit": "ms", "direction": "lower"}}
+            },
+            {
+              "id": "jobs_global",
+              "label": "Jobs, global",
+              "metrics": {"latency": {"value": 3.12, "minimum": 2.23, "maximum": 4.35, "unit": "ms", "direction": "lower"}}
+            },
+            {
+              "id": "jobs_hot_namespace",
+              "label": "Jobs, hot namespace",
+              "metrics": {"latency": {"value": 3.15, "minimum": 2.36, "maximum": 4.78, "unit": "ms", "direction": "lower"}}
+            },
+            {
+              "id": "datasets_global",
+              "label": "Datasets, global",
+              "metrics": {"latency": {"value": 4.75, "minimum": 3.97, "maximum": 5.61, "unit": "ms", "direction": "lower"}}
+            },
+            {
+              "id": "datasets_hot_namespace",
+              "label": "Datasets, hot namespace",
+              "metrics": {"latency": {"value": 5.33, "minimum": 4.73, "maximum": 5.86, "unit": "ms", "direction": "lower"}}
+            },
+            {
+              "id": "sources_global",
+              "label": "Sources, global",
+              "metrics": {"latency": {"value": 2.47, "minimum": 1.83, "maximum": 2.77, "unit": "ms", "direction": "lower"}}
+            }
+          ]
+        },
+        {
+          "id": "index_footprint",
+          "revision": {
+            "label": "v75_trimmed_indexes",
+            "gitRevision": "6232e5ebd0d6c4bc32eee5334deb61fa039dfe1a"
+          },
+          "fixture": {
+            "jobs": 5000,
+            "jobVersions": 25000,
+            "runs": 10000,
+            "datasets": 20000,
+            "jobVersionIoMappings": 100030,
+            "columnLineageRows": 40000
+          },
+          "scenarios": [
+            {
+              "id": "initial_nine_index_design",
+              "label": "Initial nine-index design",
+              "metrics": {
+                "addedIndexBytes": {"value": 16613376, "unit": "bytes", "direction": "lower"},
+                "preexistingUserIndexBytes": {"value": 83222528, "unit": "bytes", "direction": "context"},
+                "identicalLoadWalIncrease": {"value": 9.5, "unit": "percent", "direction": "lower"}
+              }
+            },
+            {
+              "id": "final_v75_design",
+              "label": "Final seven-index V75 design",
+              "metrics": {
+                "addedIndexBytes": {"value": 7168000, "unit": "bytes", "direction": "lower"},
+                "savedVersusInitialDesign": {"value": 56.9, "unit": "percent", "direction": "higher"},
+                "identicalLoadWalIncrease": {"value": 6.1, "unit": "percent", "direction": "lower"}
+              }
+            },
+            {
+              "id": "mapping_churn_after_two_cycles",
+              "label": "Mapping indexes after two churn and vacuum cycles",
+              "metrics": {
+                "allocatedBeforeReindex": {"value": 28.97, "unit": "MiB", "direction": "lower"},
+                "allocatedAfterReindex": {"value": 5.36, "unit": "MiB", "direction": "lower"},
+                "bloatRatio": {"value": 5.4, "unit": "ratio", "direction": "lower"},
+                "reclaimableAllocation": {"value": 81.5, "unit": "percent", "direction": "lower"}
+              }
+            }
+          ]
+        }
+      ],
+      "caveats": [
+        "Warm-cache single-client medians from one machine are indicative, not production capacity.",
+        "Absolute index bytes depend on tuple width, UUID distribution, fill state, history per key, and PostgreSQL version.",
+        "Historical pre-V81 batch-admission results must be rerun before treating them as current capacity.",
+        "The batch projection benchmark has correctness and regression gates but no publishable post-rework result yet."
+      ]
+    }
+  ]
+}

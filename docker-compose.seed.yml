@@ -1,4 +1,3 @@
-version: "3.7"
 services:
   seed_marquez:
     image: "marquezproject/marquez:${TAG}"

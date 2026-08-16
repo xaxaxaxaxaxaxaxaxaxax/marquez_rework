@@ -5,15 +5,24 @@
 #
 # Usage: $ ./entrypoint.sh
 
-set -e
+set -euo pipefail
 
-if [[ -z "${MARQUEZ_CONFIG}" ]]; then
-  MARQUEZ_CONFIG='marquez.dev.yml'
-  echo "WARNING 'MARQUEZ_CONFIG' not set, using development configuration."
+if [[ $# -eq 0 ]]; then
+  if [[ -z "${MARQUEZ_CONFIG:-}" ]]; then
+    MARQUEZ_CONFIG='marquez.dev.yml'
+    echo "WARNING 'MARQUEZ_CONFIG' not set, using development configuration."
+  fi
+  set -- server "${MARQUEZ_CONFIG}"
 fi
 
-# Adjust java options for the http server
-JAVA_OPTS="${JAVA_OPTS} -Duser.timezone=UTC -Dlog4j2.formatMsgNoLookups=true"
+java_opts=()
+if [[ -n "${JAVA_OPTS:-}" ]]; then
+  read -r -a java_opts <<< "${JAVA_OPTS}"
+fi
 
-# Start http server with java options and configuration
-java ${JAVA_OPTS} -jar marquez-*.jar server ${MARQUEZ_CONFIG}
+exec java \
+  "${java_opts[@]}" \
+  -Duser.timezone=UTC \
+  -Dlog4j2.formatMsgNoLookups=true \
+  -jar /usr/src/app/marquez.jar \
+  "$@"

@@ -1,6 +1,7 @@
-version: "3.7"
 services:
   web:
     build:
       context: ./web
       dockerfile: Dockerfile
+      args:
+        REACT_APP_ADVANCED_SEARCH: ${SEARCH_ENABLED}

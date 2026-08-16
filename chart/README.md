@@ -1,276 +1,152 @@
-# Marquez [Helm Chart](https://helm.sh)
+# Marquez Helm chart
 
-Helm Chart for [Marquez](https://github.com/MarquezProject/marquez).
+This chart deploys the Marquez API, the optional frontend retained in this repository, and
+optionally a Bitnami PostgreSQL subchart.
 
-## TL;DR;
-Run all commands within the "chart" folder. This snapshot chart deliberately has no default API
-image tag: supply a tag for an image built from the current source, which includes the durable
-OpenLineage queue migrations and worker.
+The chart intentionally has no default `marquez.image.tag`. The released `0.51.1` backend image
+does not contain this snapshot's durable OpenLineage queue and migrations, so installation fails
+until a current-source image tag is supplied.
 
-```bash
-helm install marquez . --dependency-update \
-  --set marquez.image.tag=YOUR_CURRENT_SOURCE_IMAGE_TAG
-```
+## Prepare
 
-## Prerequisites
-
-- Kubernetes 1.12+
-- Helm 3.1.0
-
-## Installing the Chart
-
-To install the chart with the release name `marquez` using a fresh Postgres instance.
+Run these commands from the repository root:
 
 ```bash
-helm install marquez . --dependency-update \
-  --set postgresql.enabled=true \
-  --set marquez.image.tag=YOUR_CURRENT_SOURCE_IMAGE_TAG
+docker build -t REGISTRY/REPOSITORY:TAG .
+docker build -t REGISTRY/WEB_REPOSITORY:TAG web
+docker push REGISTRY/REPOSITORY:TAG
+docker push REGISTRY/WEB_REPOSITORY:TAG
+helm dependency build chart
 ```
 
-The released `0.51.1` API image is not compatible with this snapshot chart's durable-intake
-configuration. The release chart must not acquire a default API tag until the corresponding image
-has been published and verified.
+## Install
 
-> **Note:** For a list of parameters that can be overridden during installation, see the [configuration](#configuration) section.
-
-## Testing the Chart
-
-To confirm connectivity and availability of the installed components (API and optional website). Note
-that you may need to wait a minute or so for services to fully deploy.
+For an evaluation deployment with chart-managed PostgreSQL:
 
 ```bash
-helm test marquez
+helm upgrade --install marquez chart \
+  --namespace marquez \
+  --create-namespace \
+  --set marquez.image.registry=REGISTRY \
+  --set marquez.image.repository=REPOSITORY \
+  --set-string marquez.image.tag=TAG \
+  --set web.image.registry=REGISTRY \
+  --set web.image.repository=WEB_REPOSITORY \
+  --set-string web.image.tag=TAG \
+  --set postgresql.enabled=true
 ```
 
-## Uninstalling the Chart
-
-To uninstall the `marquez ` deployment:
+For an existing PostgreSQL service, create a secret whose key is `marquez-db-password`:
 
 ```bash
-helm delete marquez
+kubectl create namespace marquez --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n marquez create secret generic marquez-db \
+  --from-literal=marquez-db-password='DATABASE_PASSWORD'
 ```
 
-## Configuration
+Use a private values file such as:
 
-### [Marquez](https://github.com/MarquezProject/marquez) **parameters**
+```yaml
+marquez:
+  image:
+    registry: REGISTRY
+    repository: REPOSITORY
+    tag: TAG
+  existingSecretName: marquez-db
+  db:
+    host: postgres.example.internal
+    port: 5432
+    name: marquez
+    user: marquez
 
-| Parameter                    | Description                                                                   | Default                  |
-|------------------------------|-------------------------------------------------------------------------------|--------------------------|
-| `marquez.serviceAccount`     | K8s service account for Marquez Deploy                                        | `default`                |
-| `marquez.replicaCount`       | Number of desired replicas                                                    | `1`                      |
-| `marquez.image.registry`     | Marquez image registry                                                        | `docker.io`              |
-| `marquez.image.repository`   | Marquez image repository                                                      | `marquezproject/marquez` |
-| `marquez.image.tag`          | Required tag for an API image built from the current durable-intake source     | `""` (required)         |
-| `marquez.image.pullPolicy`   | Image pull policy                                                             | `IfNotPresent`           |
-| `marquez.existingSecretName` | Name of an existing secret containing db password ('marquez-db-password' key) | `nil`                    |
-| `marquez.db.host`            | PostgreSQL host                                                               | `localhost`              |
-| `marquez.db.port`            | PostgreSQL port                                                               | `5432`                   |
-| `marquez.db.name`            | PostgreSQL database                                                           | `marquez`                |
-| `marquez.db.user`            | PostgreSQL user                                                               | `buendia`                |
-| `marquez.db.password`        | PostgreSQL password                                                           | `macondo`                |
-| `marquez.db.autoCommentsEnabled` | Add automatic DAO.method comments to SQL statements                       | `false`                  |
-| `marquez.dbRetention.enabled`| Enables scheduled metadata/dead-letter retention; disabled leaves dead letters until a one-off purge | `false`                  |
-| `marquez.dbRetention.frequencyMins`| Apply retention policy at a frequency of every 'X' minutes              | `15`                     |
-| `marquez.dbRetention.numberOfRowsPerBatch`| Metadata deletion batch size and maximum dead letters per completed invocation | `1000`                   |
-| `marquez.dbRetention.retentionDays`| Metadata/dead-letter age threshold; live queue is never age-purged        | `7`                      |
-| `marquez.migrateOnStartup`   | Execute Flyway migration                                                      | `true`                   |
-| `marquez.hostname`           | Marquez hostname                                                              | `localhost`              |
-| `marquez.port`               | API host port                                                                 | `5000`                   |
-| `marquez.adminPort`          | Heath/Liveness host port                                                      | `5001`                   |
-| `marquez.openLineage.workerThreads` | Concurrent OpenLineage event processors per Marquez replica            | `8`                      |
-| `marquez.openLineage.projectionBatchSize` | Maximum events from one admitted batch projected per transaction; valid range 1-64, with 1 retaining singleton projection | `8` |
-| `marquez.openLineage.pollIntervalMillis` | Delay between database polls when no due work is found              | `1000`                   |
-| `marquez.openLineage.maxAttempts` | Maximum committed caught-failure count; the failure reaching it is dead-lettered | `10`              |
-| `marquez.openLineage.retryInitialDelayMillis` | Initial retry-backoff bound for processing failures             | `1000`                   |
-| `marquez.openLineage.retryMaxDelayMillis` | Maximum retry-backoff bound for processing failures                   | `60000`                  |
-| `marquez.openLineage.shutdownGracePeriodMillis` | Duration limit for each of the two worker executor waits; synchronous JDBC abort between them has no application deadline | `30000` |
-| `marquez.terminationGracePeriodSeconds` | Kubernetes pod termination grace; should exceed both worker wait intervals plus lifecycle overhead | `90` |
-| `marquez.resources.limits`   | K8s resource limit overrides                                                  | `nil`                    |
-| `marquez.resources.requests` | K8s resource requests overrides                                               | `nil`                    |
-| `marquez.podAnnotations`     | Additional annotations on Marquez Pods                                        | `{}`                     |
-| `marquez.extraContainers`    | Additional container definitions to include inside Marquez Pod                | `[]`                     |
+web:
+  image:
+    registry: REGISTRY
+    repository: WEB_REPOSITORY
+    tag: TAG
 
-With `marquez.db.autoCommentsEnabled: false`, SQL statements no longer include automatic
-`/* DAO.method */` prefixes in PostgreSQL logs and `pg_stat_statements` query text. Set it to `true`
-when those prefixes are operationally required; SQL behavior is otherwise unchanged.
+postgresql:
+  enabled: false
+```
 
-`marquez.openLineage.projectionBatchSize` is independent of the HTTP batch admission limit of
-1000. Projection claims may be smaller than the configured size, and one admitted batch may span
-multiple projection transactions. Larger values can hold more queue and metadata locks and create
-larger post-commit publication bursts. Monitor `claim_size`, `batch_fallback`, and transaction age
-when tuning the value; set it to `1` to retain singleton projection.
-
-Set `marquez.terminationGracePeriodSeconds` to more than twice
-`marquez.openLineage.shutdownGracePeriodMillis` (after converting milliseconds to seconds),
-with additional time for the remaining application lifecycle to stop. The defaults reserve 90 seconds
-for two 30-second worker shutdown windows plus lifecycle overhead.
-After the first window, Marquez interrupts remaining tasks and synchronously aborts their registered
-JDBC connections before waiting for the second window. The two executor waits have deadlines, but
-the synchronous driver abort calls between them do not; Kubernetes termination grace is the
-external bound if a driver call blocks. A completed abort rolls back its open projection transaction
-and releases its queue and metadata locks; a connection loss before commit or a database crash that
-aborts the transaction does not consume `maxAttempts`. A lost commit response is indeterminate and
-may mean projections plus acknowledgements already committed.
-Monitor the `open-lineage-worker` health check and the `forced_shutdown` and `shutdown_incomplete`
-worker meters. The health check is unhealthy after a fatal task or coordinator failure, or after
-three consecutive poll failures; a successful poll clears the persistent-poll condition, while a
-completed batch fallback, committed retry, or dead letter remains a healthy worker outcome.
-The chart uses Dropwizard's aggregate `/healthcheck` endpoint for both readiness and liveness, so an
-unhealthy worker removes the Pod from service and, after Kubernetes probe thresholds are exceeded,
-restarts it. Durable queued events survive that restart, but the API is briefly unavailable and
-otherwise healthy admission is not kept online independently of a failed projector.
-
-The former `marquez.openLineage.leaseDurationMillis` setting has been removed and is not a
-transaction-timeout setting. Remove it from custom application YAML before upgrading. Marquez
-explicitly rejects this removed property so it cannot be silently ignored; this is not a general
-unknown-property rejection policy.
-
-The Marquez Deployment uses the `Recreate` strategy so a chart upgrade does not overlap old and new
-lineage projector replicas. Kubernetes terminates the old Pods before creating the replacement
-Pods, so brief API unavailability is expected during a rollout. The Pod template includes a
-checksum of the rendered Marquez ConfigMap. Changes to `marquez.openLineage` or other rendered
-application settings therefore trigger replacement; `marquez.podAnnotations` are also applied
-directly to the Pod template.
-
-### [Marquez Web UI](https://github.com/MarquezProject/marquez-web) **parameters**
-
-| Parameter                | Description                     | Default        |
-|--------------------------|---------------------------------|----------------|
-| `web.enabled`            | Enables creation of Web UI      | `true`         |
-| `web.replicaCount`       | Number of desired replicas      | `1`            |
-| `web.image.registry`     | Marquez Web UI image registry   | `docker.io`    |
-| `web.image.repository`   | Marquez Web UI image repository | `marquezproject/marquez-web` |
-| `web.image.tag`          | Marquez Web UI image tag        | `0.51.1`       |
-| `web.image.pullPolicy`   | Image pull policy               | `IfNotPresent` |
-| `web.port`               | Marquez Web host port           | `3000`         |
-| `web.resources.limits`   | K8s resource limit overrides    | `nil`          |
-| `web.resources.requests` | K8s resource requests overrides | `nil`          |
-
-### [Postgres](https://github.com/bitnami/charts/blob/master/bitnami/postgresql/values.yaml) (sub-chart) **parameters**
-
-| Parameter                        | Description                     | Default   |
-|----------------------------------|---------------------------------|-----------|
-| `postgresql.enabled`             | Deploy PostgreSQL container(s)  | `false`   |
-| `postgresql.image.tag`           | PostgreSQL image version        | `12.1.0`  |
-| `postgresql.auth.username`       | PostgreSQL username             | `buendia` |
-| `postgresql.auth.password`       | PostgreSQL password             | `macondo` |
-| `postgresql.auth.database`       | PostgreSQL database             | `marquez` |
-| `postgresql.auth.existingSecret` | Name of existing secret object  | `nil`     |
-
-### Common **parameters**
-
-| Parameter              | Description                         | Default |
-|------------------------|-------------------------------------|---------|
-| `global.imageRegistry` | Globally overrides image registry   | `nil`   |
-| `commonLabels`         | Labels common to all resources      | `nil`   |
-| `commonAnnotations`    | Annotations common to all resources | `nil`   |
-| `affinity`             | Affinity for pod assignment         | `nil`   |
-| `tolerations`          | Tolerations for pod assignment      | `nil`   |
-| `nodeSelector`         | Node labels for pod assignment      | `nil`   |
-
-### Service **parameters**
-
-| Parameter             | Description                         | Default     |
-|-----------------------|-------------------------------------|-------------|
-| `service.type`        | Networking type of all services     | `ClusterIP` |
-| `service.port`        | Port to expose services             | `80`        |
-| `service.annotations` | Annotations applied to all services | `nil`       |
-
-### Ingress **parameters**
-
-| Parameter             | Description                        | Default |
-|-----------------------|------------------------------------|---------|
-| `ingress.enabled`     | Enables ingress settings           | `false` |
-| `ingress.annotations` | Annotations applied to ingress     | `nil`   |
-| `ingress.hosts`       | Hostname applied to ingress routes | `nil`   |
-| `ingress.tls`         | TLS settings for hostname          | `nil`   |
-
-## Local Installation Guide
-
-### Helm Managed Postgres
-
-The quickest way to install Marquez via Kubernetes is to create a local Postgres instance.
+Then deploy it:
 
 ```bash
-helm install marquez . --dependency-update \
-  --set postgresql.enabled=true \
-  --set marquez.image.tag=YOUR_CURRENT_SOURCE_IMAGE_TAG
+helm upgrade --install marquez chart \
+  --namespace marquez \
+  --create-namespace \
+  --values values.private.yaml
 ```
 
-### Docker Postgres
+Do not commit the private values file or database credentials.
 
-A Postgres database is configured within the Marquez project that use Docker to launch, which provides the added
-benefit of test data seeding. You can run the following command to create this instance of Postgres via Docker.
-Contents of the ```./../docker-compose-postgres..yml``` file can be customized
-to better represent your desired setup.
+## Important values
+
+| Value | Default | Purpose |
+| --- | --- | --- |
+| `marquez.image.registry` | `docker.io` | Backend image registry |
+| `marquez.image.repository` | `marquezproject/marquez` | Backend image repository |
+| `marquez.image.tag` | `""` | Required current-source backend tag |
+| `marquez.migrateOnStartup` | `true` | Apply Flyway migrations before serving |
+| `marquez.db.autoCommentsEnabled` | `false` | Prefix SQL with DAO method comments |
+| `marquez.openLineage.workerThreads` | `8` | Concurrent projection workers per replica |
+| `marquez.openLineage.projectionBatchSize` | `8` | Events projected per transaction, from 1 to 64 |
+| `marquez.openLineage.maxAttempts` | `10` | Committed failures before dead-lettering |
+| `marquez.terminationGracePeriodSeconds` | `90` | Pod shutdown bound |
+| `web.enabled` | `true` | Deploy the independently published Web UI image |
+| `postgresql.enabled` | `false` | Deploy chart-managed PostgreSQL |
+
+All supported settings and their comments are in [values.yaml](values.yaml).
+
+## Upgrade behavior
+
+The backend Deployment uses the `Recreate` strategy. Upgrades stop the old projector before the
+new one starts, preventing two incompatible projector versions from overlapping. Brief API
+unavailability during a rollout is expected.
+
+Durable intake requires Flyway migrations V77 through V83. If `marquez.migrateOnStartup=false`,
+run the current image's `db-migrate` command before starting the new application version.
+
+`marquez.openLineage.projectionBatchSize` is independent of the HTTP admission limit. Larger
+values reduce transaction count but may hold queue and metadata locks longer; use `1` for singleton
+projection.
+
+Set `marquez.terminationGracePeriodSeconds` higher than twice
+`marquez.openLineage.shutdownGracePeriodMillis` after converting milliseconds to seconds. The
+defaults allow two 30-second worker waits plus lifecycle overhead.
+
+The readiness and liveness probes use Dropwizard's aggregate `/healthcheck` endpoint. An unhealthy
+OpenLineage worker removes the Pod from service and eventually causes Kubernetes to restart it;
+durable queued events remain in PostgreSQL.
+
+## Validate
+
+Render and check the deployment contract before installing:
 
 ```bash
-docker-compose -f ./../docker-compose.db.yml -p marquez-postgres up
+helm dependency build chart
+bash chart/tests/render-contract.sh
+helm lint chart --set-string marquez.image.tag=validation
 ```
 
-Once the Postgres instance has been created, run the following command to locate the IP
-address of the database. Note you will need to un-escape the markdown.
+After installation:
 
 ```bash
-marquez_db_ip=$(docker inspect marquez-postgres_db_1 -f '{{range.NetworkSettings.Networks}}{{.Gateway}}{{end}}')
+kubectl rollout status deployment/marquez --namespace marquez
+helm test marquez --namespace marquez
 ```
 
-Deploy via Helm and update database values as needed, either via
-the `values.yaml` file or within the Helm CLI command. Again, remove the
-pesky markdown escape character before running this command.
+For a default `ClusterIP` service, access the API locally with:
 
 ```bash
-helm install marquez . --dependency-update \
-  --set marquez.db.host="${marquez_db_ip}" \
-  --set marquez.image.tag=YOUR_CURRENT_SOURCE_IMAGE_TAG
+kubectl port-forward --namespace marquez service/marquez 5000:80
 ```
 
-### Validation
+The API is then available at `http://localhost:5000/api/v1/namespaces`. If `web.enabled=true`,
+forward `service/marquez-web` in the same way, using local port `3000`.
 
-Once the Kubernetes pods and services have been installed (usually within 5-10 seconds), connectivity
-tests can be executed by running the following Helm command. You should see a status message
-of `Succeeded` for each test if the HTTP endpoints were reachable.
+## Uninstall
 
 ```bash
-helm test marquez
+helm uninstall marquez --namespace marquez
 ```
-
-If you haven't configured ingress within the Helm chart values, then you can use the
-following port forwarding rules to support local development.
-
-```bash
-kubectl port-forward svc/marquez 5000:80
-```
-
-```bash
-kubectl port-forward svc/marquez-web 3000:80
-```
-
-Once these rules are in place, you can view both the APIs and UI using the
-links below.
-* http://localhost:5000/api/v1/namespaces
-* http://localhost:3000
-
-### Troubleshooting
-If things aren't working as expected, you can find out more by viewing the `kubectl` logs.
-First, get the name of the pod that was installed by the Helm chart.
-
-```bash
-kubectl get pods
-```
-
-Plug this pod name into the following command, and it will display logs related
-to the database migrations. This makes it simple to see errors dealing with
-networking issues, credentials, etc.
-
-```bash
-kubectl logs -p <podName>
-```
-
-## Contributing
-
-See [CONTRIBUTING.md](https://github.com/MarquezProject/marquez-chart/blob/master/CONTRIBUTING.md) for more details about how to contribute.
-
-----
-SPDX-License-Identifier: Apache-2.0
-Copyright 2018-2023 contributors to the Marquez project.

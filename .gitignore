@@ -1,44 +1,27 @@
-**/*.python-version
-*.egg-info
 *.iml
 *.swp
-./**/*.class
-./out/*
-.actrc
+*.class
 .DS_Store
 .classpath
-.editorconfig
-.env
 .gradle/
 .idea/
 .project
-.pytest_cache
-.settings
+.settings/
 .vscode/
-__pycache__
-api/out/
-bin/
 build/
-clients/java/out/
 dist/
-examples/airflow/dags/
-examples/airflow/openlineage.env
-examples/airflow/requirements.txt
-examples/airflow/whl
-out/*
-venv
+out/
 
-# Marquez configuration
+# Local configuration and credentials
 marquez.yml
+values.private.yaml
 
-# Metadata
-metadata.json
+# k6 load-test output
+api/load-testing/metadata.json
+api/load-testing/results/
 
 # jenv
 .java-version
 
 # Dependent Helm charts
 chart/charts/
-
-# Dev
-changes.txt

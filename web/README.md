@@ -2,14 +2,15 @@
 
 ### Requirements
 
-To develop on this project, you need to have Node version 18 installed. In order to easily switch between node versions, we recommend using node version manager like [nvm](https://github.com/nvm-sh/nvm/blob/master/README.md)
+To develop on this project, use Node.js 22. A version manager such as
+[nvm](https://github.com/nvm-sh/nvm/blob/master/README.md) makes switching versions easier.
 
 ### Development
 
 1. Install dependencies:
 
    ```
-   $ npm install
+   $ npm ci
    ```
 
 2. Run webpack (with development server):

@@ -7,10 +7,13 @@
 
 set -e
 
-# Version of Marquez
+# Change working directory to project root
+project_root=$(git rev-parse --show-toplevel)
+cd "${project_root}/"
+
+# Published fallback and current-source image versions.
 readonly VERSION=0.51.1
-# Build version of Marquez
-readonly BUILD_VERSION=0.51.1
+readonly BUILD_VERSION="$(sed -n 's/^version=//p' gradle.properties)"
 
 title() {
   echo -e "\033[1m${1}\033[0m"
@@ -59,10 +62,6 @@ usage() {
   echo
 }
 
-# Change working directory to project root
-project_root=$(git rev-parse --show-toplevel)
-cd "${project_root}/"
-
 # Base docker compose file
 compose_files="-f docker-compose.yml"
 
@@ -93,7 +92,7 @@ while [ $# -gt 0 ]; do
        shift
        WEB_PORT="${1}"
        ;;
-    -d|'--db-port')
+    -p|'--db-port')
        shift
        DB_PORT="${1}"
        ;;

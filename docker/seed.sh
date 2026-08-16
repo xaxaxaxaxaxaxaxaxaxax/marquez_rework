@@ -27,4 +27,6 @@ sed -e "s/{{RUN_START_TIME}}/$NOW/" \
     -e "s/{{RUN_END_TIME_AFTER_10_MINUTES}}/$RUN_END_TIME_AFTER_10_MINUTES/" \
     metadata.template.json > metadata.json
 
-java -jar marquez-api-*.jar seed --url "${MARQUEZ_URL:-http://localhost:5000}" --metadata metadata.json
+java -jar /usr/src/app/marquez.jar seed \
+  --url "${MARQUEZ_URL:-http://localhost:5000}" \
+  --metadata metadata.json
