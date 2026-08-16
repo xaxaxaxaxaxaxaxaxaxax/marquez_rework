@@ -55,6 +55,12 @@ public interface BaseDao extends SqlObject {
   OpenLineageDao createOpenLineageDao();
 
   @CreateSqlObject
+  OpenLineageEventDao createOpenLineageEventDao();
+
+  @CreateSqlObject
+  RunIoStateDao createRunIoStateDao();
+
+  @CreateSqlObject
   ColumnLineageDao createColumnLineageDao();
 
   @CreateSqlObject

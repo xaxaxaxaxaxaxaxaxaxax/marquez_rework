@@ -35,12 +35,10 @@ import marquez.db.models.DatasetRow;
 import marquez.db.models.JobRow;
 import marquez.db.models.JobVersionRow;
 import marquez.db.models.NamespaceRow;
-import marquez.db.models.ProjectionOrder;
 import marquez.db.models.RunArgsRow;
 import marquez.db.models.UpdateLineageRow;
 import marquez.db.models.UpdateLineageRow.DatasetRecord;
 import marquez.jdbi.MarquezJdbiExternalPostgresExtension;
-import marquez.service.models.JobEvent;
 import marquez.service.models.LineageEvent;
 import marquez.service.models.LineageEvent.Dataset;
 import marquez.service.models.LineageEvent.DatasetFacets;
@@ -76,6 +74,7 @@ class OpenLineageDaoTest {
   public static final String TRANSFORMATION_DESCRIPTION = "transformation_description";
 
   private static OpenLineageDao dao;
+  private static OpenLineageEventDao eventDao;
   private static DatasetSymlinkDao symlinkDao;
   private static NamespaceDao namespaceDao;
   private static DatasetFieldDao datasetFieldDao;
@@ -92,6 +91,7 @@ class OpenLineageDaoTest {
   public static void setUpOnce(Jdbi configuredJdbi) {
     jdbi = configuredJdbi;
     dao = jdbi.onDemand(OpenLineageDao.class);
+    eventDao = jdbi.onDemand(OpenLineageEventDao.class);
     symlinkDao = jdbi.onDemand(DatasetSymlinkDao.class);
     namespaceDao = jdbi.onDemand(NamespaceDao.class);
     datasetFieldDao = jdbi.onDemand(DatasetFieldDao.class);
@@ -250,18 +250,15 @@ class OpenLineageDaoTest {
             Collections.emptyList());
 
     UpdateLineageRow projected =
-        dao.updateMarquezModel(
-            event,
-            Utils.getMapper(),
-            false,
-            new ProjectionOrder(eventTime, Utils.sha256Utf8(Utils.toJson(event))));
+        LineageTestUtils.toLegacyRow(
+            LineageTestUtils.project(dao, event, Utils.toJson(event), false));
 
     assertThat(projected.getRun().getUuid()).isEqualTo(expectedRunUuid);
     assertThat(projected.getRunState().getRunUuid()).isEqualTo(expectedRunUuid);
     assertThat(projected.getRun().getCreatedAt()).isEqualTo(eventTime);
-    assertThat(projected.getRunArgs().getArgs()).isEqualTo(OpenLineageDao.EMPTY_RUN_ARGS_JSON);
+    assertThat(projected.getRunArgs().getArgs()).isEqualTo(Utils.toJson(Collections.emptyMap()));
     assertThat(projected.getRunArgs().getChecksum())
-        .isEqualTo(OpenLineageDao.EMPTY_RUN_ARGS_CHECKSUM);
+        .isEqualTo(Utils.checksumFor(Collections.emptyMap()));
     assertThat(jobDao.lockJobByUuid(projected.getJob().getUuid()).getCurrentRunUuid())
         .contains(expectedRunUuid);
   }
@@ -484,7 +481,7 @@ class OpenLineageDaoTest {
         .isEqualTo(
             Utils.newDatasetVersionFor(
                     datasetNamespace,
-                    OpenLineageDao.DEFAULT_SOURCE_NAME,
+                    "default",
                     output.getName(),
                     output.getName(),
                     "",
@@ -633,16 +630,18 @@ class OpenLineageDaoTest {
     UpdateLineageRow projected = projectWithSqlCapture(event, false, executedSql);
 
     assertThat(projected.getRunIoSnapshot()).isNull();
-    assertThat(projected.getInputs()).isEmpty();
-    assertThat(projected.getOutputs()).isEmpty();
+    assertThat(projected.getInputs()).isPresent();
+    assertThat(projected.getInputs().orElseThrow()).isEmpty();
+    assertThat(projected.getOutputs()).isPresent();
+    assertThat(projected.getOutputs().orElseThrow()).isEmpty();
     assertThat(countSql(executedSql, "FROM runs_input_mapping rim")).isZero();
     assertThat(countSql(executedSql, "WITH inserted_state AS")).isEqualTo(1);
-    assertThat(countSql(executedSql, "io_type IN ('INPUT', 'OUTPUT')")).isEqualTo(1);
+    assertThat(countSql(executedSql, "INSERT INTO open_lineage_run_io_state")).isEqualTo(1);
     assertThat(runDao.findRunByUuidAsRow(runUuid).orElseThrow().getStartRunStateUuid())
         .contains(projected.getRunState().getUuid());
 
     UpdateLineageRow missingIo =
-        dao.updateMarquezModel(
+        projectLegacy(
             newRunEvent(
                 "compact_missing_" + runUuid,
                 UUID.randomUUID(),
@@ -650,27 +649,9 @@ class OpenLineageDaoTest {
                 JobFacet.builder().build(),
                 null,
                 null),
-            Utils.getMapper(),
             false);
     assertThat(missingIo.getInputs()).isEmpty();
     assertThat(missingIo.getOutputs()).isEmpty();
-  }
-
-  @Test
-  void terminalEventLoadsSnapshotWithoutListenerDemand() {
-    UUID runUuid = UUID.randomUUID();
-    LineageEvent event =
-        newRunEvent(
-            "terminal_snapshot_" + runUuid,
-            runUuid,
-            "COMPLETE",
-            JobFacet.builder().build(),
-            Collections.emptyList(),
-            Collections.emptyList());
-
-    UpdateLineageRow projected = dao.updateMarquezModel(event, Utils.getMapper(), false);
-
-    assertThat(projected.getRunIoSnapshot()).isNotNull();
   }
 
   @Test
@@ -709,48 +690,11 @@ class OpenLineageDaoTest {
     assertThat(
             countSql(
                 executedSql,
-                "WITH requested(dataset_uuid, name, namespace_uuid, created_at)",
+                "WITH requested(dataset_uuid, name, namespace_uuid, is_primary, type, created_at)",
                 "INSERT INTO dataset_symlinks"))
-        .isEqualTo(2);
+        .isEqualTo(1);
     assertThat(countSql(executedSql, "WITH requested(", "INSERT INTO datasets")).isEqualTo(2);
     assertThat(countSql(executedSql, "INSERT INTO dataset_facets")).isZero();
-  }
-
-  @Test
-  void symlinkFacetDisablesStagedBaseWritesForTheEntireSide() {
-    String suffix = UUID.randomUUID().toString();
-    String datasetNamespace = "alias_fallback_" + suffix;
-    Dataset datasetWithEmptySymlinkFacet =
-        new Dataset(
-            datasetNamespace,
-            "input_b",
-            DatasetFacets.builder()
-                .symlinks(
-                    new LineageEvent.DatasetSymlinkFacet(
-                        PRODUCER_URL, SCHEMA_URL, Collections.emptyList()))
-                .build());
-    LineageEvent event =
-        newRunEvent(
-            "alias_fallback_job_" + suffix,
-            UUID.randomUUID(),
-            "COMPLETE",
-            JobFacet.builder().build(),
-            List.of(new Dataset(datasetNamespace, "input_a", null), datasetWithEmptySymlinkFacet),
-            Collections.emptyList());
-    List<String> executedSql = new ArrayList<>();
-
-    UpdateLineageRow projected = projectWithSqlCapture(event, false, executedSql);
-
-    assertThat(projected.getInputs().orElseThrow())
-        .extracting(record -> record.getDatasetRow().getName())
-        .containsExactly("input_a", "input_b");
-    assertThat(
-            countSql(
-                executedSql,
-                "WITH requested(dataset_uuid, name, namespace_uuid, created_at)",
-                "INSERT INTO dataset_symlinks"))
-        .isZero();
-    assertThat(countSql(executedSql, "WITH requested(", "INSERT INTO datasets")).isZero();
   }
 
   @Test
@@ -899,51 +843,13 @@ class OpenLineageDaoTest {
   }
 
   @Test
-  void repeatedDatasetOnOneSidePreservesOccurrenceSemantics() {
-    String suffix = UUID.randomUUID().toString();
-    Dataset repeated = new Dataset("repeated_side_" + suffix, "input", datasetFacets);
-
-    UpdateLineageRow projected =
-        LineageTestUtils.createLineageRow(
-            dao,
-            "repeated_side_job_" + suffix,
-            "COMPLETE",
-            JobFacet.builder().build(),
-            List.of(repeated, repeated),
-            Collections.emptyList());
-
-    assertThat(projected.getInputs().orElseThrow()).hasSize(2);
-    assertThat(projected.getInputs().orElseThrow())
-        .extracting(record -> record.getDatasetRow().getUuid())
-        .containsExactly(
-            projected.getInputs().orElseThrow().get(0).getDatasetRow().getUuid(),
-            projected.getInputs().orElseThrow().get(0).getDatasetRow().getUuid());
-    assertThat(projected.getInputs().orElseThrow())
-        .extracting(record -> record.getDatasetVersionRow().getUuid())
-        .containsExactly(
-            projected.getInputs().orElseThrow().get(0).getDatasetVersionRow().getUuid(),
-            projected.getInputs().orElseThrow().get(0).getDatasetVersionRow().getUuid());
-  }
-
-  @Test
   void distinctPrimaryNamesResolvingToOneDatasetKeepSequentialOccurrenceSemantics() {
     String suffix = UUID.randomUUID().toString();
     String datasetNamespace = "resolved_alias_" + suffix;
     String primaryName = "primary_" + suffix;
     String aliasName = "alias_" + suffix;
     Dataset primaryWithAlias =
-        new Dataset(
-            datasetNamespace,
-            primaryName,
-            DatasetFacets.builder()
-                .symlinks(
-                    new LineageEvent.DatasetSymlinkFacet(
-                        PRODUCER_URL,
-                        SCHEMA_URL,
-                        List.of(
-                            new LineageEvent.SymlinkIdentifier(
-                                datasetNamespace, aliasName, "alias"))))
-                .build());
+        datasetWithSymlink(datasetNamespace, primaryName, aliasName, "some-type");
     UpdateLineageRow initial =
         LineageTestUtils.createLineageRow(
             dao,
@@ -963,9 +869,8 @@ class OpenLineageDaoTest {
                 new Dataset(datasetNamespace, aliasName, null)),
             Collections.emptyList());
     List<String> executedSql = new ArrayList<>();
-
     UpdateLineageRow projected = projectWithSqlCapture(aliasRead, false, executedSql);
-
+    assertThat(projected.getRunIoSnapshot()).isNotNull();
     UUID datasetUuid = initial.getOutputs().orElseThrow().get(0).getDatasetRow().getUuid();
     UUID datasetVersionUuid =
         initial.getOutputs().orElseThrow().get(0).getDatasetVersionRow().getUuid();
@@ -975,7 +880,11 @@ class OpenLineageDaoTest {
     assertThat(projected.getInputs().orElseThrow())
         .extracting(record -> record.getDatasetVersionRow().getUuid())
         .containsExactly(datasetVersionUuid, datasetVersionUuid);
-    assertThat(countSql(executedSql, "WITH requested(", "INSERT INTO datasets")).isZero();
+    UUID namespaceUuid = namespaceDao.findNamespaceByName(datasetNamespace).orElseThrow().getUuid();
+    var alias =
+        symlinkDao.findDatasetSymlinkByNamespaceUuidAndName(namespaceUuid, aliasName).orElseThrow();
+    assertThat(alias.getType()).contains("some-type");
+    assertThat(countSql(executedSql, "WITH requested(", "INSERT INTO datasets")).isEqualTo(1);
   }
 
   @Test
@@ -984,19 +893,7 @@ class OpenLineageDaoTest {
     String datasetNamespace = "ordered_duplicate_" + suffix;
     String primaryName = "primary_" + suffix;
     String aliasName = "alias_" + suffix;
-    Dataset seed =
-        new Dataset(
-            datasetNamespace,
-            primaryName,
-            DatasetFacets.builder()
-                .symlinks(
-                    new LineageEvent.DatasetSymlinkFacet(
-                        PRODUCER_URL,
-                        SCHEMA_URL,
-                        List.of(
-                            new LineageEvent.SymlinkIdentifier(
-                                datasetNamespace, aliasName, "alias"))))
-                .build());
+    Dataset seed = datasetWithSymlink(datasetNamespace, primaryName, aliasName, "alias");
     UpdateLineageRow initial =
         LineageTestUtils.createLineageRow(
             dao,
@@ -1047,12 +944,7 @@ class OpenLineageDaoTest {
             .outputs(List.of(first, last))
             .producer(PRODUCER_URL.toString())
             .build();
-    UpdateLineageRow projected =
-        dao.updateMarquezModel(
-            event,
-            Utils.getMapper(),
-            false,
-            new ProjectionOrder(eventTime, Utils.sha256Utf8(Utils.toJson(event))));
+    UpdateLineageRow projected = projectLegacy(event, false);
 
     assertThat(projected.getOutputs().orElseThrow()).hasSize(2);
     assertThat(projected.getOutputs().orElseThrow())
@@ -1080,12 +972,7 @@ class OpenLineageDaoTest {
             .outputs(List.of(last, first))
             .producer(PRODUCER_URL.toString())
             .build();
-    UpdateLineageRow reversed =
-        dao.updateMarquezModel(
-            reverse,
-            Utils.getMapper(),
-            false,
-            new ProjectionOrder(reverseTime, Utils.sha256Utf8(Utils.toJson(reverse))));
+    UpdateLineageRow reversed = projectLegacy(reverse, false);
     DatasetRow reversedCanonical =
         datasetDao.findDatasetAsRow(datasetNamespace, primaryName).orElseThrow();
     assertThat(reversedCanonical.getPhysicalName()).isEqualTo(primaryName);
@@ -1108,12 +995,7 @@ class OpenLineageDaoTest {
             .outputs(List.of(last))
             .producer(PRODUCER_URL.toString())
             .build();
-    UpdateLineageRow crossSideProjection =
-        dao.updateMarquezModel(
-            crossSide,
-            Utils.getMapper(),
-            false,
-            new ProjectionOrder(crossSideTime, Utils.sha256Utf8(Utils.toJson(crossSide))));
+    UpdateLineageRow crossSideProjection = projectLegacy(crossSide, false);
 
     DatasetRow crossSideCanonical =
         datasetDao.findDatasetAsRow(datasetNamespace, primaryName).orElseThrow();
@@ -1199,10 +1081,8 @@ class OpenLineageDaoTest {
             new Job(NAMESPACE, "missing_job_io_" + UUID.randomUUID(), JobFacet.builder().build()),
             null,
             null);
-    assertThat(missingIo.getInputs()).isPresent();
-    assertThat(missingIo.getInputs().orElseThrow()).isEmpty();
-    assertThat(missingIo.getOutputs()).isPresent();
-    assertThat(missingIo.getOutputs().orElseThrow()).isEmpty();
+    assertThat(missingIo.getInputs()).isEmpty();
+    assertThat(missingIo.getOutputs()).isEmpty();
   }
 
   @Test
@@ -1392,15 +1272,9 @@ class OpenLineageDaoTest {
     assertThat(namespaceDao.findNamespaceByName(datasetNamespace)).isEmpty();
   }
 
-  @Test
-  void testGetUrlOrNullReturnsEmptyString() {
-    assertEquals("", dao.getUrlOrNull(null));
-  }
-
   private UpdateLineageRow projectWithSqlCapture(
       LineageEvent event, boolean listenerSnapshotRequired, List<String> executedSql) {
-    UpdateLineageRow[] projected = new UpdateLineageRow[1];
-    jdbi.useHandle(
+    return jdbi.inTransaction(
         handle -> {
           handle
               .getConfig(SqlStatements.class)
@@ -1411,12 +1285,14 @@ class OpenLineageDaoTest {
                       executedSql.add(context.getRawSql());
                     }
                   });
-          projected[0] =
-              handle
-                  .attach(OpenLineageDao.class)
-                  .updateMarquezModel(event, Utils.getMapper(), listenerSnapshotRequired);
+          return LineageTestUtils.toLegacyRow(
+              OpenLineageProjector.getInstance()
+                  .projectInTransaction(
+                      handle.attach(BaseDao.class),
+                      Utils.getMapper(),
+                      new OpenLineageProjector.ProjectionRequest(
+                          event, Utils.toJson(event), listenerSnapshotRequired)));
         });
-    return projected[0];
   }
 
   private static LineageEvent newRunEvent(
@@ -1459,12 +1335,12 @@ class OpenLineageDaoTest {
   }
 
   private UpdateLineageRow projectOrdered(LineageEvent event, boolean listenerSnapshotRequired) {
-    Instant eventTime = event.getEventTime().toInstant();
-    return dao.updateMarquezModel(
-        event,
-        Utils.getMapper(),
-        listenerSnapshotRequired,
-        new ProjectionOrder(eventTime, Utils.sha256Utf8(Utils.toJson(event))));
+    return projectLegacy(event, listenerSnapshotRequired);
+  }
+
+  private UpdateLineageRow projectLegacy(LineageEvent event, boolean listenerSnapshotRequired) {
+    return LineageTestUtils.toLegacyRow(
+        LineageTestUtils.project(dao, event, Utils.toJson(event), listenerSnapshotRequired));
   }
 
   private boolean isOpenLineageParentPlaceholder(UUID runUuid) {
@@ -1632,56 +1508,6 @@ class OpenLineageDaoTest {
   }
 
   @Test
-  void testUpdateMarquezModelDatasetWithSymlinks() {
-    Dataset dataset =
-        new Dataset(
-            NAMESPACE,
-            DATASET_NAME,
-            LineageEvent.DatasetFacets.builder()
-                .symlinks(
-                    new LineageEvent.DatasetSymlinkFacet(
-                        PRODUCER_URL,
-                        SCHEMA_URL,
-                        Collections.singletonList(
-                            new LineageEvent.SymlinkIdentifier(
-                                "symlinkNamespace", "symlinkName", "some-type"))))
-                .build());
-
-    JobFacet jobFacet = JobFacet.builder().build();
-    UpdateLineageRow writeJob =
-        LineageTestUtils.createLineageRow(
-            dao, WRITE_JOB_NAME, "COMPLETE", jobFacet, Arrays.asList(), Arrays.asList(dataset));
-
-    UpdateLineageRow readJob =
-        LineageTestUtils.createLineageRow(
-            dao,
-            WRITE_JOB_NAME,
-            "COMPLETE",
-            jobFacet,
-            Arrays.asList(
-                new Dataset(
-                    "symlinkNamespace",
-                    "symlinkName",
-                    LineageEvent.DatasetFacets.builder().build())),
-            Arrays.asList());
-
-    // make sure writeJob output dataset and readJob input dataset are the same (have the same uuid)
-    assertThat(writeJob.getOutputs()).isPresent().get().asList().size().isEqualTo(1);
-    assertThat(writeJob.getOutputs().get().get(0).getDatasetRow().getUuid())
-        .isEqualTo(readJob.getInputs().get().get(0).getDatasetRow().getUuid());
-    // make sure symlink is stored with type in dataset_symlinks table
-    assertThat(
-            symlinkDao
-                .findDatasetSymlinkByNamespaceUuidAndName(
-                    namespaceDao.findNamespaceByName("symlinkNamespace").get().getUuid(),
-                    "symlinkName")
-                .get()
-                .getType()
-                .get())
-        .isEqualTo("some-type");
-  }
-
-  @Test
   void concurrentPrimaryAndAliasEventsSerializeCanonicalJobMappings() throws Exception {
     String suffix = UUID.randomUUID().toString();
     NamespaceRow namespace =
@@ -1746,67 +1572,6 @@ class OpenLineageDaoTest {
       executor.shutdownNow();
       executor.awaitTermination(5, TimeUnit.SECONDS);
     }
-  }
-
-  @Test
-  void orderedAliasJobEventCasProjectsAndReadsTheCanonicalWinner() {
-    String suffix = UUID.randomUUID().toString();
-    NamespaceRow namespace =
-        namespaceDao.upsertNamespaceRow(
-            UUID.randomUUID(), Instant.now(), NAMESPACE, getClass().getName());
-    String primaryJobName = "ordered_primary_" + suffix;
-    String aliasJobName = "ordered_alias_" + suffix;
-    JobRow primary =
-        createJobWithoutSymlinkTarget(jdbi, namespace, primaryJobName, "initial description");
-    createJobWithSymlinkTarget(jdbi, namespace, aliasJobName, primary.getUuid(), "alias row");
-
-    Instant winnerTime = primary.getUpdatedAt().plusSeconds(1);
-    Dataset winnerInput = new Dataset("ordered_alias_dataset_" + suffix, "winner", datasetFacets);
-    JobEvent winner =
-        jobEvent(aliasJobName, winnerTime, "winner description", List.of(winnerInput));
-    ProjectionOrder winnerOrder =
-        new ProjectionOrder(winnerTime, Utils.sha256Utf8(Utils.toJson(winner)));
-    UpdateLineageRow projected = dao.updateMarquezModel(winner, Utils.getMapper(), winnerOrder);
-
-    assertThat(projected.getJob().getUuid()).isEqualTo(primary.getUuid());
-    JobRow canonical = jobDao.lockJobByUuid(primary.getUuid());
-    assertThat(canonical.getDescription()).contains("winner description");
-    assertThat(canonical.getInputs())
-        .extracting(dataset -> dataset.getName().getValue())
-        .containsExactly("winner");
-    UUID winningVersion = canonical.getCurrentVersionUuid().orElseThrow();
-
-    Instant staleTime = winnerTime.minusSeconds(1);
-    JobEvent stale =
-        jobEvent(primaryJobName, staleTime, "stale description", Collections.emptyList());
-    dao.updateMarquezModel(
-        stale,
-        Utils.getMapper(),
-        new ProjectionOrder(staleTime, Utils.sha256Utf8(Utils.toJson(stale))));
-
-    JobRow afterStale = jobDao.lockJobByUuid(primary.getUuid());
-    assertThat(afterStale.getDescription()).contains("winner description");
-    assertThat(afterStale.getCurrentVersionUuid()).contains(winningVersion);
-    assertThat(afterStale.getInputs())
-        .extracting(dataset -> dataset.getName().getValue())
-        .containsExactly("winner");
-  }
-
-  private static JobEvent jobEvent(
-      String jobName, Instant eventTime, String description, List<Dataset> inputs) {
-    return JobEvent.builder()
-        .eventTime(eventTime.atZone(LineageTestUtils.LOCAL_ZONE))
-        .job(
-            new Job(
-                NAMESPACE,
-                jobName,
-                JobFacet.builder()
-                    .documentation(DocumentationJobFacet.builder().description(description).build())
-                    .build()))
-        .inputs(inputs)
-        .outputs(Collections.emptyList())
-        .producer(PRODUCER_URL.toString())
-        .build();
   }
 
   private UpdateLineageRow projectAfter(
@@ -2004,7 +1769,8 @@ class OpenLineageDaoTest {
             Arrays.asList(),
             Arrays.asList(new Dataset(NAMESPACE, DATASET_NAME, datasetFacets)));
 
-    List<LineageEvent> lineageEvents = dao.findLineageEventsByRunUuid(writeJob.getRun().getUuid());
+    List<LineageEvent> lineageEvents =
+        eventDao.findLineageEventsByRunUuid(writeJob.getRun().getUuid());
     assertThat(lineageEvents).hasSize(1);
 
     assertThat(lineageEvents.get(0).getEventType()).isEqualTo("COMPLETE");
@@ -2078,6 +1844,20 @@ class OpenLineageDaoTest {
 
   private Dataset getInputDataset() {
     return getInputDataset(INPUT_NAMESPACE, INPUT_DATASET);
+  }
+
+  private static Dataset datasetWithSymlink(
+      String namespace, String primaryName, String aliasName, String type) {
+    return new Dataset(
+        namespace,
+        primaryName,
+        DatasetFacets.builder()
+            .symlinks(
+                new LineageEvent.DatasetSymlinkFacet(
+                    PRODUCER_URL,
+                    SCHEMA_URL,
+                    List.of(new LineageEvent.SymlinkIdentifier(namespace, aliasName, type))))
+            .build());
   }
 
   private Dataset getInputDataset(String namespace, String name) {

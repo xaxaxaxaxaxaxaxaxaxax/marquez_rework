@@ -33,12 +33,12 @@ import marquez.common.Utils;
 import marquez.common.models.FieldName;
 import marquez.common.models.JobType;
 import marquez.common.models.RunState;
+import marquez.db.BaseDao;
 import marquez.db.DatasetDao;
 import marquez.db.DatasetVersionDao;
 import marquez.db.JobDao;
 import marquez.db.JobVersionDao;
 import marquez.db.NamespaceDao;
-import marquez.db.OpenLineageDao;
 import marquez.db.RunArgsDao;
 import marquez.db.RunDao;
 import marquez.db.models.DatasetVersionRow;
@@ -86,7 +86,7 @@ public class OpenLineageServiceIntegrationTest {
   private RunService runService;
 
   private JobService jobService;
-  private OpenLineageDao openLineageDao;
+  private BaseDao baseDao;
   private Jdbi jdbi;
   private JobDao jobDao;
   private JobVersionDao jobVersionDao;
@@ -125,11 +125,13 @@ public class OpenLineageServiceIntegrationTest {
               Arrays.asList(
                   Resources.getResource("open_lineage/listener/1.json").toURI(),
                   Resources.getResource("open_lineage/listener/2.json").toURI()),
-              new ExpectedResults(3, 2, 2, 1)
+              // Each reported side replaces that side's prior state; listener/2 reports one of
+              // each, rather than extending listener/1's two inputs and one output.
+              new ExpectedResults(1, 1, 2, 1)
             },
             new Object[] {
               Arrays.asList(Resources.getResource(EVENT_LARGE).toURI()),
-              new ExpectedResults(2, 1, 1, 1)
+              new ExpectedResults(1, 1, 1, 1)
             })
         .collect(Collectors.toList());
   }
@@ -153,7 +155,7 @@ public class OpenLineageServiceIntegrationTest {
   @BeforeEach
   public void setup(Jdbi jdbi) throws SQLException {
     this.jdbi = jdbi;
-    openLineageDao = jdbi.onDemand(OpenLineageDao.class);
+    baseDao = jdbi.onDemand(BaseDao.class);
     datasetVersionDao = jdbi.onDemand(DatasetVersionDao.class);
     jobDao = jdbi.onDemand(JobDao.class);
     jobVersionDao = jdbi.onDemand(JobVersionDao.class);
@@ -166,7 +168,7 @@ public class OpenLineageServiceIntegrationTest {
     when(runService.notify(runOutputListener.capture())).thenReturn(0);
     runTransitionListener = ArgumentCaptor.forClass(RunTransition.class);
     when(runService.notify(runTransitionListener.capture())).thenReturn(0);
-    lineageService = new OpenLineageService(openLineageDao, runService, Runnable::run);
+    lineageService = new OpenLineageService(baseDao, runService, Runnable::run);
     datasetDao = jdbi.onDemand(DatasetDao.class);
 
     NamespaceRow namespace =
@@ -257,7 +259,11 @@ public class OpenLineageServiceIntegrationTest {
           "RunOutputListener events");
       Assertions.assertEquals(
           expectedResults.outputDatasetCount,
-          runOutputListener.getAllValues().get(0).getOutputs().size(),
+          runOutputListener
+              .getAllValues()
+              .get(runOutputListener.getAllValues().size() - 1)
+              .getOutputs()
+              .size(),
           "Dataset output count");
     }
   }
@@ -280,17 +286,17 @@ public class OpenLineageServiceIntegrationTest {
   public void serviceCalls(List<URI> uris, ExpectedResults expectedResults) {
     List<LineageEvent> events = initEvents(uris);
 
-    JobService jobService = new JobService(openLineageDao, runService);
+    JobService jobService = new JobService(baseDao, runService);
     LineageEvent event = events.get(events.size() - 1);
     Optional<Job> job =
         jobService.findWithDatasetsAndRun(
-            openLineageDao.formatNamespaceName(event.getJob().getNamespace()),
+            Utils.sanitizeOpenLineageNamespace(event.getJob().getNamespace()),
             event.getJob().getName());
     Assertions.assertTrue(job.isPresent(), "Job does not exist: " + event.getJob().getName());
 
-    RunService runService = new RunService(openLineageDao, new ArrayList());
+    RunService runService = new RunService(baseDao, new ArrayList());
     Optional<Run> run =
-        runService.findRunByUuid(openLineageDao.runToUuid(event.getRun().getRunId()));
+        runService.findRunByUuid(Utils.openLineageRunUuid(event.getRun().getRunId()));
     Assertions.assertTrue(run.isPresent(), "Should have run");
 
     if (event.getInputs() != null) {
@@ -422,12 +428,13 @@ public class OpenLineageServiceIntegrationTest {
   @Test
   void testJobIsNotHiddenAfterSubsequentOLEvent() throws ExecutionException, InterruptedException {
     String name = "aNotHiddenJob";
+    Instant firstEventTime = Instant.now();
 
     LineageEvent.LineageEventBuilder builder =
         LineageEvent.builder()
             .eventType("COMPLETE")
             .job(LineageEvent.Job.builder().name(name).namespace(NAMESPACE).build())
-            .eventTime(Instant.now().atZone(TIMEZONE))
+            .eventTime(firstEventTime.atZone(TIMEZONE))
             .inputs(Collections.emptyList())
             .outputs(Collections.emptyList());
 
@@ -447,6 +454,7 @@ public class OpenLineageServiceIntegrationTest {
     lineageService
         .createAsync(
             builder
+                .eventTime(firstEventTime.plusSeconds(1).atZone(TIMEZONE))
                 .run(new LineageEvent.Run(UUID.randomUUID().toString(), RunFacet.builder().build()))
                 .build())
         .get();
@@ -533,12 +541,11 @@ public class OpenLineageServiceIntegrationTest {
     assertThat(jobByName).isPresent().map(Job::getCurrentVersion).isPresent();
     assertThat(jobByName.get().getFacets().get("sql").toString()).contains(query);
 
-    DatasetService datasetService = new DatasetService(openLineageDao, runService);
+    DatasetService datasetService = new DatasetService(baseDao, runService);
     assertThat(
             datasetService
                 .findDatasetByName(
-                    openLineageDao.formatNamespaceName(input.getNamespace()),
-                    openLineageDao.formatDatasetName(input.getName()))
+                    Utils.sanitizeOpenLineageNamespace(input.getNamespace()), input.getName())
                 .get()
                 .getSourceName()
                 .getValue())
@@ -547,8 +554,7 @@ public class OpenLineageServiceIntegrationTest {
     assertThat(
             datasetService
                 .findDatasetByName(
-                    openLineageDao.formatNamespaceName(output.getNamespace()),
-                    openLineageDao.formatDatasetName(output.getName()))
+                    Utils.sanitizeOpenLineageNamespace(output.getNamespace()), output.getName())
                 .get()
                 .getSourceName()
                 .getValue())
@@ -556,11 +562,10 @@ public class OpenLineageServiceIntegrationTest {
   }
 
   @Test
-  void testStreamingJob() throws ExecutionException, InterruptedException {
-    // (1) Create output
-    LineageEvent.Dataset input =
-        LineageEvent.Dataset.builder().name(DATASET_NAME).namespace(NAMESPACE).build();
-
+  void testStreamingJobRunIoStateMachine() throws ExecutionException, InterruptedException {
+    String jobName = "streaming_job_name";
+    LineageEvent.Dataset initialInput =
+        LineageEvent.Dataset.builder().name(INPUT_DATASET_NAME).namespace(NAMESPACE).build();
     LineageEvent.Dataset output =
         LineageEvent.Dataset.builder()
             .name(DATASET_NAME)
@@ -571,163 +576,135 @@ public class OpenLineageServiceIntegrationTest {
                         new SchemaDatasetFacet(
                             PRODUCER_URL,
                             SCHEMA_URL,
-                            Arrays.asList(new SchemaField("col", "STRING", "my name"))))
+                            List.of(new SchemaField("col", "STRING", "my name"))))
                     .build())
             .build();
-
-    // (2) Streaming job not followed by a COMPLETE event writing to a output
-    UUID firstRunId = UUID.randomUUID();
-    lineageService
-        .createAsync(
-            LineageEvent.builder()
-                .eventType("RUNNING")
-                .run(new LineageEvent.Run(firstRunId.toString(), RunFacet.builder().build()))
-                .job(
-                    LineageEvent.Job.builder()
-                        .name("streaming_job_name")
-                        .namespace(NAMESPACE)
-                        .facets(
-                            JobFacet.builder()
-                                .jobType(
-                                    JobTypeJobFacet.builder()
-                                        .processingType("STREAMING")
-                                        .integration("FLINK")
-                                        .jobType("JOB")
-                                        .build())
-                                .build())
-                        .build())
-                .eventTime(Instant.now().atZone(TIMEZONE))
-                .inputs(Collections.singletonList(input))
-                .outputs(Collections.singletonList(output))
-                .build())
-        .get();
-    Optional<Dataset> datasetRow = datasetDao.findDatasetByName(NAMESPACE, DATASET_NAME);
-
-    // (3) Assert that output is present and has dataset_version written
-    assertThat(datasetRow).isPresent().flatMap(Dataset::getCurrentVersion).isPresent();
-
-    // (4) Assert that job is present and its current version is present
-    Job job = jobDao.findJobByName(NAMESPACE, "streaming_job_name").get();
-    assertThat(job.getInputs()).hasSize(1);
-    assertThat(job.getCurrentVersion()).isPresent();
-    assertThat(job.getType()).isEqualTo(JobType.STREAM);
-    assertThat(job.getLabels()).containsExactly("JOB", "FLINK");
-
-    UUID initialJobVersion = job.getCurrentVersion().get();
-    Instant updatedAt =
-        jdbi.withHandle(
-            h ->
-                h.createQuery("SELECT max(updated_at) FROM job_versions")
-                    .mapTo(Instant.class)
-                    .first());
-
-    // (5) Send COMPLETE event streaming job
-    lineageService
-        .createAsync(
-            LineageEvent.builder()
-                .eventType("COMPLETE")
-                .run(new LineageEvent.Run(firstRunId.toString(), RunFacet.builder().build()))
-                .job(
-                    LineageEvent.Job.builder()
-                        .name("streaming_job_name")
-                        .namespace(NAMESPACE)
-                        .facets(
-                            JobFacet.builder()
-                                .jobType(
-                                    JobTypeJobFacet.builder()
-                                        .processingType("STREAMING")
-                                        .integration("FLINK")
-                                        .jobType("JOB")
-                                        .build())
-                                .build())
-                        .build())
-                .eventTime(Instant.now().atZone(TIMEZONE))
-                .inputs(Collections.emptyList())
-                .outputs(Collections.emptyList())
-                .build())
-        .get();
-
-    // (6) Assert job version exists
-    job = jobDao.findJobByName(NAMESPACE, "streaming_job_name").get();
-    assertThat(job.getCurrentVersion()).isPresent();
-    assertThat(job.getType()).isEqualTo(JobType.STREAM);
-    assertThat(job.getLabels()).containsExactly("JOB", "FLINK");
-    assertThat(job.getCurrentVersion().get()).isEqualTo(initialJobVersion);
-
-    // (7) Make sure updated_at in job version did not change
-    Instant lastUpdatedAt =
-        jdbi.withHandle(
-            h ->
-                h.createQuery("SELECT max(updated_at) FROM job_versions")
-                    .mapTo(Instant.class)
-                    .first());
-    assertThat(updatedAt).isEqualTo(lastUpdatedAt);
-  }
-
-  @Test
-  void testStreamingJobCreateSingleJobAndDatasetVersion()
-      throws ExecutionException, InterruptedException {
-    LineageEvent.Dataset dataset =
-        LineageEvent.Dataset.builder().name(DATASET_NAME).namespace(NAMESPACE).build();
-    UUID firstRunId = UUID.randomUUID();
-    LineageEventBuilder eventBuilder =
+    LineageEvent.Dataset replacementInput =
+        LineageEvent.Dataset.builder().name("otherDataset").namespace(NAMESPACE).build();
+    JobFacet streamingFacets =
+        JobFacet.builder()
+            .jobType(
+                JobTypeJobFacet.builder()
+                    .processingType("STREAMING")
+                    .integration("FLINK")
+                    .jobType("JOB")
+                    .build())
+            .build();
+    UUID runId = UUID.randomUUID();
+    Instant initialEventTime = Instant.now();
+    LineageEventBuilder events =
         LineageEvent.builder()
             .eventType("RUNNING")
-            .run(new LineageEvent.Run(firstRunId.toString(), RunFacet.builder().build()))
+            .run(new LineageEvent.Run(runId.toString(), RunFacet.builder().build()))
             .job(
                 LineageEvent.Job.builder()
-                    .name("streaming_job_name")
+                    .name(jobName)
                     .namespace(NAMESPACE)
-                    .facets(
-                        JobFacet.builder()
-                            .jobType(JobTypeJobFacet.builder().processingType("STREAMING").build())
-                            .build())
-                    .build())
-            .eventTime(Instant.now().atZone(TIMEZONE));
-    LineageEvent lineageEvent = eventBuilder.outputs(Collections.singletonList(dataset)).build();
+                    .facets(streamingFacets)
+                    .build());
+    LineageEvent initialEvent =
+        eventAt(events, initialEventTime, List.of(initialInput), List.of(output));
 
-    // (1) Emit running event
-    lineageService.createAsync(lineageEvent).get();
+    // Initial state at t0: both sides are reported and materialize one job version.
+    emit(initialEvent);
+    UUID outputDatasetVersion = currentDatasetVersion(DATASET_NAME);
+    Job job = jobDao.findJobByName(NAMESPACE, jobName).orElseThrow();
+    assertThat(job.getInputs()).hasSize(1);
+    assertThat(job.getType()).isEqualTo(JobType.STREAM);
+    assertThat(job.getLabels()).containsExactly("JOB", "FLINK");
+    UUID initialJobVersion = currentJobVersion(jobName);
+    int initialJobVersionCount = jobVersionCount(jobName);
+    Instant initialVersionUpdatedAt = latestJobVersionUpdate();
+    assertStreamingState(jobName, runId, initialJobVersion, 1, 1, initialJobVersionCount);
 
-    UUID datasetVersionUuid =
-        datasetDao.findDatasetAsRow(NAMESPACE, DATASET_NAME).get().getCurrentVersionUuid().get();
-    int initialJobVersionsCount =
-        jobVersionDao.findAllJobVersions(NAMESPACE, "streaming_job_name", 10, 0).size();
+    // Exact replay at t0 is idempotent.
+    emit(initialEvent);
+    assertStreamingState(jobName, runId, initialJobVersion, 1, 1, initialJobVersionCount);
 
-    // (2) Emit other running event
-    lineageService.createAsync(lineageEvent).get();
+    // Missing sides at t0+1 retain both sides and the current job-version UUID.
+    emit(eventAt(events, initialEventTime.plusSeconds(1), null, null));
+    assertStreamingState(jobName, runId, initialJobVersion, 1, 1, initialJobVersionCount);
 
-    // (3) Emit running event with no input nor output datasets
-    lineageService.createAsync(eventBuilder.build()).get();
-    assertThat(jobVersionDao.findAllJobVersions(NAMESPACE, "streaming_job_name", 10, 0).size())
-        .isEqualTo(initialJobVersionsCount);
+    // Reporting only inputs at t0+2 replaces inputs while retaining outputs.
+    emit(eventAt(events, initialEventTime.plusSeconds(2), List.of(replacementInput), null));
+    UUID replacementJobVersion = currentJobVersion(jobName);
+    assertThat(replacementJobVersion).isNotEqualTo(initialJobVersion);
+    assertStreamingState(jobName, runId, replacementJobVersion, 1, 1, initialJobVersionCount + 1);
+    assertThat(currentDatasetVersion(DATASET_NAME)).isEqualTo(outputDatasetVersion);
 
-    // (4) Emit event with other input dataset
-    LineageEvent.Dataset otherdataset =
-        LineageEvent.Dataset.builder().name("otherDataset").namespace(NAMESPACE).build();
-    lineageService
-        .createAsync(eventBuilder.inputs(Collections.singletonList(otherdataset)).build())
-        .get();
-    assertThat(jobVersionDao.findAllJobVersions(NAMESPACE, "streaming_job_name", 10, 0).size())
-        .isEqualTo(initialJobVersionsCount + 1);
+    // Explicit empty sides at t0+3 clear both sides and create a distinct version.
+    events.eventType("COMPLETE");
+    emit(eventAt(events, initialEventTime.plusSeconds(3), List.of(), List.of()));
+    UUID clearedJobVersion = currentJobVersion(jobName);
+    assertThat(clearedJobVersion).isNotIn(initialJobVersion, replacementJobVersion);
+    assertStreamingState(jobName, runId, clearedJobVersion, 0, 0, initialJobVersionCount + 2);
+    job = jobDao.findJobByName(NAMESPACE, jobName).orElseThrow();
+    assertThat(job.getInputs()).isEmpty();
+    assertThat(job.getOutputs()).isEmpty();
+    assertThat(job.getType()).isEqualTo(JobType.STREAM);
+    assertThat(job.getLabels()).containsExactly("JOB", "FLINK");
+    assertThat(latestJobVersionUpdate()).isAfter(initialVersionUpdatedAt);
+    assertThat(currentDatasetVersion(DATASET_NAME)).isEqualTo(outputDatasetVersion);
+  }
 
-    // (5) Verify dataset's version has not changed
-    assertThat(
-            datasetDao
-                .findDatasetAsRow(NAMESPACE, DATASET_NAME)
-                .get()
-                .getCurrentVersionUuid()
-                .get())
-        .isEqualTo(datasetVersionUuid);
+  private void emit(LineageEvent event) throws ExecutionException, InterruptedException {
+    lineageService.createAsync(event).get();
+  }
+
+  private UUID currentJobVersion(String jobName) {
+    return jobDao.findJobByName(NAMESPACE, jobName).orElseThrow().getCurrentVersion().orElseThrow();
+  }
+
+  private UUID currentDatasetVersion(String datasetName) {
+    return datasetDao
+        .findDatasetAsRow(NAMESPACE, datasetName)
+        .orElseThrow()
+        .getCurrentVersionUuid()
+        .orElseThrow();
+  }
+
+  private int jobVersionCount(String jobName) {
+    return jobVersionDao.findAllJobVersions(NAMESPACE, jobName, 10, 0).size();
+  }
+
+  private Instant latestJobVersionUpdate() {
+    return jdbi.withHandle(
+        handle ->
+            handle
+                .createQuery("SELECT max(updated_at) FROM job_versions")
+                .mapTo(Instant.class)
+                .first());
+  }
+
+  private LineageEvent eventAt(
+      LineageEventBuilder events,
+      Instant eventTime,
+      List<LineageEvent.Dataset> inputs,
+      List<LineageEvent.Dataset> outputs) {
+    return events.eventTime(eventTime.atZone(TIMEZONE)).inputs(inputs).outputs(outputs).build();
+  }
+
+  private void assertStreamingState(
+      String jobName,
+      UUID runId,
+      UUID jobVersion,
+      int inputCount,
+      int outputCount,
+      int versionCount) {
+    assertThat(currentJobVersion(jobName)).isEqualTo(jobVersion);
+    assertThat(jobVersionCount(jobName)).isEqualTo(versionCount);
+    assertThat(jobVersionDao.findRunIoSnapshot(runId).getInputs()).hasSize(inputCount);
+    assertThat(jobVersionDao.findRunIoSnapshot(runId).getOutputs()).hasSize(outputCount);
+    assertThat(jobVersionDao.findInputDatasetsFor(jobVersion)).hasSize(inputCount);
+    assertThat(jobVersionDao.findOutputDatasetsFor(jobVersion)).hasSize(outputCount);
   }
 
   private void checkExists(LineageEvent.Dataset ds) {
-    DatasetService datasetService = new DatasetService(openLineageDao, runService);
+    DatasetService datasetService = new DatasetService(baseDao, runService);
 
     Optional<Dataset> dataset =
         datasetService.findDatasetByName(
-            openLineageDao.formatNamespaceName(ds.getNamespace()),
-            openLineageDao.formatDatasetName(ds.getName()));
+            Utils.sanitizeOpenLineageNamespace(ds.getNamespace()), ds.getName());
     Assertions.assertTrue(dataset.isPresent(), "Dataset does not exist: " + ds);
   }
 

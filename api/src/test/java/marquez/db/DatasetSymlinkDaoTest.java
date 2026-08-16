@@ -5,7 +5,7 @@
 
 package marquez.db;
 
-import static marquez.db.OpenLineageDao.DEFAULT_NAMESPACE_OWNER;
+import static marquez.db.OpenLineageDefaults.DEFAULT_NAMESPACE_OWNER;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
@@ -20,7 +20,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import marquez.api.JdbiUtils;
-import marquez.db.DatasetSymlinkDao.PrimaryDatasetSymlinkUpsert;
+import marquez.db.DatasetSymlinkDao.PlannedDatasetSymlinkUpsert;
 import marquez.db.models.DatasetSymlinkRow;
 import marquez.db.models.NamespaceRow;
 import marquez.jdbi.MarquezJdbiExternalPostgresExtension;
@@ -61,16 +61,16 @@ class DatasetSymlinkDaoTest {
         symlinkDao.upsertDatasetSymlinkRow(
             UUID.randomUUID(), "second", namespace.getUuid(), true, null, NOW);
 
-    List<PrimaryDatasetSymlinkUpsert> inputs =
+    List<PlannedDatasetSymlinkUpsert> inputs =
         List.of(
-            primary(UUID.randomUUID(), "second", namespace.getUuid()),
-            primary(UUID.randomUUID(), "first", namespace.getUuid()),
-            primary(UUID.randomUUID(), "second", namespace.getUuid()));
+            planned(UUID.randomUUID(), "second", namespace.getUuid()),
+            planned(UUID.randomUUID(), "first", namespace.getUuid()),
+            planned(UUID.randomUUID(), "second", namespace.getUuid()));
 
     List<DatasetSymlinkRow> resolved =
         jdbi.inTransaction(
             handle ->
-                handle.attach(DatasetSymlinkDao.class).resolvePrimarySymlinksInTransaction(inputs));
+                handle.attach(DatasetSymlinkDao.class).resolvePlannedSymlinksInTransaction(inputs));
 
     assertThat(resolved).containsExactly(second, first, second);
   }
@@ -79,15 +79,15 @@ class DatasetSymlinkDaoTest {
   void missingDuplicateKeyUsesTheFirstCandidateUuid() {
     NamespaceRow namespace = newNamespace("duplicate-symlinks");
     UUID firstUuid = UUID.randomUUID();
-    List<PrimaryDatasetSymlinkUpsert> inputs =
+    List<PlannedDatasetSymlinkUpsert> inputs =
         List.of(
-            primary(firstUuid, "shared", namespace.getUuid()),
-            primary(UUID.randomUUID(), "shared", namespace.getUuid()));
+            planned(firstUuid, "shared", namespace.getUuid()),
+            planned(UUID.randomUUID(), "shared", namespace.getUuid()));
 
     List<DatasetSymlinkRow> resolved =
         jdbi.inTransaction(
             handle ->
-                handle.attach(DatasetSymlinkDao.class).resolvePrimarySymlinksInTransaction(inputs));
+                handle.attach(DatasetSymlinkDao.class).resolvePlannedSymlinksInTransaction(inputs));
 
     assertThat(resolved).hasSize(2).extracting(DatasetSymlinkRow::getUuid).containsOnly(firstUuid);
     assertThat(symlinkDao.findDatasetSymlinkByNamespaceUuidAndName(namespace.getUuid(), "shared"))
@@ -97,39 +97,65 @@ class DatasetSymlinkDaoTest {
   }
 
   @Test
+  void plannedAliasCannotReplaceAnExistingPrimaryIdentity() {
+    NamespaceRow namespace = newNamespace("protected-primary");
+    DatasetSymlinkRow primary =
+        symlinkDao.upsertDatasetSymlinkRow(
+            UUID.randomUUID(), "protected", namespace.getUuid(), true, null, NOW);
+    PlannedDatasetSymlinkUpsert alias =
+        new PlannedDatasetSymlinkUpsert(
+            UUID.randomUUID(), "protected", namespace.getUuid(), false, "alias", NOW);
+
+    List<DatasetSymlinkRow> resolved =
+        jdbi.inTransaction(
+            handle ->
+                handle
+                    .attach(DatasetSymlinkDao.class)
+                    .resolvePlannedSymlinksInTransaction(List.of(alias)));
+
+    assertThat(resolved).containsExactly(primary);
+    DatasetSymlinkRow persisted =
+        symlinkDao
+            .findDatasetSymlinkByNamespaceUuidAndName(namespace.getUuid(), "protected")
+            .orElseThrow();
+    assertThat(persisted).isEqualTo(primary);
+    assertThat(persisted.isPrimary()).isTrue();
+  }
+
+  @Test
   @SuppressWarnings("unchecked")
   void usesBoundedGloballyOrderedChunks() {
     DatasetSymlinkDao batchingDao = mock(DatasetSymlinkDao.class, CALLS_REAL_METHODS);
     when(batchingDao.findDatasetSymlinksByKeys(any(UUID[].class), any(String[].class)))
         .thenReturn(List.of());
-    when(batchingDao.insertPrimarySymlinksChunk(anyList()))
+    when(batchingDao.insertPlannedSymlinksChunk(anyList()))
         .thenAnswer(
             invocation -> {
-              List<PrimaryDatasetSymlinkUpsert> chunk = invocation.getArgument(0);
+              List<PlannedDatasetSymlinkUpsert> chunk = invocation.getArgument(0);
               List<DatasetSymlinkRow> rows = new ArrayList<>(chunk.size());
-              for (PrimaryDatasetSymlinkUpsert symlink : chunk) {
+              for (PlannedDatasetSymlinkUpsert symlink : chunk) {
                 rows.add(rowFor(symlink));
               }
               return rows;
             });
 
     UUID namespaceUuid = UUID.randomUUID();
-    List<PrimaryDatasetSymlinkUpsert> inputs = new ArrayList<>();
-    for (int index = DatasetSymlinkDao.MAX_PRIMARY_SYMLINKS_PER_RESOLVE; index >= 0; index--) {
-      inputs.add(primary(UUID.randomUUID(), String.format("dataset-%04d", index), namespaceUuid));
+    List<PlannedDatasetSymlinkUpsert> inputs = new ArrayList<>();
+    for (int index = DatasetSymlinkDao.MAX_SYMLINKS_PER_RESOLVE; index >= 0; index--) {
+      inputs.add(planned(UUID.randomUUID(), String.format("dataset-%04d", index), namespaceUuid));
     }
 
-    List<DatasetSymlinkRow> resolved = batchingDao.resolvePrimarySymlinksInTransaction(inputs);
+    List<DatasetSymlinkRow> resolved = batchingDao.resolvePlannedSymlinksInTransaction(inputs);
 
     assertThat(resolved)
         .extracting(DatasetSymlinkRow::getUuid)
         .containsExactlyElementsOf(
-            inputs.stream().map(PrimaryDatasetSymlinkUpsert::getUuid).toList());
+            inputs.stream().map(PlannedDatasetSymlinkUpsert::getUuid).toList());
 
-    ArgumentCaptor<List<PrimaryDatasetSymlinkUpsert>> chunks = ArgumentCaptor.forClass(List.class);
-    verify(batchingDao, times(2)).insertPrimarySymlinksChunk(chunks.capture());
+    ArgumentCaptor<List<PlannedDatasetSymlinkUpsert>> chunks = ArgumentCaptor.forClass(List.class);
+    verify(batchingDao, times(2)).insertPlannedSymlinksChunk(chunks.capture());
     assertThat(chunks.getAllValues().get(0))
-        .hasSize(DatasetSymlinkDao.MAX_PRIMARY_SYMLINKS_PER_RESOLVE)
+        .hasSize(DatasetSymlinkDao.MAX_SYMLINKS_PER_RESOLVE)
         .isSortedAccordingTo(
             (left, right) -> {
               int compared = left.getNamespaceUuid().compareTo(right.getNamespaceUuid());
@@ -142,8 +168,8 @@ class DatasetSymlinkDaoTest {
   @Test
   void readsBackAConcurrentWinnerAfterInsertReturningIsEmpty() {
     DatasetSymlinkDao racingDao = mock(DatasetSymlinkDao.class, CALLS_REAL_METHODS);
-    PrimaryDatasetSymlinkUpsert requested =
-        primary(UUID.randomUUID(), "concurrent", UUID.randomUUID());
+    PlannedDatasetSymlinkUpsert requested =
+        planned(UUID.randomUUID(), "concurrent", UUID.randomUUID());
     DatasetSymlinkRow winner =
         new DatasetSymlinkRow(
             UUID.randomUUID(),
@@ -155,12 +181,12 @@ class DatasetSymlinkDaoTest {
             NOW);
     when(racingDao.findDatasetSymlinksByKeys(any(UUID[].class), any(String[].class)))
         .thenReturn(List.of(), List.of(winner));
-    when(racingDao.insertPrimarySymlinksChunk(anyList())).thenReturn(List.of());
+    when(racingDao.insertPlannedSymlinksChunk(anyList())).thenReturn(List.of());
 
-    assertThat(racingDao.resolvePrimarySymlinksInTransaction(List.of(requested)))
+    assertThat(racingDao.resolvePlannedSymlinksInTransaction(List.of(requested)))
         .containsExactly(winner);
     verify(racingDao, times(2)).findDatasetSymlinksByKeys(any(UUID[].class), any(String[].class));
-    verify(racingDao).insertPrimarySymlinksChunk(anyList());
+    verify(racingDao).insertPlannedSymlinksChunk(anyList());
   }
 
   private NamespaceRow newNamespace(String prefix) {
@@ -168,17 +194,17 @@ class DatasetSymlinkDaoTest {
         UUID.randomUUID(), NOW, prefix + "-" + UUID.randomUUID(), DEFAULT_NAMESPACE_OWNER);
   }
 
-  private static PrimaryDatasetSymlinkUpsert primary(UUID uuid, String name, UUID namespaceUuid) {
-    return new PrimaryDatasetSymlinkUpsert(uuid, name, namespaceUuid, NOW);
+  private static PlannedDatasetSymlinkUpsert planned(UUID uuid, String name, UUID namespaceUuid) {
+    return new PlannedDatasetSymlinkUpsert(uuid, name, namespaceUuid, true, null, NOW);
   }
 
-  private static DatasetSymlinkRow rowFor(PrimaryDatasetSymlinkUpsert symlink) {
+  private static DatasetSymlinkRow rowFor(PlannedDatasetSymlinkUpsert symlink) {
     return new DatasetSymlinkRow(
         symlink.getUuid(),
         symlink.getName(),
         symlink.getNamespaceUuid(),
         null,
-        true,
+        symlink.isPrimary(),
         symlink.getNow(),
         symlink.getNow());
   }

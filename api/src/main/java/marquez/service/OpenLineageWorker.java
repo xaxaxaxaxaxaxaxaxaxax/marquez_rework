@@ -41,13 +41,16 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.DoubleSupplier;
 import java.util.function.IntFunction;
+import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 import marquez.common.Utils;
-import marquez.db.OpenLineageDao;
+import marquez.db.BaseDao;
+import marquez.db.OpenLineageProjector.ProjectionResult;
+import marquez.db.OpenLineageProjector.RunProjectionResult;
 import marquez.db.OpenLineageQueueDao;
 import marquez.db.models.OpenLineageQueueRow;
-import marquez.db.models.UpdateLineageRow;
 import marquez.service.OpenLineageService.CommittedEvent;
+import marquez.service.OpenLineageService.QueuedEvent;
 import marquez.service.models.BaseEvent;
 import marquez.service.models.LineageEvent;
 import org.jdbi.v3.core.Handle;
@@ -347,7 +350,7 @@ public final class OpenLineageWorker implements Managed {
                   try (Timer.Context ignored = processingDuration.time()) {
                     return processLockedClaim(
                         transactionHandle.getConnection(),
-                        transactionHandle.attach(OpenLineageDao.class),
+                        transactionHandle.attach(BaseDao.class),
                         transactionalQueueDao,
                         rows);
                   }
@@ -401,21 +404,20 @@ public final class OpenLineageWorker implements Managed {
 
   private TransactionBatch processLockedClaim(
       Connection connection,
-      OpenLineageDao transactionalOpenLineageDao,
+      BaseDao transactionalDaos,
       OpenLineageQueueDao transactionalQueueDao,
       List<OpenLineageQueueRow> rows) {
     if (rows.size() == 1) {
       TransactionResult result =
           processLockedWithMdc(
-              connection, transactionalOpenLineageDao, transactionalQueueDao, rows.get(0), false);
+              connection, transactionalDaos, transactionalQueueDao, rows.get(0), false);
       return new TransactionBatch(rows, List.of(result));
     }
 
     Map<String, String> previousMdc = MDC.getCopyOfContextMap();
     installClaimMdc(rows);
     try {
-      return processLockedBatch(
-          connection, transactionalOpenLineageDao, transactionalQueueDao, rows);
+      return processLockedBatch(connection, transactionalDaos, transactionalQueueDao, rows);
     } finally {
       restoreMdc(previousMdc);
     }
@@ -423,15 +425,13 @@ public final class OpenLineageWorker implements Managed {
 
   private TransactionBatch processLockedBatch(
       Connection connection,
-      OpenLineageDao transactionalOpenLineageDao,
+      BaseDao transactionalDaos,
       OpenLineageQueueDao transactionalQueueDao,
       List<OpenLineageQueueRow> rows) {
     Savepoint projection = setSavepoint(connection, rows.get(0).id());
-    List<TransactionResult> results = new ArrayList<>(rows.size());
+    List<TransactionResult> results;
     try {
-      for (OpenLineageQueueRow row : rows) {
-        results.add(projectQueued(row, transactionalOpenLineageDao));
-      }
+      results = projectQueuedRows(rows, transactionalDaos);
     } catch (Error failure) {
       throw failure;
     } catch (Exception failure) {
@@ -440,7 +440,7 @@ public final class OpenLineageWorker implements Managed {
       }
       rollbackToSavepoint(connection, projection, rows.get(0).id());
       releaseSavepoint(connection, projection, rows.get(0).id());
-      return processFallback(connection, transactionalOpenLineageDao, transactionalQueueDao, rows);
+      return processFallback(connection, transactionalDaos, transactionalQueueDao, rows);
     }
 
     releaseSavepoint(connection, projection, rows.get(0).id());
@@ -451,7 +451,7 @@ public final class OpenLineageWorker implements Managed {
 
   private TransactionBatch processFallback(
       Connection connection,
-      OpenLineageDao transactionalOpenLineageDao,
+      BaseDao transactionalDaos,
       OpenLineageQueueDao transactionalQueueDao,
       List<OpenLineageQueueRow> rows) {
     batchFallbacks.mark();
@@ -468,8 +468,7 @@ public final class OpenLineageWorker implements Managed {
         continue;
       }
       TransactionResult result =
-          processLockedWithMdc(
-              connection, transactionalOpenLineageDao, transactionalQueueDao, row, true);
+          processLockedWithMdc(connection, transactionalDaos, transactionalQueueDao, row, true);
       results.add(result);
       if (result.outcome() == EventOutcome.RETRIED) {
         blockedLanes.add(row.orderingKey());
@@ -480,15 +479,14 @@ public final class OpenLineageWorker implements Managed {
 
   private TransactionResult processLockedWithMdc(
       Connection connection,
-      OpenLineageDao transactionalOpenLineageDao,
+      BaseDao transactionalDaos,
       OpenLineageQueueDao transactionalQueueDao,
       OpenLineageQueueRow row,
       boolean laneLockHeld) {
     Map<String, String> previousMdc = MDC.getCopyOfContextMap();
     installMdc(row);
     try {
-      return processLocked(
-          connection, transactionalOpenLineageDao, transactionalQueueDao, row, laneLockHeld);
+      return processLocked(connection, transactionalDaos, transactionalQueueDao, row, laneLockHeld);
     } finally {
       restoreMdc(previousMdc);
     }
@@ -496,14 +494,14 @@ public final class OpenLineageWorker implements Managed {
 
   private TransactionResult processLocked(
       Connection connection,
-      OpenLineageDao transactionalOpenLineageDao,
+      BaseDao transactionalDaos,
       OpenLineageQueueDao transactionalQueueDao,
       OpenLineageQueueRow row,
       boolean laneLockHeld) {
     Savepoint projection = setSavepoint(connection, row.id());
     TransactionResult result;
     try {
-      result = projectQueued(row, transactionalOpenLineageDao);
+      result = projectQueuedRows(List.of(row), transactionalDaos).get(0);
     } catch (Error failure) {
       throw failure;
     } catch (Exception failure) {
@@ -556,17 +554,33 @@ public final class OpenLineageWorker implements Managed {
     return result;
   }
 
-  private TransactionResult projectQueued(
-      OpenLineageQueueRow row, OpenLineageDao transactionalOpenLineageDao)
-      throws JsonProcessingException {
-    if (row.attemptCount() > maxAttempts) {
-      throw new IllegalArgumentException("maximum processing attempts exceeded");
+  private List<TransactionResult> projectQueuedRows(
+      List<OpenLineageQueueRow> rows, BaseDao transactionalDaos) throws JsonProcessingException {
+    List<QueuedEvent> events = new ArrayList<>(rows.size());
+    for (OpenLineageQueueRow row : rows) {
+      if (row.attemptCount() > maxAttempts) {
+        throw new IllegalArgumentException("maximum processing attempts exceeded");
+      }
+      events.add(
+          new QueuedEvent(mapper.readValue(row.eventJson(), BaseEvent.class), row.eventJson()));
     }
-    BaseEvent event = mapper.readValue(row.eventJson(), BaseEvent.class);
-    UpdateLineageRow update =
-        openLineageService.processQueuedInTransaction(
-            event, row.eventJson(), transactionalOpenLineageDao);
-    return TransactionResult.succeeded(row, event, update);
+
+    List<ProjectionResult> projections =
+        Objects.requireNonNull(
+            openLineageService.processQueuedBatchInTransaction(
+                List.copyOf(events), transactionalDaos),
+            "Queued OpenLineage projection returned null results");
+    if (projections.size() != rows.size()) {
+      throw new IllegalStateException(
+          "Expected %d queued OpenLineage projection results, but received %d"
+              .formatted(rows.size(), projections.size()));
+    }
+
+    List<TransactionResult> results = new ArrayList<>(rows.size());
+    for (int index = 0; index < rows.size(); index++) {
+      results.add(TransactionResult.succeeded(rows.get(index), projections.get(index)));
+    }
+    return results;
   }
 
   private ClaimResult publishCommittedBatch(TransactionBatch batch) {
@@ -575,14 +589,12 @@ public final class OpenLineageWorker implements Managed {
     }
 
     int completionCount = 0;
-    TransactionResult completedResult = null;
     EventOutcome lastOutcome = EventOutcome.IDLE;
     for (TransactionResult result : batch.results()) {
       switch (result.outcome()) {
         case COMPLETED -> {
           successes.mark();
           completionCount++;
-          completedResult = result;
         }
         case RETRIED, DEAD_LETTERED -> recordCommittedFailure(result);
         default ->
@@ -601,8 +613,7 @@ public final class OpenLineageWorker implements Managed {
       }
       try {
         try (Timer.Context ignored = postCommitDuration.time()) {
-          int failures =
-              publishCompletedBestEffort(batch.results(), completionCount, completedResult);
+          int failures = publishCompletedBestEffort(batch.results(), completionCount);
           if (failures > 0) {
             postCommitFailures.mark(failures);
           }
@@ -615,27 +626,24 @@ public final class OpenLineageWorker implements Managed {
     return new ClaimResult(batch.claimedRows().size(), batch.results().size(), lastOutcome);
   }
 
-  private int publishCompletedBestEffort(
-      List<TransactionResult> results, int completionCount, TransactionResult completedResult) {
-    if (completionCount == 1) {
-      return completedResult.event() instanceof LineageEvent lineageEvent
-          ? openLineageService.publishQueuedEventBestEffort(lineageEvent, completedResult.update())
-          : 0;
-    }
-
-    List<CommittedEvent> committedEvents = null;
+  private int publishCompletedBestEffort(List<TransactionResult> results, int completionCount) {
+    List<CommittedEvent> committedEvents = new ArrayList<>(completionCount);
     for (TransactionResult result : results) {
       if (result.outcome() == EventOutcome.COMPLETED
-          && result.event() instanceof LineageEvent lineageEvent) {
-        if (committedEvents == null) {
-          committedEvents = new ArrayList<>(completionCount);
-        }
-        committedEvents.add(new CommittedEvent(result.row().id(), lineageEvent, result.update()));
+          && result.projection() instanceof RunProjectionResult runProjection) {
+        committedEvents.add(
+            new CommittedEvent(
+                result.row().id(), (LineageEvent) runProjection.request().event(), runProjection));
       }
     }
-    return committedEvents == null
-        ? 0
-        : openLineageService.publishQueuedEventsBestEffort(committedEvents);
+    if (committedEvents.isEmpty()) {
+      return 0;
+    }
+    if (completionCount == 1) {
+      CommittedEvent event = committedEvents.get(0);
+      return openLineageService.publishQueuedEventBestEffort(event.event(), event.projection());
+    }
+    return openLineageService.publishQueuedEventsBestEffort(committedEvents);
   }
 
   private void recordCommittedFailure(TransactionResult result) {
@@ -1158,22 +1166,22 @@ public final class OpenLineageWorker implements Managed {
   private record TransactionResult(
       EventOutcome outcome,
       OpenLineageQueueRow row,
-      BaseEvent event,
-      UpdateLineageRow update,
-      String error,
+      @Nullable ProjectionResult projection,
+      @Nullable String error,
       long retryDelayMillis) {
     private static TransactionResult succeeded(
-        OpenLineageQueueRow row, BaseEvent event, UpdateLineageRow update) {
-      return new TransactionResult(EventOutcome.COMPLETED, row, event, update, null, 0);
+        OpenLineageQueueRow row, ProjectionResult projection) {
+      return new TransactionResult(
+          EventOutcome.COMPLETED, row, Objects.requireNonNull(projection, "projection"), null, 0);
     }
 
     private static TransactionResult retried(
         OpenLineageQueueRow row, String error, long retryDelayMillis) {
-      return new TransactionResult(EventOutcome.RETRIED, row, null, null, error, retryDelayMillis);
+      return new TransactionResult(EventOutcome.RETRIED, row, null, error, retryDelayMillis);
     }
 
     private static TransactionResult deadLettered(OpenLineageQueueRow row, String error) {
-      return new TransactionResult(EventOutcome.DEAD_LETTERED, row, null, null, error, 0);
+      return new TransactionResult(EventOutcome.DEAD_LETTERED, row, null, error, 0);
     }
   }
 

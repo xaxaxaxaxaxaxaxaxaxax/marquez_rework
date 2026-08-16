@@ -5,7 +5,7 @@
 
 package marquez.db;
 
-import static marquez.db.OpenLineageDao.DEFAULT_NAMESPACE_OWNER;
+import static marquez.db.OpenLineageDefaults.DEFAULT_NAMESPACE_OWNER;
 
 import com.google.common.collect.ImmutableSet;
 import java.time.Instant;
@@ -36,6 +36,7 @@ import marquez.db.models.DatasetRow;
 import marquez.db.models.ExtendedRunRow;
 import marquez.db.models.JobRow;
 import marquez.db.models.NamespaceRow;
+import marquez.db.models.ProjectionOrder;
 import marquez.db.models.RunArgsRow;
 import marquez.db.models.RunRow;
 import marquez.service.models.Dataset;
@@ -695,8 +696,6 @@ public interface RunDao extends BaseDao {
   default void upsertOutputDatasetsFor(UUID runUuid, ImmutableSet<DatasetId> runOutputIds) {
     DatasetVersionDao datasetVersionDao = createDatasetVersionDao();
     DatasetDao datasetDao = createDatasetDao();
-    OpenLineageDao openLineageDao = createOpenLineageDao();
-
     if (runOutputIds != null) {
       for (DatasetId runOutputId : runOutputIds) {
         Optional<DatasetRow> dsRow =
@@ -819,9 +818,52 @@ public interface RunDao extends BaseDao {
   }
 
   @SqlUpdate(
-      "UPDATE runs SET job_version_uuid = :jobVersionUuid "
-          + "WHERE uuid = :runUuid AND job_version_uuid IS DISTINCT FROM :jobVersionUuid")
+      "UPDATE runs SET job_version_uuid = :jobVersionUuid, "
+          + "open_lineage_job_version_time = NULL, "
+          + "open_lineage_job_version_key = NULL "
+          + "WHERE uuid = :runUuid "
+          + "AND (job_version_uuid IS DISTINCT FROM :jobVersionUuid "
+          + "OR open_lineage_job_version_time IS NOT NULL)")
   void updateJobVersion(UUID runUuid, UUID jobVersionUuid);
+
+  default boolean updateJobVersionForOpenLineageClaim(
+      UUID runUuid, UUID jobVersionUuid, ProjectionOrder order) {
+    Objects.requireNonNull(order, "order");
+    return updateJobVersionForOpenLineageClaim(
+            runUuid, jobVersionUuid, order.getEventTime(), order.getEventKey())
+        == 1;
+  }
+
+  @SqlUpdate(
+      """
+      UPDATE runs
+      SET job_version_uuid = :jobVersionUuid
+      WHERE uuid = :runUuid
+        AND open_lineage_job_version_time = :projectionTime
+        AND open_lineage_job_version_key = :projectionKey
+      """)
+  int updateJobVersionForOpenLineageClaim(
+      UUID runUuid, UUID jobVersionUuid, Instant projectionTime, byte[] projectionKey);
+
+  /** Claims terminal linkage while retaining the run-row lock for dependent writes. */
+  default boolean claimOpenLineageJobVersionProjection(UUID runUuid, ProjectionOrder order) {
+    Objects.requireNonNull(order, "order");
+    return claimOpenLineageJobVersionProjection(runUuid, order.getEventTime(), order.getEventKey())
+        == 1;
+  }
+
+  @SqlUpdate(
+      """
+      UPDATE runs
+      SET open_lineage_job_version_time = :projectionTime,
+          open_lineage_job_version_key = :projectionKey
+      WHERE uuid = :runUuid
+        AND (open_lineage_job_version_time IS NULL
+          OR ROW(:projectionTime, :projectionKey) >
+             ROW(open_lineage_job_version_time, open_lineage_job_version_key))
+      """)
+  int claimOpenLineageJobVersionProjection(
+      UUID runUuid, Instant projectionTime, byte[] projectionKey);
 
   @SqlQuery(
       """

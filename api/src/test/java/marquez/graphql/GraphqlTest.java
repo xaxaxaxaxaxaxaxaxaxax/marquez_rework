@@ -14,7 +14,7 @@ import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import marquez.common.Utils;
-import marquez.db.OpenLineageDao;
+import marquez.db.BaseDao;
 import marquez.jdbi.MarquezJdbiExternalPostgresExtension;
 import marquez.service.OpenLineageService;
 import marquez.service.RunService;
@@ -34,12 +34,12 @@ public class GraphqlTest {
   public static void setup(Jdbi jdbi) throws IOException, ExecutionException, InterruptedException {
     GraphqlSchemaBuilder schemaBuilder = new GraphqlSchemaBuilder(jdbi);
     graphQL = GraphQL.newGraphQL(schemaBuilder.buildSchema()).build();
-    OpenLineageDao openLineageDao = jdbi.onDemand(OpenLineageDao.class);
+    BaseDao baseDao = jdbi.onDemand(BaseDao.class);
     LineageEvent lineageEvent =
         Utils.newObjectMapper()
             .readValue(Resources.getResource("open_lineage/event_simple.json"), LineageEvent.class);
 
-    OpenLineageService service = new OpenLineageService(openLineageDao, mock(RunService.class));
+    OpenLineageService service = new OpenLineageService(baseDao, mock(RunService.class));
     service.createAsync(lineageEvent).get();
   }
 

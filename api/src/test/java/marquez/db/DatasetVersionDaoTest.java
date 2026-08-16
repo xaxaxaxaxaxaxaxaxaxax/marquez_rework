@@ -5,7 +5,7 @@
 
 package marquez.db;
 
-import static marquez.db.OpenLineageDao.DEFAULT_NAMESPACE_OWNER;
+import static marquez.db.OpenLineageDefaults.DEFAULT_NAMESPACE_OWNER;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.CALLS_REAL_METHODS;

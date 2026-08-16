@@ -60,10 +60,13 @@ import marquez.common.models.JobName;
 import marquez.common.models.JobType;
 import marquez.common.models.NamespaceName;
 import marquez.common.models.RunState;
+import marquez.db.BaseDao;
 import marquez.db.DatasetDao;
 import marquez.db.JobDao;
 import marquez.db.NamespaceDao;
 import marquez.db.OpenLineageDao;
+import marquez.db.OpenLineageDefaults;
+import marquez.db.OpenLineageProjector.ProjectionResult;
 import marquez.db.OpenLineageQueueDao;
 import marquez.db.RunArgsDao;
 import marquez.db.RunDao;
@@ -71,8 +74,8 @@ import marquez.db.models.JobRow;
 import marquez.db.models.NamespaceRow;
 import marquez.db.models.OpenLineageQueueRow;
 import marquez.db.models.RunArgsRow;
-import marquez.db.models.UpdateLineageRow;
 import marquez.jdbi.MarquezJdbiExternalPostgresExtension;
+import marquez.service.OpenLineageService.QueuedEvent;
 import marquez.service.models.BaseEvent;
 import marquez.service.models.JobEvent;
 import marquez.service.models.LineageEvent;
@@ -658,16 +661,35 @@ class OpenLineageDurabilityIntegrationTest {
         jobDao.toJson(Collections.emptySet(), Utils.getMapper()));
     Instant winnerTime = Instant.now().plusSeconds(10);
 
-    queueDao.enqueue(jobEvent(winnerTime, aliasName, List.of("alias-input"), List.of()));
+    queueDao.enqueue(
+        documentedJobEvent(
+            winnerTime, aliasName, "winner description", List.of("alias-input"), List.of()));
     assertThat(processNext(newService(), 3, 0).outcome()).isEqualTo(TransactionOutcome.SUCCESS);
     assertThat(currentJobIo(primaryName))
         .containsExactly(new IoRef("INPUT", NAMESPACE, "alias-input"));
+    JobRow canonical = jobDao.lockJobByUuid(primary.getUuid());
+    assertThat(canonical.getDescription()).contains("winner description");
+    assertThat(canonical.getInputs())
+        .extracting(dataset -> dataset.getName().getValue())
+        .containsExactly("alias-input");
+    UUID winningVersion = canonical.getCurrentVersionUuid().orElseThrow();
 
     queueDao.enqueue(
-        jobEvent(winnerTime.minusSeconds(1), primaryName, List.of("stale-input"), List.of()));
+        documentedJobEvent(
+            winnerTime.minusSeconds(1),
+            primaryName,
+            "stale description",
+            List.of("stale-input"),
+            List.of()));
     assertThat(processNext(newService(), 3, 0).outcome()).isEqualTo(TransactionOutcome.SUCCESS);
     assertThat(currentJobIo(primaryName))
         .containsExactly(new IoRef("INPUT", NAMESPACE, "alias-input"));
+    JobRow afterStale = jobDao.lockJobByUuid(primary.getUuid());
+    assertThat(afterStale.getDescription()).contains("winner description");
+    assertThat(afterStale.getCurrentVersionUuid()).contains(winningVersion);
+    assertThat(afterStale.getInputs())
+        .extracting(dataset -> dataset.getName().getValue())
+        .containsExactly("alias-input");
   }
 
   @ParameterizedTest(name = "older JobEvent commits first: {0}")
@@ -1063,7 +1085,7 @@ class OpenLineageDurabilityIntegrationTest {
     UUID expectedInputVersion =
         Utils.newDatasetVersionFor(
                 NAMESPACE,
-                OpenLineageDao.DEFAULT_SOURCE_NAME,
+                OpenLineageDefaults.DEFAULT_SOURCE_NAME,
                 inputName,
                 inputName,
                 "",
@@ -1458,8 +1480,8 @@ class OpenLineageDurabilityIntegrationTest {
               throw new IllegalArgumentException("maximum processing attempts exceeded");
             }
             BaseEvent event = Utils.getMapper().readValue(row.eventJson(), BaseEvent.class);
-            service.processQueuedInTransaction(
-                event, row.eventJson(), handle.attach(OpenLineageDao.class));
+            service.processQueuedBatchInTransaction(
+                List.of(new QueuedEvent(event, row.eventJson())), handle.attach(BaseDao.class));
           } catch (Exception failure) {
             rollbackProjection(handle.getConnection(), projection);
             releaseProjectionSavepoint(handle.getConnection(), projection);
@@ -1493,16 +1515,17 @@ class OpenLineageDurabilityIntegrationTest {
             return List.of();
           }
 
-          OpenLineageDao transactionalOpenLineage = handle.attach(OpenLineageDao.class);
+          List<QueuedEvent> events = new ArrayList<>(rows.size());
           for (OpenLineageQueueRow row : rows) {
             try {
               BaseEvent event = Utils.getMapper().readValue(row.eventJson(), BaseEvent.class);
-              service.processQueuedInTransaction(event, row.eventJson(), transactionalOpenLineage);
+              events.add(new QueuedEvent(event, row.eventJson()));
             } catch (IOException failure) {
               throw new IllegalArgumentException(
                   "test queue payload could not be deserialized", failure);
             }
           }
+          service.processQueuedBatchInTransaction(events, handle.attach(BaseDao.class));
           transactionalQueue.ackLockedAll(rows);
           return rows;
         });
@@ -2273,6 +2296,27 @@ class OpenLineageDurabilityIntegrationTest {
     return jobEvent(eventTime, jobName, inputNames, outputNames, null);
   }
 
+  private static JobEvent documentedJobEvent(
+      Instant eventTime,
+      String jobName,
+      String description,
+      List<String> inputNames,
+      List<String> outputNames) {
+    JobEvent event = jobEvent(eventTime, jobName, inputNames, outputNames);
+    event
+        .getJob()
+        .setFacets(
+            LineageEvent.JobFacet.builder()
+                .documentation(
+                    LineageEvent.DocumentationJobFacet.builder()
+                        ._producer(URI.create(PRODUCER))
+                        ._schemaURL(FACET_SCHEMA)
+                        .description(description)
+                        .build())
+                .build());
+    return event;
+  }
+
   private static JobEvent jobEvent(
       Instant eventTime,
       String jobName,
@@ -2671,7 +2715,7 @@ class OpenLineageDurabilityIntegrationTest {
   private static UUID expectedDatasetVersion(String datasetName, UUID runId) {
     return Utils.newDatasetVersionFor(
             NAMESPACE,
-            OpenLineageDao.DEFAULT_SOURCE_NAME,
+            OpenLineageDefaults.DEFAULT_SOURCE_NAME,
             datasetName,
             datasetName,
             "",
@@ -3147,16 +3191,18 @@ class OpenLineageDurabilityIntegrationTest {
     }
 
     @Override
-    UpdateLineageRow processQueuedInTransaction(
-        BaseEvent event, String eventJson, OpenLineageDao transactionalDao) {
-      UpdateLineageRow update =
-          super.processQueuedInTransaction(event, eventJson, transactionalDao);
-      LineageEvent lineageEvent = (LineageEvent) event;
-      if (runId.toString().equals(lineageEvent.getRun().getRunId())
-          && eventType.equals(lineageEvent.getEventType())) {
-        throw new IllegalStateException(failureMessage);
+    List<ProjectionResult> processQueuedBatchInTransaction(
+        List<QueuedEvent> events, BaseDao transactionalDaos) {
+      List<ProjectionResult> results =
+          super.processQueuedBatchInTransaction(events, transactionalDaos);
+      for (QueuedEvent queuedEvent : events) {
+        LineageEvent lineageEvent = (LineageEvent) queuedEvent.event();
+        if (runId.toString().equals(lineageEvent.getRun().getRunId())
+            && eventType.equals(lineageEvent.getEventType())) {
+          throw new IllegalStateException(failureMessage);
+        }
       }
-      return update;
+      return results;
     }
   }
 
@@ -3178,24 +3224,24 @@ class OpenLineageDurabilityIntegrationTest {
     }
 
     @Override
-    UpdateLineageRow processQueuedInTransaction(
-        BaseEvent event, String eventJson, OpenLineageDao transactionalDao) {
-      UpdateLineageRow update =
-          super.processQueuedInTransaction(event, eventJson, transactionalDao);
+    List<ProjectionResult> processQueuedBatchInTransaction(
+        List<QueuedEvent> events, BaseDao transactionalDaos) {
+      List<ProjectionResult> results =
+          super.processQueuedBatchInTransaction(events, transactionalDaos);
       backendPid.set(
-          transactionalDao
+          transactionalDaos
               .getHandle()
               .createQuery("SELECT pg_backend_pid()")
               .mapTo(Integer.class)
               .one());
       projected.countDown();
-      transactionalDao
+      transactionalDaos
           .getHandle()
           .createQuery("SELECT pg_advisory_lock(:advisoryKey)")
           .bind("advisoryKey", advisoryKey)
           .map((resultSet, context) -> true)
           .one();
-      return update;
+      return results;
     }
   }
 
@@ -3229,25 +3275,26 @@ class OpenLineageDurabilityIntegrationTest {
     }
 
     @Override
-    UpdateLineageRow processQueuedInTransaction(
-        BaseEvent event, String eventJson, OpenLineageDao transactionalDao) {
+    List<ProjectionResult> processQueuedBatchInTransaction(
+        List<QueuedEvent> events, BaseDao transactionalDaos) {
+      BaseEvent event = events.get(0).event();
       if (firstEvent.test(event)) {
-        firstBackendPid.set(backendPid(transactionalDao));
-        UpdateLineageRow update =
-            super.processQueuedInTransaction(event, eventJson, transactionalDao);
+        firstBackendPid.set(backendPid(transactionalDaos));
+        List<ProjectionResult> results =
+            super.processQueuedBatchInTransaction(events, transactionalDaos);
         firstProjected.countDown();
         awaitRelease(releaseFirst, "first cross-lane projection release");
-        return update;
+        return results;
       }
       if (secondEvent.test(event)) {
-        secondBackendPid.set(backendPid(transactionalDao));
+        secondBackendPid.set(backendPid(transactionalDaos));
         secondEntered.countDown();
       }
-      return super.processQueuedInTransaction(event, eventJson, transactionalDao);
+      return super.processQueuedBatchInTransaction(events, transactionalDaos);
     }
 
-    private static int backendPid(OpenLineageDao transactionalDao) {
-      return transactionalDao
+    private static int backendPid(BaseDao transactionalDaos) {
+      return transactionalDaos
           .getHandle()
           .createQuery("SELECT pg_backend_pid()")
           .mapTo(Integer.class)
@@ -3284,15 +3331,15 @@ class OpenLineageDurabilityIntegrationTest {
     }
 
     @Override
-    UpdateLineageRow processQueuedInTransaction(
-        BaseEvent event, String eventJson, OpenLineageDao transactionalDao) {
-      LineageEvent lineageEvent = (LineageEvent) event;
+    List<ProjectionResult> processQueuedBatchInTransaction(
+        List<QueuedEvent> events, BaseDao transactionalDaos) {
+      LineageEvent lineageEvent = (LineageEvent) events.get(0).event();
       if (blockedRunId.toString().equals(lineageEvent.getRun().getRunId())
           && "START".equals(lineageEvent.getEventType())) {
         entered.countDown();
         OpenLineageDurabilityIntegrationTest.awaitRelease(release, "blocked projection release");
       }
-      return super.processQueuedInTransaction(event, eventJson, transactionalDao);
+      return super.processQueuedBatchInTransaction(events, transactionalDaos);
     }
   }
 }

@@ -30,7 +30,6 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-import com.google.common.collect.ImmutableSet;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -41,9 +40,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 import marquez.BaseIntegrationTest;
 import marquez.api.models.JobVersion;
+import marquez.common.Utils;
 import marquez.common.models.DatasetId;
 import marquez.common.models.NamespaceName;
 import marquez.common.models.RunState;
@@ -52,7 +51,6 @@ import marquez.db.models.DatasetRow;
 import marquez.db.models.ExtendedDatasetVersionRow;
 import marquez.db.models.ExtendedJobVersionRow;
 import marquez.db.models.JobRow;
-import marquez.db.models.ModelDaos;
 import marquez.db.models.NamespaceRow;
 import marquez.db.models.ProjectionOrder;
 import marquez.db.models.RunArgsRow;
@@ -60,6 +58,7 @@ import marquez.db.models.RunIoSnapshot;
 import marquez.db.models.RunRow;
 import marquez.db.models.UpdateLineageRow.DatasetRecord;
 import marquez.jdbi.MarquezJdbiExternalPostgresExtension;
+import marquez.service.models.DatasetEvent;
 import marquez.service.models.JobMeta;
 import marquez.service.models.LineageEvent;
 import marquez.service.models.Run;
@@ -69,6 +68,8 @@ import org.jdbi.v3.core.Jdbi;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 
@@ -83,7 +84,6 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
   static RunDao runDao;
   static OpenLineageDao openLineageDao;
   static JobVersionDao jobVersionDao;
-  static ModelDaos modelDaos = mock(ModelDaos.class);
   static NamespaceRow namespaceRow;
   static JobRow jobRow;
 
@@ -96,18 +96,6 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
     runDao = jdbi.onDemand(RunDao.class);
     openLineageDao = jdbi.onDemand(OpenLineageDao.class);
     jobVersionDao = jdbiForTesting.onDemand(JobVersionDao.class);
-
-    when(modelDaos.getJobDao()).thenReturn(jobDao);
-    when(modelDaos.getRunDao()).thenReturn(runDao);
-    when(modelDaos.getJobVersionDao()).thenReturn(jobVersionDao);
-    when(modelDaos.getNamespaceDao()).thenReturn(jdbi.onDemand(NamespaceDao.class));
-    when(modelDaos.getSourceDao()).thenReturn(jdbi.onDemand(SourceDao.class));
-    when(modelDaos.getDatasetSymlinkDao()).thenReturn(jdbi.onDemand(DatasetSymlinkDao.class));
-    when(modelDaos.getDatasetDao()).thenReturn(jdbi.onDemand(DatasetDao.class));
-    when(modelDaos.getDatasetVersionDao()).thenReturn(jdbi.onDemand(DatasetVersionDao.class));
-    when(modelDaos.getDatasetSchemaVersionDao())
-        .thenReturn(jdbi.onDemand(DatasetSchemaVersionDao.class));
-    when(modelDaos.getDatasetFieldDao()).thenReturn(jdbi.onDemand(DatasetFieldDao.class));
 
     // Each tests requires both a namespace and job row.
     namespaceRow = DbTestUtils.newNamespace(jdbiForTesting);
@@ -192,90 +180,133 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
     assertThat(waiting).as("transition should wait on the canonical job gate").isTrue();
   }
 
-  @Test
-  public void testCurrentJobVersionIoWriteSortsDeduplicatesAndFlushesInputThenOutput() {
+  private enum IoMutation {
+    FLUSH,
+    REPLACE
+  }
+
+  private enum IoShape {
+    EMPTY,
+    INPUT_ONLY,
+    OUTPUT_ONLY,
+    BOTH
+  }
+
+  private static List<UUID> uuidRange(long first, long last) {
+    return java.util.stream.LongStream.rangeClosed(first, last)
+        .mapToObj(value -> new UUID(0L, value))
+        .toList();
+  }
+
+  @ParameterizedTest(name = "{0} / {1}")
+  @CsvSource({
+    "FLUSH, EMPTY",
+    "FLUSH, INPUT_ONLY",
+    "FLUSH, OUTPUT_ONLY",
+    "FLUSH, BOTH",
+    "REPLACE, EMPTY",
+    "REPLACE, INPUT_ONLY",
+    "REPLACE, OUTPUT_ONLY",
+    "REPLACE, BOTH"
+  })
+  public void testCurrentJobVersionIoDispatchMatrix(IoMutation mutation, IoShape shape) {
     JobVersionDao batchingDao = mock(JobVersionDao.class, CALLS_REAL_METHODS);
     UUID jobVersionUuid = UUID.randomUUID();
     UUID jobUuid = UUID.randomUUID();
     UUID symlinkTargetJobUuid = UUID.randomUUID();
-    UUID firstInputUuid = new UUID(0L, 1L);
-    UUID secondInputUuid = new UUID(0L, 2L);
-    UUID firstOutputUuid = new UUID(0L, 3L);
-    UUID secondOutputUuid = new UUID(0L, 4L);
+    UUID inputUuid = new UUID(0L, 1L);
+    UUID outputUuid = new UUID(0L, 2L);
+    boolean hasInputs = shape == IoShape.INPUT_ONLY || shape == IoShape.BOTH;
+    boolean hasOutputs = shape == IoShape.OUTPUT_ONLY || shape == IoShape.BOTH;
     JobVersionDao.CurrentJobVersionIoWrite write =
         JobVersionDao.CurrentJobVersionIoWrite.of(
             jobVersionUuid,
             jobUuid,
             symlinkTargetJobUuid,
-            List.of(secondInputUuid, firstInputUuid, secondInputUuid),
-            List.of(secondOutputUuid, firstOutputUuid, secondOutputUuid));
+            hasInputs ? List.of(inputUuid) : List.of(),
+            hasOutputs ? List.of(outputUuid) : List.of());
 
-    assertThat(write.inputDatasetUuids()).containsExactly(firstInputUuid, secondInputUuid);
-    assertThat(write.outputDatasetUuids()).containsExactly(firstOutputUuid, secondOutputUuid);
-
-    batchingDao.flushCurrentJobVersionIoInCurrentTransaction(write);
-
-    ArgumentCaptor<UUID[]> inputUuids = ArgumentCaptor.forClass(UUID[].class);
-    ArgumentCaptor<UUID[]> outputUuids = ArgumentCaptor.forClass(UUID[].class);
-    InOrder writes = inOrder(batchingDao);
-    writes.verify(batchingDao).markInputAndOutputDatasetsAsPreviousFor(jobVersionUuid, jobUuid);
-    writes
-        .verify(batchingDao)
-        .upsertCurrentInputAndOutputDatasetsChunk(
-            eq(jobVersionUuid),
-            inputUuids.capture(),
-            outputUuids.capture(),
-            eq(jobUuid),
-            eq(symlinkTargetJobUuid));
-    assertThat(inputUuids.getValue()).containsExactly(firstInputUuid, secondInputUuid);
-    assertThat(outputUuids.getValue()).containsExactly(firstOutputUuid, secondOutputUuid);
-  }
-
-  @Test
-  public void testPluralDatasetUpsertDoesNothingForEmptyLists() {
-    JobVersionDao batchingDao = mock(JobVersionDao.class, CALLS_REAL_METHODS);
-    UUID jobVersionUuid = UUID.randomUUID();
-    UUID jobUuid = UUID.randomUUID();
-    UUID symlinkTargetJobUuid = UUID.randomUUID();
-
-    batchingDao.upsertInputDatasetsFor(jobVersionUuid, List.of(), jobUuid, symlinkTargetJobUuid);
-    batchingDao.upsertOutputDatasetsFor(jobVersionUuid, List.of(), jobUuid, symlinkTargetJobUuid);
-
-    verify(batchingDao, never())
-        .markInputOrOutputDatasetAsPreviousFor(
-            any(UUID.class), any(UUID.class), any(JobVersionDao.IoType.class));
-    verify(batchingDao, never())
-        .upsertCurrentInputOrOutputDatasetsChunk(
-            any(UUID.class),
-            any(UUID[].class),
-            any(UUID.class),
-            any(UUID.class),
-            any(JobVersionDao.IoType.class));
-    verify(batchingDao, never())
-        .markInputAndOutputDatasetsAsPreviousFor(any(UUID.class), any(UUID.class));
-    verify(batchingDao, never())
-        .upsertCurrentInputAndOutputDatasetsChunk(
-            any(UUID.class),
-            any(UUID[].class),
-            any(UUID[].class),
-            any(UUID.class),
-            any(UUID.class));
-  }
-
-  @Test
-  public void testCurrentJobVersionIoWriteChunksSortedArraysAfterOneInvalidation() {
-    JobVersionDao batchingDao = mock(JobVersionDao.class, CALLS_REAL_METHODS);
-    UUID jobVersionUuid = UUID.randomUUID();
-    UUID jobUuid = UUID.randomUUID();
-    List<UUID> descendingDatasetUuids = new ArrayList<>();
-    for (long value = JobVersionDao.JOB_VERSION_IO_BATCH_SIZE + 1L; value > 0; value--) {
-      descendingDatasetUuids.add(new UUID(0L, value));
+    if (mutation == IoMutation.FLUSH) {
+      batchingDao.flushCurrentJobVersionIoInCurrentTransaction(write);
+    } else {
+      batchingDao.replaceOpenLineageCurrentJobVersionIoInCurrentTransaction(write);
     }
-    descendingDatasetUuids.add(new UUID(0L, 1L));
+    if (mutation == IoMutation.FLUSH && shape == IoShape.EMPTY) {
+      batchingDao.upsertInputDatasetsFor(jobVersionUuid, List.of(), jobUuid, symlinkTargetJobUuid);
+      batchingDao.upsertOutputDatasetsFor(jobVersionUuid, List.of(), jobUuid, symlinkTargetJobUuid);
+    }
+
+    InOrder calls = inOrder(batchingDao);
+    if (mutation == IoMutation.FLUSH) {
+      calls.verify(batchingDao).flushCurrentJobVersionIoInCurrentTransaction(write);
+    } else {
+      calls.verify(batchingDao).replaceOpenLineageCurrentJobVersionIoInCurrentTransaction(write);
+    }
+    if (mutation == IoMutation.REPLACE) {
+      calls.verify(batchingDao).markInputAndOutputDatasetsAsPreviousFor(jobUuid);
+    } else if (shape == IoShape.BOTH) {
+      calls.verify(batchingDao).markInputAndOutputDatasetsAsPreviousFor(jobVersionUuid, jobUuid);
+    } else if (shape != IoShape.EMPTY) {
+      calls
+          .verify(batchingDao)
+          .markInputOrOutputDatasetAsPreviousFor(
+              jobVersionUuid, jobUuid, shape == IoShape.INPUT_ONLY ? INPUT : OUTPUT);
+    }
+    ArgumentCaptor<UUID[]> datasetUuids = ArgumentCaptor.forClass(UUID[].class);
+    if (shape == IoShape.BOTH) {
+      ArgumentCaptor<UUID[]> outputUuids = ArgumentCaptor.forClass(UUID[].class);
+      calls
+          .verify(batchingDao)
+          .upsertCurrentInputAndOutputDatasetsChunk(
+              eq(jobVersionUuid),
+              datasetUuids.capture(),
+              outputUuids.capture(),
+              eq(jobUuid),
+              eq(symlinkTargetJobUuid));
+      assertThat(datasetUuids.getValue()).containsExactly(inputUuid);
+      assertThat(outputUuids.getValue()).containsExactly(outputUuid);
+    } else if (shape != IoShape.EMPTY) {
+      calls
+          .verify(batchingDao)
+          .upsertCurrentInputOrOutputDatasetsChunk(
+              eq(jobVersionUuid),
+              datasetUuids.capture(),
+              eq(jobUuid),
+              eq(symlinkTargetJobUuid),
+              eq(shape == IoShape.INPUT_ONLY ? INPUT : OUTPUT));
+      assertThat(datasetUuids.getValue()).containsExactly(hasInputs ? inputUuid : outputUuid);
+    }
+    if (mutation == IoMutation.FLUSH && shape == IoShape.EMPTY) {
+      calls
+          .verify(batchingDao)
+          .upsertInputDatasetsFor(jobVersionUuid, List.of(), jobUuid, symlinkTargetJobUuid);
+      calls.verify(batchingDao).flushCurrentJobVersionIoInCurrentTransaction(write);
+      calls
+          .verify(batchingDao)
+          .upsertOutputDatasetsFor(jobVersionUuid, List.of(), jobUuid, symlinkTargetJobUuid);
+      calls.verify(batchingDao).flushCurrentJobVersionIoInCurrentTransaction(write);
+    }
+    calls.verifyNoMoreInteractions();
+  }
+
+  @Test
+  public void testIoChunksUsePostgresqlUnsignedUuidOrderAcrossBatchBoundary() {
+    JobVersionDao batchingDao = mock(JobVersionDao.class, CALLS_REAL_METHODS);
+    UUID jobVersionUuid = UUID.randomUUID();
+    UUID jobUuid = UUID.randomUUID();
+    List<UUID> inputUuids = new ArrayList<>();
+    UUID unsignedHighMsb = new UUID(Long.MIN_VALUE, 0L);
+    UUID unsignedHighLsb = new UUID(0L, Long.MIN_VALUE);
+    inputUuids.add(unsignedHighMsb);
+    inputUuids.add(unsignedHighLsb);
+    for (long value = JobVersionDao.JOB_VERSION_IO_BATCH_SIZE; value >= 0; value--) {
+      inputUuids.add(new UUID(0L, value));
+    }
+    inputUuids.add(new UUID(0L, 0L));
 
     batchingDao.flushCurrentJobVersionIoInCurrentTransaction(
         JobVersionDao.CurrentJobVersionIoWrite.of(
-            jobVersionUuid, jobUuid, null, descendingDatasetUuids, List.of()));
+            jobVersionUuid, jobUuid, null, inputUuids, List.of()));
 
     verify(batchingDao).markInputOrOutputDatasetAsPreviousFor(jobVersionUuid, jobUuid, INPUT);
     ArgumentCaptor<UUID[]> chunks = ArgumentCaptor.forClass(UUID[].class);
@@ -283,90 +314,12 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
         .upsertCurrentInputOrOutputDatasetsChunk(
             eq(jobVersionUuid), chunks.capture(), eq(jobUuid), eq(null), eq(INPUT));
     assertThat(chunks.getAllValues().get(0))
-        .containsExactlyElementsOf(
-            java.util.stream.LongStream.rangeClosed(1, JobVersionDao.JOB_VERSION_IO_BATCH_SIZE)
-                .mapToObj(value -> new UUID(0L, value))
-                .collect(Collectors.toList()));
+        .containsExactlyElementsOf(uuidRange(0, JobVersionDao.JOB_VERSION_IO_BATCH_SIZE - 1L));
     assertThat(chunks.getAllValues().get(1))
-        .containsExactly(new UUID(0L, JobVersionDao.JOB_VERSION_IO_BATCH_SIZE + 1L));
-  }
-
-  @Test
-  public void testOutputOnlyIoWriteRetainsPerSideCompatibilityPath() {
-    JobVersionDao batchingDao = mock(JobVersionDao.class, CALLS_REAL_METHODS);
-    UUID jobVersionUuid = UUID.randomUUID();
-    UUID jobUuid = UUID.randomUUID();
-    UUID outputUuid = UUID.randomUUID();
-
-    batchingDao.flushCurrentJobVersionIoInCurrentTransaction(
-        JobVersionDao.CurrentJobVersionIoWrite.of(
-            jobVersionUuid, jobUuid, null, List.of(), List.of(outputUuid)));
-
-    verify(batchingDao).markInputOrOutputDatasetAsPreviousFor(jobVersionUuid, jobUuid, OUTPUT);
-    ArgumentCaptor<UUID[]> outputUuids = ArgumentCaptor.forClass(UUID[].class);
-    verify(batchingDao)
-        .upsertCurrentInputOrOutputDatasetsChunk(
-            eq(jobVersionUuid), outputUuids.capture(), eq(jobUuid), eq(null), eq(OUTPUT));
-    assertThat(outputUuids.getValue()).containsExactly(outputUuid);
-    verify(batchingDao, never())
-        .markInputAndOutputDatasetsAsPreviousFor(any(UUID.class), any(UUID.class));
-    verify(batchingDao, never())
-        .upsertCurrentInputAndOutputDatasetsChunk(
-            any(UUID.class),
-            any(UUID[].class),
-            any(UUID[].class),
-            any(UUID.class),
-            any(UUID.class));
-  }
-
-  @Test
-  public void testOrderedInputOnlyIoWriteReplacesBothCurrentSides() {
-    JobVersionDao batchingDao = mock(JobVersionDao.class, CALLS_REAL_METHODS);
-    UUID jobVersionUuid = UUID.randomUUID();
-    UUID jobUuid = UUID.randomUUID();
-    UUID inputUuid = UUID.randomUUID();
-
-    batchingDao.replaceOpenLineageCurrentJobVersionIoInCurrentTransaction(
-        JobVersionDao.CurrentJobVersionIoWrite.of(
-            jobVersionUuid, jobUuid, null, List.of(inputUuid), List.of()));
-
-    InOrder writes = inOrder(batchingDao);
-    writes.verify(batchingDao).markInputAndOutputDatasetsAsPreviousFor(jobUuid);
-    ArgumentCaptor<UUID[]> inputUuids = ArgumentCaptor.forClass(UUID[].class);
-    writes
-        .verify(batchingDao)
-        .upsertCurrentInputOrOutputDatasetsChunk(
-            eq(jobVersionUuid), inputUuids.capture(), eq(jobUuid), eq(null), eq(INPUT));
-    assertThat(inputUuids.getValue()).containsExactly(inputUuid);
-    verify(batchingDao, never())
-        .markInputAndOutputDatasetsAsPreviousFor(any(UUID.class), any(UUID.class));
-  }
-
-  @Test
-  public void testOrderedEmptyIoWriteStillClearsBothCurrentSides() {
-    JobVersionDao batchingDao = mock(JobVersionDao.class, CALLS_REAL_METHODS);
-    UUID jobVersionUuid = UUID.randomUUID();
-    UUID jobUuid = UUID.randomUUID();
-
-    batchingDao.replaceOpenLineageCurrentJobVersionIoInCurrentTransaction(
-        JobVersionDao.CurrentJobVersionIoWrite.of(
-            jobVersionUuid, jobUuid, null, List.of(), List.of()));
-
-    verify(batchingDao).markInputAndOutputDatasetsAsPreviousFor(jobUuid);
-    verify(batchingDao, never())
-        .upsertCurrentInputOrOutputDatasetsChunk(
-            any(UUID.class),
-            any(UUID[].class),
-            any(UUID.class),
-            any(UUID.class),
-            any(JobVersionDao.IoType.class));
-    verify(batchingDao, never())
-        .upsertCurrentInputAndOutputDatasetsChunk(
-            any(UUID.class),
-            any(UUID[].class),
-            any(UUID[].class),
-            any(UUID.class),
-            any(UUID.class));
+        .containsExactly(
+            new UUID(0L, JobVersionDao.JOB_VERSION_IO_BATCH_SIZE),
+            unsignedHighLsb,
+            unsignedHighMsb);
   }
 
   @Test
@@ -398,22 +351,10 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
             eq(jobUuid),
             eq(null));
 
-    assertThat(inputChunks.getAllValues().get(0))
-        .containsExactlyElementsOf(
-            java.util.stream.LongStream.rangeClosed(1, 750)
-                .mapToObj(value -> new UUID(0L, value))
-                .collect(Collectors.toList()));
-    assertThat(outputChunks.getAllValues().get(0))
-        .containsExactlyElementsOf(
-            java.util.stream.LongStream.rangeClosed(1001, 1250)
-                .mapToObj(value -> new UUID(0L, value))
-                .collect(Collectors.toList()));
+    assertThat(inputChunks.getAllValues().get(0)).containsExactlyElementsOf(uuidRange(1, 750));
+    assertThat(outputChunks.getAllValues().get(0)).containsExactlyElementsOf(uuidRange(1001, 1250));
     assertThat(inputChunks.getAllValues().get(1)).isEmpty();
-    assertThat(outputChunks.getAllValues().get(1))
-        .containsExactlyElementsOf(
-            java.util.stream.LongStream.rangeClosed(1251, 1750)
-                .mapToObj(value -> new UUID(0L, value))
-                .collect(Collectors.toList()));
+    assertThat(outputChunks.getAllValues().get(1)).containsExactlyElementsOf(uuidRange(1251, 1750));
     for (int index = 0; index < inputChunks.getAllValues().size(); index++) {
       assertThat(
               inputChunks.getAllValues().get(index).length
@@ -1053,28 +994,14 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
     assertThat(overlappingSnapshot.getOutputs()).contains(outputAlsoUsedAsInput);
     assertThatThrownBy(() -> overlappingSnapshot.getInputs().add(outputAlsoUsedAsInput))
         .isInstanceOf(UnsupportedOperationException.class);
-  }
 
-  @Test
-  public void testRunIoSnapshotIsEmptyForRunWithoutDatasets() {
-    final JobMeta emptyJobMeta =
-        new JobMeta(
-            newJobType(),
-            ImmutableSet.of(),
-            ImmutableSet.of(),
-            newLocation(),
-            newDescription(),
-            null,
-            null);
-    final JobRow emptyJob =
-        DbTestUtils.newJobWith(
-            jdbiForTesting, namespaceRow.getName(), newJobName().getValue(), emptyJobMeta);
-    final RunRow emptyRun = DbTestUtils.newRun(jdbiForTesting, emptyJob);
-
-    RunIoSnapshot snapshot = jobVersionDao.findRunIoSnapshot(emptyRun.getUuid());
-
-    assertThat(snapshot.getInputs()).isEmpty();
-    assertThat(snapshot.getOutputs()).isEmpty();
+    JobRow emptyJob =
+        DbTestUtils.createJobWithoutSymlinkTarget(
+            jdbiForTesting, namespaceRow, newJobName().getValue(), "");
+    RunIoSnapshot emptySnapshot =
+        jobVersionDao.findRunIoSnapshot(DbTestUtils.newRun(jdbiForTesting, emptyJob).getUuid());
+    assertThat(emptySnapshot.getInputs()).isEmpty();
+    assertThat(emptySnapshot.getOutputs()).isEmpty();
   }
 
   @Test
@@ -1127,31 +1054,13 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
     // (2) Attach job datasets
     List<DatasetRecord> datasetInputs = new ArrayList<>();
     for (DatasetId di : jobMeta.getInputs()) {
-      datasetInputs.add(
-          openLineageDao.upsertLineageDataset(
-              modelDaos,
-              LineageEvent.Dataset.builder()
-                  .namespace(di.getNamespace().getValue())
-                  .name(di.getName().getValue())
-                  .build(),
-              jobRow.getCreatedAt(),
-              null,
-              true));
+      datasetInputs.add(projectDataset(di, jobRow.getCreatedAt()));
     }
 
     // Attach output datasets.
     List<DatasetRecord> datasetOutputs = new ArrayList<>();
     for (DatasetId di : jobMeta.getOutputs()) {
-      datasetOutputs.add(
-          openLineageDao.upsertLineageDataset(
-              modelDaos,
-              LineageEvent.Dataset.builder()
-                  .namespace(di.getNamespace().getValue())
-                  .name(di.getName().getValue())
-                  .build(),
-              jobRow.getCreatedAt(),
-              null,
-              false));
+      datasetOutputs.add(projectDataset(di, jobRow.getCreatedAt()));
     }
 
     // (2) Upsert runless job version
@@ -1197,6 +1106,32 @@ public class JobVersionDaoTest extends BaseIntegrationTest {
         .get()
         .extracting(JobVersion::getOutputs, InstanceOfAssertFactories.list(DatasetId.class))
         .isNotEmpty();
+  }
+
+  private DatasetRecord projectDataset(DatasetId datasetId, Instant eventTime) {
+    DatasetEvent event =
+        DatasetEvent.builder()
+            .eventTime(eventTime.atZone(java.time.ZoneOffset.UTC))
+            .dataset(
+                LineageEvent.Dataset.builder()
+                    .namespace(datasetId.getNamespace().getValue())
+                    .name(datasetId.getName().getValue())
+                    .build())
+            .producer("job-version-dao-test")
+            .build();
+    String eventJson = Utils.toJson(event);
+    OpenLineageProjector.ProjectionResult projected =
+        openLineageDao.inTransaction(
+            transaction ->
+                OpenLineageProjector.getInstance()
+                    .projectInTransaction(
+                        transaction,
+                        Utils.getMapper(),
+                        new OpenLineageProjector.ProjectionRequest(event, eventJson, false)));
+    OpenLineageProjector.DatasetProjection dataset =
+        ((OpenLineageProjector.DatasetProjectionResult) projected).outputs().get(0);
+    return new DatasetRecord(
+        dataset.dataset(), dataset.version(), dataset.namespace(), dataset.columnLineage());
   }
 
   @Test

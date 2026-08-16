@@ -11,7 +11,7 @@ import static marquez.db.ColumnLineageTestUtils.getDatasetB;
 import static marquez.db.ColumnLineageTestUtils.getDatasetC;
 import static marquez.db.LineageTestUtils.PRODUCER_URL;
 import static marquez.db.LineageTestUtils.SCHEMA_URL;
-import static marquez.db.OpenLineageDao.DEFAULT_NAMESPACE_OWNER;
+import static marquez.db.OpenLineageDefaults.DEFAULT_NAMESPACE_OWNER;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertEquals;

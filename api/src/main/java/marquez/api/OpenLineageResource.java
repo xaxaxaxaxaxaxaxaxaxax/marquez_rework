@@ -14,7 +14,6 @@ import com.codahale.metrics.annotation.ResponseMetered;
 import com.codahale.metrics.annotation.Timed;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import io.dropwizard.jersey.jsr310.ZonedDateTimeParam;
-import java.util.Collections;
 import java.util.List;
 import javax.validation.Valid;
 import javax.validation.constraints.Min;
@@ -32,8 +31,9 @@ import lombok.NonNull;
 import lombok.Value;
 import lombok.extern.slf4j.Slf4j;
 import marquez.api.models.SortDirection;
+import marquez.common.Utils;
 import marquez.common.models.RunId;
-import marquez.db.OpenLineageDao;
+import marquez.db.OpenLineageEventDao;
 import marquez.db.OpenLineageQueueDao;
 import marquez.db.OpenLineageQueueDao.PreparedAdmission;
 import marquez.db.OpenLineageQueueDao.PreparedEvent;
@@ -51,15 +51,15 @@ public class OpenLineageResource extends BaseResource {
   private static final String DEFAULT_DEPTH = "20";
   static final int MAX_BATCH_SIZE = OpenLineageQueueDao.MAX_ADMISSION_EVENTS;
 
-  private final OpenLineageDao openLineageDao;
+  private final OpenLineageEventDao openLineageEventDao;
   private final OpenLineageIntake openLineageIntake;
 
   public OpenLineageResource(
       @NonNull final ServiceFactory serviceFactory,
-      @NonNull final OpenLineageDao openLineageDao,
+      @NonNull final OpenLineageEventDao openLineageEventDao,
       @NonNull final OpenLineageIntake openLineageIntake) {
     super(serviceFactory);
-    this.openLineageDao = openLineageDao;
+    this.openLineageEventDao = openLineageEventDao;
     this.openLineageIntake = openLineageIntake;
   }
 
@@ -130,9 +130,9 @@ public class OpenLineageResource extends BaseResource {
 
   private static void validateInputDatasetIds(BaseEvent event) {
     if (event instanceof LineageEvent lineageEvent) {
-      OpenLineageDao.validateDatasetIds(lineageEvent.getInputs());
+      Utils.validateOpenLineageDatasetIds(lineageEvent.getInputs());
     } else if (event instanceof JobEvent jobEvent) {
-      OpenLineageDao.validateDatasetIds(jobEvent.getInputs());
+      Utils.validateOpenLineageDatasetIds(jobEvent.getInputs());
     }
   }
 
@@ -162,14 +162,14 @@ public class OpenLineageResource extends BaseResource {
       @QueryParam("sortDirection") @DefaultValue("desc") SortDirection sortDirection,
       @QueryParam("limit") @DefaultValue("100") @Min(value = 0) int limit,
       @QueryParam("offset") @DefaultValue("0") @Min(value = 0) int offset) {
-    List<LineageEvent> events = Collections.emptyList();
-    switch (sortDirection) {
-      case DESC ->
-          events = openLineageDao.getAllLineageEventsDesc(before.get(), after.get(), limit, offset);
-      case ASC ->
-          events = openLineageDao.getAllLineageEventsAsc(before.get(), after.get(), limit, offset);
-    }
-    int totalCount = openLineageDao.getAllLineageTotalCount(before.get(), after.get());
+    List<LineageEvent> events =
+        switch (sortDirection) {
+          case DESC ->
+              openLineageEventDao.getAllLineageEventsDesc(before.get(), after.get(), limit, offset);
+          case ASC ->
+              openLineageEventDao.getAllLineageEventsAsc(before.get(), after.get(), limit, offset);
+        };
+    int totalCount = openLineageEventDao.getAllLineageTotalCount(before.get(), after.get());
     return Response.ok(new Events(events, totalCount)).build();
   }
 
@@ -179,7 +179,7 @@ public class OpenLineageResource extends BaseResource {
    *
    * @param runId the run to get upstream lineage from
    * @param depth the maximum depth of the upstream lineage
-   * @return the upstream lineage for that run up to `detph` levels
+   * @return the upstream lineage for that run up to {@code depth} levels
    */
   @Timed
   @ResponseMetered

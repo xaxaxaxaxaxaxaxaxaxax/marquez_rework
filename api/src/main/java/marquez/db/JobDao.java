@@ -5,7 +5,7 @@
 
 package marquez.db;
 
-import static marquez.db.OpenLineageDao.DEFAULT_NAMESPACE_OWNER;
+import static marquez.db.OpenLineageDefaults.DEFAULT_NAMESPACE_OWNER;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.net.URL;

@@ -235,14 +235,14 @@ final class TestingDb {
 
   void insert(@NonNull OpenLineage.RunEvent olEvent) {
     delegate
-        .onDemand(OpenLineageDao.class)
+        .onDemand(OpenLineageEventDao.class)
         .createLineageEvent(
             olEvent.getEventType().toString(),
             olEvent.getEventTime().toInstant(),
             olEvent.getRun().getRunId(),
             olEvent.getJob().getName(),
             olEvent.getJob().getNamespace(),
-            Columns.toPgObject(olEvent),
+            Columns.toPgObject(olEvent).getValue(),
             olEvent.getProducer().toASCIIString());
   }
 

@@ -44,7 +44,7 @@ public class BackfillTestUtils {
       String parentRunId,
       String parentJobName)
       throws SQLException, JsonProcessingException {
-    OpenLineageDao openLineageDao = jdbi.onDemand(OpenLineageDao.class);
+    OpenLineageEventDao openLineageEventDao = jdbi.onDemand(OpenLineageEventDao.class);
     RunArgsDao runArgsDao = jdbi.onDemand(RunArgsDao.class);
     RunDao runDao = jdbi.onDemand(RunDao.class);
     UUID jobUuid = writeJob(jdbi, jobName, now, namespace);
@@ -127,13 +127,13 @@ public class BackfillTestUtils {
     PGobject eventJson = new PGobject();
     eventJson.setType("json");
     eventJson.setValue(Utils.getMapper().writeValueAsString(event));
-    openLineageDao.createLineageEvent(
+    openLineageEventDao.createLineageEvent(
         COMPLETE,
         Instant.now(),
         runRow.getUuid(),
         jobName,
         namespace.getName(),
-        eventJson,
+        eventJson.getValue(),
         PRODUCER_URL.toString());
     return runRow;
   }

@@ -46,10 +46,21 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import marquez.common.Utils;
-import marquez.db.OpenLineageDao;
+import marquez.db.BaseDao;
+import marquez.db.OpenLineageProjector.DatasetProjectionResult;
+import marquez.db.OpenLineageProjector.JobProjectionResult;
+import marquez.db.OpenLineageProjector.JobVersionProjection;
+import marquez.db.OpenLineageProjector.ProjectionRequest;
+import marquez.db.OpenLineageProjector.ProjectionResult;
+import marquez.db.OpenLineageProjector.RunProjectionResult;
 import marquez.db.OpenLineageQueueDao;
+import marquez.db.models.JobRow;
+import marquez.db.models.JobVersionRow;
+import marquez.db.models.NamespaceRow;
 import marquez.db.models.OpenLineageQueueRow;
-import marquez.db.models.UpdateLineageRow;
+import marquez.db.models.RunArgsRow;
+import marquez.db.models.RunRow;
+import marquez.service.OpenLineageService.QueuedEvent;
 import marquez.service.models.BaseEvent;
 import marquez.service.models.DatasetEvent;
 import marquez.service.models.JobEvent;
@@ -75,11 +86,10 @@ class OpenLineageWorkerTest {
   private Connection connection;
   private Savepoint savepoint;
   private OpenLineageQueueDao transactionalQueueDao;
-  private OpenLineageDao transactionalOpenLineageDao;
+  private BaseDao transactionalBaseDao;
   private OpenLineageService openLineageService;
   private OpenLineageConfig config;
   private MetricRegistry metricRegistry;
-  private UpdateLineageRow update;
   private OpenLineageWorker worker;
   private List<String> transactionTrace;
   private final AtomicInteger activeConnectionsAtHandleClose = new AtomicInteger(-1);
@@ -92,11 +102,10 @@ class OpenLineageWorkerTest {
     connection = mock(Connection.class);
     savepoint = mock(Savepoint.class);
     transactionalQueueDao = mock(OpenLineageQueueDao.class);
-    transactionalOpenLineageDao = mock(OpenLineageDao.class);
+    transactionalBaseDao = mock(BaseDao.class);
     openLineageService = mock(OpenLineageService.class);
     config = mock(OpenLineageConfig.class);
     metricRegistry = new MetricRegistry();
-    update = mock(UpdateLineageRow.class);
     transactionTrace = Collections.synchronizedList(new ArrayList<>());
 
     when(config.getWorkerThreads()).thenReturn(2);
@@ -111,17 +120,19 @@ class OpenLineageWorkerTest {
     when(handle.getConnection()).thenReturn(connection);
     when(connection.setSavepoint()).thenReturn(savepoint);
     when(handle.attach(OpenLineageQueueDao.class)).thenReturn(transactionalQueueDao);
-    when(handle.attach(OpenLineageDao.class)).thenReturn(transactionalOpenLineageDao);
+    when(handle.attach(BaseDao.class)).thenReturn(transactionalBaseDao);
     when(transactionalQueueDao.lockNextDue()).thenReturn(Optional.empty());
     when(transactionalQueueDao.lockNextDueBatch(anyInt()))
         .thenAnswer(
             invocation -> transactionalQueueDao.lockNextDue().map(List::of).orElseGet(List::of));
-    when(openLineageService.processQueuedInTransaction(
-            any(BaseEvent.class), any(String.class), eq(transactionalOpenLineageDao)))
+    when(openLineageService.processQueuedBatchInTransaction(anyList(), eq(transactionalBaseDao)))
         .thenAnswer(
-            invocation -> invocation.getArgument(0) instanceof LineageEvent ? update : null);
+            invocation -> {
+              List<QueuedEvent> events = invocation.getArgument(0);
+              return events.stream().map(OpenLineageWorkerTest::projection).toList();
+            });
     when(openLineageService.publishQueuedEventBestEffort(
-            any(LineageEvent.class), any(UpdateLineageRow.class)))
+            any(LineageEvent.class), any(RunProjectionResult.class)))
         .thenReturn(0);
     when(openLineageService.publishQueuedEventsBestEffort(anyList())).thenReturn(0);
     when(jdbi.open()).thenReturn(handle);
@@ -177,7 +188,7 @@ class OpenLineageWorkerTest {
     verify(handle, never())
         .inTransaction(any(TransactionIsolationLevel.class), any(HandleCallback.class));
     verify(handle, times(2)).attach(OpenLineageQueueDao.class);
-    verify(handle, times(2)).attach(OpenLineageDao.class);
+    verify(handle, times(2)).attach(BaseDao.class);
     verify(transactionalQueueDao, times(2)).lockNextDue();
     assertThat(transactionTrace).containsExactly("begin", "commit", "begin", "commit");
     assertThat(activeConnectionsAtHandleClose).hasValue(0);
@@ -186,15 +197,17 @@ class OpenLineageWorkerTest {
     order.verify(connection).setSavepoint();
     order
         .verify(openLineageService)
-        .processQueuedInTransaction(
-            any(BaseEvent.class), eq(first.eventJson()), eq(transactionalOpenLineageDao));
+        .processQueuedBatchInTransaction(
+            argThat(events -> queuedJsons(events).equals(List.of(first.eventJson()))),
+            eq(transactionalBaseDao));
     order.verify(connection).releaseSavepoint(savepoint);
     order.verify(transactionalQueueDao).ackLocked(KEY, first.id());
     order.verify(connection).setSavepoint();
     order
         .verify(openLineageService)
-        .processQueuedInTransaction(
-            any(BaseEvent.class), eq(second.eventJson()), eq(transactionalOpenLineageDao));
+        .processQueuedBatchInTransaction(
+            argThat(events -> queuedJsons(events).equals(List.of(second.eventJson()))),
+            eq(transactionalBaseDao));
     order.verify(connection).releaseSavepoint(savepoint);
     order.verify(transactionalQueueDao).ackLocked(KEY, second.id());
   }
@@ -225,12 +238,11 @@ class OpenLineageWorkerTest {
     order.verify(connection).setSavepoint();
     order
         .verify(openLineageService)
-        .processQueuedInTransaction(
-            any(BaseEvent.class), eq(first.eventJson()), eq(transactionalOpenLineageDao));
-    order
-        .verify(openLineageService)
-        .processQueuedInTransaction(
-            any(BaseEvent.class), eq(second.eventJson()), eq(transactionalOpenLineageDao));
+        .processQueuedBatchInTransaction(
+            argThat(
+                events ->
+                    queuedJsons(events).equals(List.of(first.eventJson(), second.eventJson()))),
+            eq(transactionalBaseDao));
     order.verify(connection).releaseSavepoint(savepoint);
     order.verify(transactionalQueueDao).ackLockedAll(List.of(first, second));
     verify(transactionalQueueDao, never()).ackLocked(any(), anyLong());
@@ -247,26 +259,18 @@ class OpenLineageWorkerTest {
   }
 
   @Test
-  void datasetAndJobOnlyCompletionsAreCountedAndTimedWithoutPublication() {
-    long admissionId = 76L;
-    OpenLineageQueueRow dataset = batchRow(1, KEY, datasetEventJson(), 1, admissionId);
-    OpenLineageQueueRow job = batchRow(2, OTHER_KEY, jobEventJson(), 1, admissionId);
-    doReturn(List.of(dataset, job)).when(transactionalQueueDao).lockNextDueBatch(anyInt());
+  void nonRunCompletionIsCountedAndTimedWithoutPublication() {
+    OpenLineageQueueRow job = row(1, 1, jobEventJson());
+    when(transactionalQueueDao.lockNextDue()).thenReturn(Optional.of(job));
 
     OpenLineageWorker.TaskResult result = worker.processTask(allowEvents(1));
 
     assertThat(result)
-        .isEqualTo(new OpenLineageWorker.TaskResult(2, OpenLineageWorker.EventOutcome.COMPLETED));
+        .isEqualTo(new OpenLineageWorker.TaskResult(1, OpenLineageWorker.EventOutcome.COMPLETED));
     assertThat(transactionTrace).containsExactly("begin", "commit");
-    verify(transactionalQueueDao).ackLockedAll(List.of(dataset, job));
-    verify(openLineageService)
-        .processQueuedInTransaction(
-            any(DatasetEvent.class), eq(dataset.eventJson()), eq(transactionalOpenLineageDao));
-    verify(openLineageService)
-        .processQueuedInTransaction(
-            any(JobEvent.class), eq(job.eventJson()), eq(transactionalOpenLineageDao));
+    verify(transactionalQueueDao).ackLocked(KEY, job.id());
     verifyNoPublication();
-    assertThat(metricCount("succeeded")).isEqualTo(2);
+    assertThat(metricCount("succeeded")).isEqualTo(1);
     assertThat(metricRegistry.timer(metricName("post_commit_duration")).getCount()).isEqualTo(1);
   }
 
@@ -280,18 +284,21 @@ class OpenLineageWorkerTest {
     doReturn(List.of(first, retry, blockedFollower, independent))
         .when(transactionalQueueDao)
         .lockNextDueBatch(anyInt());
-    when(openLineageService.processQueuedInTransaction(
-            any(BaseEvent.class), any(String.class), eq(transactionalOpenLineageDao)))
+    when(openLineageService.processQueuedBatchInTransaction(anyList(), eq(transactionalBaseDao)))
         .thenAnswer(
             invocation -> {
-              String eventJson = invocation.getArgument(1);
+              List<QueuedEvent> events = invocation.getArgument(0);
+              if (events.size() > 1) {
+                throw new IllegalStateException("batch projection failed");
+              }
+              String eventJson = events.get(0).eventJson();
               if (eventJson.equals(retry.eventJson())) {
                 throw new IllegalStateException("retry this lane");
               }
               if (eventJson.equals(independent.eventJson())) {
                 throw new IllegalArgumentException("discard this event");
               }
-              return update;
+              return List.of(projection(events.get(0)));
             });
 
     OpenLineageWorker.TaskResult result = worker.processTask(allowEvents(1));
@@ -319,19 +326,36 @@ class OpenLineageWorkerTest {
             independent.attemptCount(),
             "java.lang.IllegalArgumentException: discard this event");
     verify(transactionalQueueDao, never()).ackLockedAll(anyList());
-    verify(openLineageService, times(2))
-        .processQueuedInTransaction(
-            any(BaseEvent.class), eq(first.eventJson()), eq(transactionalOpenLineageDao));
-    verify(openLineageService, times(2))
-        .processQueuedInTransaction(
-            any(BaseEvent.class), eq(retry.eventJson()), eq(transactionalOpenLineageDao));
     verify(openLineageService)
-        .processQueuedInTransaction(
-            any(BaseEvent.class), eq(independent.eventJson()), eq(transactionalOpenLineageDao));
+        .processQueuedBatchInTransaction(
+            argThat(
+                events ->
+                    queuedJsons(events)
+                        .equals(
+                            List.of(
+                                first.eventJson(),
+                                retry.eventJson(),
+                                blockedFollower.eventJson(),
+                                independent.eventJson()))),
+            eq(transactionalBaseDao));
+    verify(openLineageService)
+        .processQueuedBatchInTransaction(
+            argThat(events -> queuedJsons(events).equals(List.of(first.eventJson()))),
+            eq(transactionalBaseDao));
+    verify(openLineageService)
+        .processQueuedBatchInTransaction(
+            argThat(events -> queuedJsons(events).equals(List.of(retry.eventJson()))),
+            eq(transactionalBaseDao));
+    verify(openLineageService)
+        .processQueuedBatchInTransaction(
+            argThat(events -> queuedJsons(events).equals(List.of(independent.eventJson()))),
+            eq(transactionalBaseDao));
     verify(openLineageService, never())
-        .processQueuedInTransaction(
-            any(BaseEvent.class), eq(blockedFollower.eventJson()), eq(transactionalOpenLineageDao));
-    verify(openLineageService).publishQueuedEventBestEffort(any(LineageEvent.class), eq(update));
+        .processQueuedBatchInTransaction(
+            argThat(events -> queuedJsons(events).equals(List.of(blockedFollower.eventJson()))),
+            eq(transactionalBaseDao));
+    verify(openLineageService)
+        .publishQueuedEventBestEffort(any(LineageEvent.class), any(RunProjectionResult.class));
     verify(openLineageService, never()).publishQueuedEventsBestEffort(anyList());
     assertThat(metricCount("batch_fallback")).isEqualTo(1);
     assertThat(metricCount("selected")).isEqualTo(4);
@@ -350,8 +374,7 @@ class OpenLineageWorkerTest {
     OpenLineageQueueRow second = batchRow(2, OTHER_KEY, 1, admissionId);
     CancellationException cancelled = new CancellationException("batch cancelled");
     doReturn(List.of(first, second)).when(transactionalQueueDao).lockNextDueBatch(anyInt());
-    when(openLineageService.processQueuedInTransaction(
-            any(BaseEvent.class), eq(first.eventJson()), eq(transactionalOpenLineageDao)))
+    when(openLineageService.processQueuedBatchInTransaction(anyList(), eq(transactionalBaseDao)))
         .thenThrow(cancelled);
 
     assertThatThrownBy(() -> worker.processTask(allowEvents(1)))
@@ -363,11 +386,11 @@ class OpenLineageWorkerTest {
     verify(transactionalQueueDao, never()).acquireOrderingKeyLocks(any(UUID[].class));
     verify(transactionalQueueDao, never()).ackLockedAll(anyList());
     verify(openLineageService)
-        .processQueuedInTransaction(
-            any(BaseEvent.class), eq(first.eventJson()), eq(transactionalOpenLineageDao));
-    verify(openLineageService, never())
-        .processQueuedInTransaction(
-            any(BaseEvent.class), eq(second.eventJson()), eq(transactionalOpenLineageDao));
+        .processQueuedBatchInTransaction(
+            argThat(
+                events ->
+                    queuedJsons(events).equals(List.of(first.eventJson(), second.eventJson()))),
+            eq(transactionalBaseDao));
     verifyNoPublication();
     assertThat(metricCount("batch_fallback")).isZero();
     assertThat(worker.healthStatus().failure()).isNotNull();
@@ -441,7 +464,7 @@ class OpenLineageWorkerTest {
   void ordinaryProjectionFailureRollsBackSavepointAndCommitsRetry() throws Exception {
     OpenLineageQueueRow row = row(1, 1);
     when(transactionalQueueDao.lockNextDue()).thenReturn(Optional.of(row));
-    when(openLineageService.processQueuedInTransaction(any(), any(), any()))
+    when(openLineageService.processQueuedBatchInTransaction(anyList(), any()))
         .thenThrow(new IllegalStateException("temporary\0\nfailure"));
 
     OpenLineageWorker.TaskResult result = worker.processTask(allowEvents(1));
@@ -449,7 +472,7 @@ class OpenLineageWorkerTest {
     assertThat(result.outcome()).isEqualTo(OpenLineageWorker.EventOutcome.RETRIED);
     InOrder order = inOrder(connection, openLineageService, transactionalQueueDao);
     order.verify(connection).setSavepoint();
-    order.verify(openLineageService).processQueuedInTransaction(any(), any(), any());
+    order.verify(openLineageService).processQueuedBatchInTransaction(anyList(), any());
     order.verify(connection).rollback(savepoint);
     order
         .verify(transactionalQueueDao)
@@ -465,23 +488,28 @@ class OpenLineageWorkerTest {
   }
 
   @Test
-  void failureAtAttemptLimitCommitsDeadLetter() throws Exception {
-    OpenLineageQueueRow row = row(1, 3);
+  void conflictingProjectionResultCardinalityRetriesWithoutAcknowledging() throws Exception {
+    OpenLineageQueueRow row = row(1, 1);
     when(transactionalQueueDao.lockNextDue()).thenReturn(Optional.of(row));
-    when(openLineageService.processQueuedInTransaction(any(), any(), any()))
-        .thenThrow(new IllegalStateException("still failing"));
+    when(openLineageService.processQueuedBatchInTransaction(anyList(), any()))
+        .thenReturn(List.of());
 
     OpenLineageWorker.TaskResult result = worker.processTask(allowEvents(1));
 
-    assertThat(result.outcome()).isEqualTo(OpenLineageWorker.EventOutcome.DEAD_LETTERED);
+    assertThat(result.outcome()).isEqualTo(OpenLineageWorker.EventOutcome.RETRIED);
     verify(connection).rollback(savepoint);
     verify(transactionalQueueDao)
-        .deadLetterLocked(KEY, row.id(), 3, "java.lang.IllegalStateException: still failing");
+        .retryLocked(
+            KEY,
+            row.id(),
+            row.attemptCount(),
+            "java.lang.IllegalStateException: Expected 1 queued OpenLineage projection results, "
+                + "but received 0",
+            500L);
+    verify(transactionalQueueDao, never()).ackLocked(any(), eq(row.id()));
     verify(transactionalQueueDao, never())
-        .retryLocked(any(), eq(row.id()), eq(3), any(), anyLong());
-    assertThat(transactionTrace).containsExactly("begin", "commit");
-    assertThat(metricCount("dead_lettered")).isEqualTo(1);
-    assertThat(worker.healthStatus().failure()).isNull();
+        .deadLetterLocked(any(), eq(row.id()), eq(row.attemptCount()), any());
+    verifyNoPublication();
   }
 
   @Test
@@ -503,7 +531,7 @@ class OpenLineageWorkerTest {
     OpenLineageQueueRow row = row(1, 1);
     AssertionError fatal = new AssertionError("fatal projection");
     when(transactionalQueueDao.lockNextDue()).thenReturn(Optional.of(row));
-    when(openLineageService.processQueuedInTransaction(any(), any(), any())).thenThrow(fatal);
+    when(openLineageService.processQueuedBatchInTransaction(anyList(), any())).thenThrow(fatal);
 
     assertThatThrownBy(() -> worker.processTask(allowEvents(1))).isSameAs(fatal);
 
@@ -519,7 +547,7 @@ class OpenLineageWorkerTest {
     OpenLineageQueueRow row = row(1, 1);
     CancellationException cancelled = new CancellationException("cancelled");
     when(transactionalQueueDao.lockNextDue()).thenReturn(Optional.of(row));
-    when(openLineageService.processQueuedInTransaction(any(), any(), any())).thenThrow(cancelled);
+    when(openLineageService.processQueuedBatchInTransaction(anyList(), any())).thenThrow(cancelled);
 
     assertThatThrownBy(() -> worker.processTask(allowEvents(1)))
         .isInstanceOf(RuntimeException.class)
@@ -535,7 +563,7 @@ class OpenLineageWorkerTest {
   void shutdownCancellationDoesNotCountRolledBackEventAsProcessed() throws Exception {
     OpenLineageQueueRow row = row(1, 1);
     when(transactionalQueueDao.lockNextDue()).thenReturn(Optional.of(row));
-    when(openLineageService.processQueuedInTransaction(any(), any(), any()))
+    when(openLineageService.processQueuedBatchInTransaction(anyList(), any()))
         .thenAnswer(
             invocation -> {
               worker.stop();
@@ -560,7 +588,7 @@ class OpenLineageWorkerTest {
     OpenLineageQueueRow row = row(1, 1);
     IllegalStateException transitionFailure = new IllegalStateException("database unavailable");
     when(transactionalQueueDao.lockNextDue()).thenReturn(Optional.of(row));
-    when(openLineageService.processQueuedInTransaction(any(), any(), any()))
+    when(openLineageService.processQueuedBatchInTransaction(anyList(), any()))
         .thenThrow(new IllegalStateException("projection failed"));
     doThrow(transitionFailure)
         .when(transactionalQueueDao)
@@ -583,7 +611,8 @@ class OpenLineageWorkerTest {
   void reportedBestEffortFailuresAreNonfatal() {
     OpenLineageQueueRow row = row(1, 1);
     when(transactionalQueueDao.lockNextDue()).thenReturn(Optional.of(row));
-    when(openLineageService.publishQueuedEventBestEffort(any(), eq(update))).thenReturn(2);
+    when(openLineageService.publishQueuedEventBestEffort(any(), any(RunProjectionResult.class)))
+        .thenReturn(2);
 
     OpenLineageWorker.TaskResult result = worker.processTask(allowEvents(1));
 
@@ -629,7 +658,8 @@ class OpenLineageWorkerTest {
     OpenLineageQueueRow row = row(1, 1);
     AssertionError fatal = new AssertionError("fatal publisher");
     when(transactionalQueueDao.lockNextDue()).thenReturn(Optional.of(row));
-    when(openLineageService.publishQueuedEventBestEffort(any(), eq(update))).thenThrow(fatal);
+    when(openLineageService.publishQueuedEventBestEffort(any(), any(RunProjectionResult.class)))
+        .thenThrow(fatal);
 
     assertThatThrownBy(() -> worker.processTask(allowEvents(1))).isSameAs(fatal);
 
@@ -662,7 +692,8 @@ class OpenLineageWorkerTest {
       verify(transactionalQueueDao).lockNextDueBatch(remaining);
     }
     verify(transactionalQueueDao, times(8)).ackLocked(eq(KEY), anyLong());
-    verify(openLineageService, times(8)).publishQueuedEventBestEffort(any(), eq(update));
+    verify(openLineageService, times(8))
+        .publishQueuedEventBestEffort(any(), any(RunProjectionResult.class));
     assertThat(transactionTrace).hasSize(16);
   }
 
@@ -794,7 +825,7 @@ class OpenLineageWorkerTest {
     CountDownLatch projectionEntered = new CountDownLatch(1);
     CountDownLatch abortRan = new CountDownLatch(1);
     AtomicReference<Thread> abortThread = new AtomicReference<>();
-    when(openLineageService.processQueuedInTransaction(any(), any(), any()))
+    when(openLineageService.processQueuedBatchInTransaction(anyList(), any()))
         .thenAnswer(
             invocation -> {
               projectionEntered.countDown();
@@ -847,7 +878,7 @@ class OpenLineageWorkerTest {
     OpenLineageService blockingService = mock(OpenLineageService.class);
     CountDownLatch projectionsEntered = new CountDownLatch(2);
     CountDownLatch releaseProjections = new CountDownLatch(1);
-    when(blockingService.processQueuedInTransaction(any(), any(), any()))
+    when(blockingService.processQueuedBatchInTransaction(anyList(), any()))
         .thenAnswer(
             invocation -> {
               projectionsEntered.countDown();
@@ -926,13 +957,13 @@ class OpenLineageWorkerTest {
       throws Exception {
     Savepoint transactionSavepoint = mock(Savepoint.class);
     OpenLineageQueueDao transactionQueue = mock(OpenLineageQueueDao.class);
-    OpenLineageDao transactionOpenLineage = mock(OpenLineageDao.class);
+    BaseDao transactionDaos = mock(BaseDao.class);
     when(transactionHandle.getTransactionIsolationLevel())
         .thenReturn(TransactionIsolationLevel.READ_COMMITTED);
     when(transactionHandle.getConnection()).thenReturn(transactionConnection);
     when(transactionConnection.setSavepoint()).thenReturn(transactionSavepoint);
     when(transactionHandle.attach(OpenLineageQueueDao.class)).thenReturn(transactionQueue);
-    when(transactionHandle.attach(OpenLineageDao.class)).thenReturn(transactionOpenLineage);
+    when(transactionHandle.attach(BaseDao.class)).thenReturn(transactionDaos);
     when(transactionQueue.lockNextDue()).thenReturn(Optional.of(lockedRow));
     when(transactionQueue.lockNextDueBatch(anyInt())).thenReturn(List.of(lockedRow));
     when(transactionHandle.inTransaction(any(HandleCallback.class)))
@@ -1027,16 +1058,62 @@ class OpenLineageWorkerTest {
   }
 
   private static String eventJson(long id) {
-    return Utils.toJson(
-        LineageEvent.builder()
-            .eventType("START")
-            .eventTime(NOW.atZone(ZoneOffset.UTC))
-            .run(new LineageEvent.Run(new UUID(0, id).toString(), null))
-            .job(LineageEvent.Job.builder().namespace("namespace").name("job").build())
-            .inputs(List.of())
-            .outputs(List.of())
-            .producer("https://example.com/producer")
-            .build());
+    return Utils.toJson(lineageEvent(id));
+  }
+
+  private static LineageEvent lineageEvent(long id) {
+    return LineageEvent.builder()
+        .eventType("START")
+        .eventTime(NOW.atZone(ZoneOffset.UTC))
+        .run(new LineageEvent.Run(new UUID(0, id).toString(), null))
+        .job(LineageEvent.Job.builder().namespace("namespace").name("job").build())
+        .inputs(List.of())
+        .outputs(List.of())
+        .producer("https://example.com/producer")
+        .build();
+  }
+
+  private static List<String> queuedJsons(List<QueuedEvent> events) {
+    return events.stream().map(QueuedEvent::eventJson).toList();
+  }
+
+  private static ProjectionResult projection(QueuedEvent queuedEvent) {
+    BaseEvent event = queuedEvent.event();
+    ProjectionRequest request = new ProjectionRequest(event, queuedEvent.eventJson(), false);
+    if (event instanceof LineageEvent) {
+      return runProjection(request);
+    }
+    if (event instanceof JobEvent) {
+      return new JobProjectionResult(
+          request,
+          mock(NamespaceRow.class),
+          mock(JobRow.class),
+          Optional.empty(),
+          Optional.empty(),
+          new JobVersionProjection(
+              mock(JobRow.class), mock(JobVersionRow.class), List.of(), List.of()));
+    }
+    if (event instanceof DatasetEvent) {
+      return new DatasetProjectionResult(request, mock(NamespaceRow.class), List.of());
+    }
+    throw new IllegalArgumentException("unsupported test event " + event.getClass().getName());
+  }
+
+  private static RunProjectionResult runProjection(ProjectionRequest request) {
+    LineageEvent event = (LineageEvent) request.event();
+    RunRow run = mock(RunRow.class);
+    when(run.getUuid()).thenReturn(UUID.fromString(event.getRun().getRunId()));
+    return new RunProjectionResult(
+        request,
+        mock(NamespaceRow.class),
+        mock(JobRow.class),
+        mock(RunArgsRow.class),
+        run,
+        null,
+        Optional.empty(),
+        Optional.empty(),
+        null,
+        null);
   }
 
   private static String datasetEventJson() {

@@ -21,6 +21,7 @@ import marquez.db.NamespaceDao;
 import marquez.db.RunArgsDao;
 import marquez.db.RunDao;
 import marquez.db.RunFacetsDao;
+import marquez.db.RunIoStateDao;
 import marquez.db.RunStateDao;
 import marquez.db.SourceDao;
 
@@ -45,6 +46,7 @@ public final class ModelDaos {
   private RunArgsDao runArgsDao = null;
   private RunStateDao runStateDao = null;
   private RunFacetsDao runFacetsDao = null;
+  private RunIoStateDao runIoStateDao = null;
   private final BaseDao baseDao;
 
   public ModelDaos(BaseDao baseDao) {
@@ -154,6 +156,13 @@ public final class ModelDaos {
       runFacetsDao = baseDao.createRunFacetsDao();
     }
     return runFacetsDao;
+  }
+
+  public RunIoStateDao getRunIoStateDao() {
+    if (runIoStateDao == null) {
+      runIoStateDao = baseDao.createRunIoStateDao();
+    }
+    return runIoStateDao;
   }
 
   public JobVersionDao getJobVersionDao() {

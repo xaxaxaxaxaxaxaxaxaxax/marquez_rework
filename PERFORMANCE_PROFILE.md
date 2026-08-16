@@ -1,6 +1,6 @@
 # Cumulative performance profile
 
-Profile date: 2026-08-15
+Profile date: 2026-08-16
 
 This is an indicative, correctness-gated PostgreSQL 14 profile of the rework against the
 unmodified repository at `/tmp/marquez-rework-upstream`. It is not a production capacity test.
@@ -349,46 +349,52 @@ JAVA_TOOL_OPTIONS=-DrunOpenLineageBatchThroughputBenchmark=true \
   --tests marquez.OpenLineageBatchThroughputBenchmark
 ```
 
-### Request-bounded projection batching methodology
+### Batch-first projection semantics and performance gate
 
-`OpenLineageBatchPipelineThroughputBenchmark` is the opt-in gate for downstream projection
-batching. It compares `projectionBatchSize=1` and `projectionBatchSize=8` against the same
-deterministic eight-event admissions in one JVM. A benchmark-local PostgreSQL 14 container is
-migrated with Flyway, and the worker uses a Dropwizard managed pool fixed at one reusable physical
-connection with READ COMMITTED isolation. No running Marquez application is required.
+The queued worker projects each locked claim through `OpenLineageProjector.projectBatchInTransaction(...)`. The kernel canonicalizes the claim's primary/alias graph, retains every event-owned fact, and applies shared job/dataset snapshots using `(UTC eventTime, SHA-256 of exact queued JSON)` last-write-wins ordering. Its aligned effective results preserve per-event post-commit listener behavior.
 
-Admission and fixture construction are outside timing; this benchmark reports drain only. After
-each clean seed, `VACUUM (ANALYZE)` runs outside timing so both variants start with reclaimed tuples
-and statistics for the actual fixture. An aggregate V81 gate verifies queue rows, heads, distinct
-admissions, non-null membership, and exact eight-row admission sizes without reading or reparsing
-payload JSON. Drain timing begins immediately before the one-thread worker starts and ends when its
-commit-observed `succeeded` meter reaches the event count. Queue emptiness and raw and relational
-projection counts are checked afterward.
+V83 adds authoritative per-side run I/O in `open_lineage_run_io_state`, keyed by `(run_uuid, io_type)`. Each row has its own LWW watermark and ordered dataset-version UUID occurrences; sides are independent:
 
-One warm-up pair precedes seven measured pairs, measured order alternates, and both cells in a pair
-use identical fixture identities. The primary statistic is the median of paired drain-throughput
-ratios, accompanied by its range and pair wins; variant medians and ranges are descriptive. The
-benchmark uses the canonical [worker metric algebra](METRICS.md#durable-openlineage-intake). For
-this full all-success fixture it additionally requires `S = O = events` and `S = B*K`; any retry,
-dead letter, fallback, worker failure, forced or incomplete shutdown, or unhealthy pre-stop worker
-invalidates the cell.
+- An omitted `inputs` or `outputs` member does not update that side and retains its prior value.
+- A present empty list writes an empty UUID array and clears that side.
+- A present non-empty list replaces that side with the reported ordered occurrences.
 
-There is currently no publishable projection-batching performance result. The previous result was
-collected through a non-pooled `PGSimpleDataSource`, so the batch-size-one cell opened roughly one
-physical PostgreSQL connection per claim while the batch-size-eight cell opened roughly one per
-eight events. That violated physical comparability; its throughput and WAL figures and their tuning
-conclusions are retracted. WAL is no longer mixed into this throughput benchmark: an unchecked LSN
-delta is cluster-global, while forcing a checkpoint before every cell would introduce full-page
-images and alter the measured drain workload. A repaired full pooled run is required before changing
-the configured default or publishing a replacement claim.
+V83 intentionally has no backfill: a side without a V83 row reads its cumulative legacy mapping until a later report makes the authoritative row win for that side. This is forward-only compatibility. Roll out by direct replacement—stop old projectors, apply V83, then start the new version—with no binary overlap. Helm's `Recreate` strategy enforces the boundary and permits brief API unavailability.
 
-Run the benchmark explicitly; it is disabled in normal test execution:
+The opt-in `OpenLineageBatchPipelineThroughputBenchmark` compares `projectionBatchSize=1` and `8` against identical deterministic eight-event admissions in one JVM:
+
+| Workload | Per-admission shape |
+|---|---|
+| M0 | Eight distinct required-only RunEvents with omitted I/O. |
+| M1 | Four START/COMPLETE run pairs; each event reports three inputs and three outputs with eight schema fields per dataset. |
+| M3 | M1 with 32 fields per dataset and 256 physical column edges per run: 32 output fields by eight input-field references. |
+| HOT | One worker-projected COMPLETE seed followed by byte-identical COMPLETE replays for the same run, job, six datasets, and 8-field schemas. |
+
+A local PostgreSQL 14 container is migrated through the tested revision. A one-connection Dropwizard pool uses READ COMMITTED; no Marquez app is needed. Fixture creation, HOT seeding, durable admission, and `VACUUM (ANALYZE)` precede timing. Defaults are two warm-up and 16 measured admissions (128 events), configurable with `.warmupAdmissions` and `.admissionsPerCell` under `openLineageBatchPipelineBenchmark`.
+
+Every workload has one warm-up pair and exactly seven measured pairs, alternating size order with identical identities. Timing spans one-thread worker start through the commit-observed `succeeded` count. Stable `OPENLINEAGE_PROJECTOR_SAMPLE schema=1` lines carry revision, cell identity/counts, and exact drain nanoseconds; summaries report medians/ranges and paired size ratios.
+
+Correctness gates timing. Before drain: exact queue rows/heads, V81 admissions, non-null membership, eight-row admission sizes, and seed raw count. After drain: empty queue; exact raw-event, distinct-run, run, state, job, dataset, field, M3 column-edge, and (on V83+) authoritative input/output side and ordered-occurrence counts. The benchmark also enforces [worker metric algebra](METRICS.md#durable-openlineage-intake), complete selection/commit, a multi-event size-eight claim, healthy pre-stop worker, and zero retry, dead-letter, fallback, worker-failure, forced-shutdown, and incomplete-shutdown meters; the HOT seed gets the same gates.
+
+Candidate samples pair with a baseline by workload, batch size, and trial, with exact admission/event-count matching. Every one of the eight cells must retain at least 95% at the median of seven paired throughput ratios. V82 auto-detection prints `legacy_baseline=true` and skips only the unavailable authoritative-I/O table gates; queue, raw, model, worker, and health gates remain. Use:
 
 ```text
-JAVA_TOOL_OPTIONS=-DrunOpenLineageBatchPipelineThroughputBenchmark=true \
+set -o pipefail
+
+JAVA_TOOL_OPTIONS="-DrunOpenLineageBatchPipelineThroughputBenchmark=true \
+  -DopenLineageBatchPipelineBenchmark.revision=baseline" \
+  ./gradlew --rerun-tasks :api:testIntegration \
+  --tests marquez.OpenLineageBatchPipelineThroughputBenchmark \
+  | tee /tmp/openlineage-projector-baseline.log
+
+JAVA_TOOL_OPTIONS="-DrunOpenLineageBatchPipelineThroughputBenchmark=true \
+  -DopenLineageBatchPipelineBenchmark.revision=candidate \
+  -DopenLineageBatchPipelineBenchmark.baselineResults=/tmp/openlineage-projector-baseline.log" \
   ./gradlew --rerun-tasks :api:testIntegration \
   --tests marquez.OpenLineageBatchPipelineThroughputBenchmark
 ```
+
+Run both revisions on the same idle host, JDK, PostgreSQL image, and properties. A regression `FAIL` is followed by an assertion failure. No publishable post-rework result exists yet; run this pooled gate before changing the default or making a throughput claim. WAL is excluded because LSN deltas are cluster-global and per-cell checkpoints add full-page images that change the workload.
 
 ## Native bespoke stats-query profile
 

@@ -15,7 +15,6 @@ import marquez.db.JobDao;
 import marquez.db.JobVersionDao;
 import marquez.db.LineageDao;
 import marquez.db.NamespaceDao;
-import marquez.db.OpenLineageDao;
 import marquez.db.RunArgsDao;
 import marquez.db.RunDao;
 import marquez.db.RunStateDao;
@@ -52,11 +51,6 @@ public class DelegatingDaos {
   @RequiredArgsConstructor
   public static class DelegatingNamespaceDao implements NamespaceDao {
     @Delegate private final NamespaceDao delegate;
-  }
-
-  @RequiredArgsConstructor
-  public static class DelegatingOpenLineageDao implements OpenLineageDao {
-    @Delegate private final OpenLineageDao delegate;
   }
 
   @RequiredArgsConstructor

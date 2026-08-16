@@ -9,6 +9,7 @@ import static marquez.db.Columns.stringOrThrow;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableSortedSet;
+import com.google.common.collect.Lists;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Instant;
@@ -56,6 +57,7 @@ import org.jdbi.v3.sqlobject.transaction.Transaction;
 @RegisterRowMapper(JobVersionMapper.class)
 @RegisterRowMapper(JobDataMapper.class)
 @RegisterRowMapper(RunIoRowMapper.class)
+@RegisterRowMapper(JobVersionDao.JobDatasetMapper.class)
 public interface JobVersionDao extends BaseDao {
   int JOB_VERSION_IO_BATCH_SIZE = 1000;
 
@@ -269,7 +271,6 @@ public interface JobVersionDao extends BaseDao {
       @Bind("jobUuid") UUID jobUuid,
       @Bind("symlinkTargetJobUuid") UUID symlinkTargetJobUuid);
 
-  /** Compatibility entry point retaining the pre-batching public DAO contract. */
   @Transaction
   default void upsertCurrentInputOrOutputDatasetsFor(
       UUID jobVersionUuid,
@@ -279,13 +280,12 @@ public interface JobVersionDao extends BaseDao {
       IoType ioType) {
     upsertCurrentInputOrOutputDatasetsInCurrentTransaction(
         jobVersionUuid,
-        ImmutableSortedSet.copyOf(Objects.requireNonNull(datasetUuids, "datasetUuids")),
+        postgresUuidSet(Objects.requireNonNull(datasetUuids, "datasetUuids")),
         jobUuid,
         symlinkTargetJobUuid,
         ioType);
   }
 
-  /** Used to upsert a single input or output dataset to a given job version. */
   default void upsertCurrentInputOrOutputDatasetFor(
       UUID jobVersionUuid,
       UUID datasetUuid,
@@ -338,19 +338,13 @@ public interface JobVersionDao extends BaseDao {
   """)
   void markInputAndOutputDatasetsAsPreviousFor(UUID jobUuid);
 
-  /**
-   * Used to link an input dataset to a given job version.
-   *
-   * @param inputDatasetUuid The unique ID of the input dataset.
-   * @param jobUuid The unique ID of the job.
-   */
+  /** Links one input dataset to a job version. */
   default void upsertInputDatasetFor(
       UUID jobVersionUuid, UUID inputDatasetUuid, UUID jobUuid, UUID symlinkTargetJobUuid) {
     upsertInputDatasetsFor(
         jobVersionUuid, List.of(inputDatasetUuid), jobUuid, symlinkTargetJobUuid);
   }
 
-  /** Used to link input datasets to a given job version. */
   @Transaction
   default void upsertInputDatasetsFor(
       UUID jobVersionUuid, List<UUID> inputDatasetUuids, UUID jobUuid, UUID symlinkTargetJobUuid) {
@@ -359,19 +353,13 @@ public interface JobVersionDao extends BaseDao {
             jobVersionUuid, jobUuid, symlinkTargetJobUuid, inputDatasetUuids, List.of()));
   }
 
-  /**
-   * Used to link an output dataset to a given job version.
-   *
-   * @param outputDatasetUuid The unique ID of the output dataset.
-   * @param jobUuid The unique ID of the job.
-   */
+  /** Links one output dataset to a job version. */
   default void upsertOutputDatasetFor(
       UUID jobVersionUuid, UUID outputDatasetUuid, UUID jobUuid, UUID symlinkTargetJobUuid) {
     upsertOutputDatasetsFor(
         jobVersionUuid, List.of(outputDatasetUuid), jobUuid, symlinkTargetJobUuid);
   }
 
-  /** Used to link output datasets to a given job version. */
   @Transaction
   default void upsertOutputDatasetsFor(
       UUID jobVersionUuid, List<UUID> outputDatasetUuids, UUID jobUuid, UUID symlinkTargetJobUuid) {
@@ -380,57 +368,46 @@ public interface JobVersionDao extends BaseDao {
             jobVersionUuid, jobUuid, symlinkTargetJobUuid, List.of(), outputDatasetUuids));
   }
 
-  /**
-   * Flushes deterministic job-version I/O mutations in input-then-output order. The caller owns the
-   * surrounding transaction.
-   */
+  /** Flushes reported sides in the caller's transaction; empty I/O is a no-op. */
   default void flushCurrentJobVersionIoInCurrentTransaction(CurrentJobVersionIoWrite write) {
-    if (!write.inputDatasetUuids().isEmpty() && !write.outputDatasetUuids().isEmpty()) {
-      markInputAndOutputDatasetsAsPreviousFor(write.jobVersionUuid(), write.jobUuid());
-      upsertCurrentInputAndOutputDatasetsInCurrentTransaction(write);
-    } else if (!write.inputDatasetUuids().isEmpty()) {
-      markInputOrOutputDatasetAsPreviousFor(write.jobVersionUuid(), write.jobUuid(), IoType.INPUT);
-      upsertCurrentInputOrOutputDatasetsInCurrentTransaction(
-          write.jobVersionUuid(),
-          write.inputDatasetUuids(),
-          write.jobUuid(),
-          write.symlinkTargetJobUuid(),
-          IoType.INPUT);
-    } else if (!write.outputDatasetUuids().isEmpty()) {
-      markInputOrOutputDatasetAsPreviousFor(write.jobVersionUuid(), write.jobUuid(), IoType.OUTPUT);
-      upsertCurrentInputOrOutputDatasetsInCurrentTransaction(
-          write.jobVersionUuid(),
-          write.outputDatasetUuids(),
-          write.jobUuid(),
-          write.symlinkTargetJobUuid(),
-          IoType.OUTPUT);
+    boolean hasInputs = !write.inputDatasetUuids().isEmpty();
+    boolean hasOutputs = !write.outputDatasetUuids().isEmpty();
+    if (!hasInputs && !hasOutputs) {
+      return;
     }
+    if (hasInputs && hasOutputs) {
+      markInputAndOutputDatasetsAsPreviousFor(write.jobVersionUuid(), write.jobUuid());
+    } else {
+      markInputOrOutputDatasetAsPreviousFor(
+          write.jobVersionUuid(), write.jobUuid(), hasInputs ? IoType.INPUT : IoType.OUTPUT);
+    }
+    upsertCurrentJobVersionIoInCurrentTransaction(write);
   }
 
-  /**
-   * Replaces the complete current-I/O snapshot for an ordered OpenLineage winner. The caller must
-   * hold the job-row lock acquired by the ordered current-version pointer update.
-   */
+  /** Replaces both sides while holding the ordered current-version winner's job lock. */
   default void replaceOpenLineageCurrentJobVersionIoInCurrentTransaction(
       CurrentJobVersionIoWrite write) {
     markInputAndOutputDatasetsAsPreviousFor(write.jobUuid());
+    upsertCurrentJobVersionIoInCurrentTransaction(write);
+  }
+
+  private void upsertCurrentJobVersionIoInCurrentTransaction(CurrentJobVersionIoWrite write) {
     if (!write.inputDatasetUuids().isEmpty() && !write.outputDatasetUuids().isEmpty()) {
       upsertCurrentInputAndOutputDatasetsInCurrentTransaction(write);
-    } else if (!write.inputDatasetUuids().isEmpty()) {
-      upsertCurrentInputOrOutputDatasetsInCurrentTransaction(
-          write.jobVersionUuid(),
-          write.inputDatasetUuids(),
-          write.jobUuid(),
-          write.symlinkTargetJobUuid(),
-          IoType.INPUT);
-    } else if (!write.outputDatasetUuids().isEmpty()) {
-      upsertCurrentInputOrOutputDatasetsInCurrentTransaction(
-          write.jobVersionUuid(),
-          write.outputDatasetUuids(),
-          write.jobUuid(),
-          write.symlinkTargetJobUuid(),
-          IoType.OUTPUT);
+      return;
     }
+    if (write.inputDatasetUuids().isEmpty() && write.outputDatasetUuids().isEmpty()) {
+      return;
+    }
+    IoType ioType = write.inputDatasetUuids().isEmpty() ? IoType.OUTPUT : IoType.INPUT;
+    ImmutableSortedSet<UUID> datasetUuids =
+        ioType == IoType.INPUT ? write.inputDatasetUuids() : write.outputDatasetUuids();
+    upsertCurrentInputOrOutputDatasetsInCurrentTransaction(
+        write.jobVersionUuid(),
+        datasetUuids,
+        write.jobUuid(),
+        write.symlinkTargetJobUuid(),
+        ioType);
   }
 
   private void upsertCurrentInputAndOutputDatasetsInCurrentTransaction(
@@ -461,14 +438,9 @@ public interface JobVersionDao extends BaseDao {
       UUID symlinkTargetJobUuid,
       IoType ioType) {
     List<UUID> sortedDatasetUuids = datasetUuids.asList();
-    for (int from = 0; from < sortedDatasetUuids.size(); from += JOB_VERSION_IO_BATCH_SIZE) {
-      int to = Math.min(from + JOB_VERSION_IO_BATCH_SIZE, sortedDatasetUuids.size());
+    for (List<UUID> chunk : Lists.partition(sortedDatasetUuids, JOB_VERSION_IO_BATCH_SIZE)) {
       upsertCurrentInputOrOutputDatasetsChunk(
-          jobVersionUuid,
-          sortedDatasetUuids.subList(from, to).toArray(UUID[]::new),
-          jobUuid,
-          symlinkTargetJobUuid,
-          ioType);
+          jobVersionUuid, chunk.toArray(UUID[]::new), jobUuid, symlinkTargetJobUuid, ioType);
     }
   }
 
@@ -517,39 +489,72 @@ public interface JobVersionDao extends BaseDao {
 
   @SqlQuery(
       """
+      WITH authoritative_state AS (
+        SELECT io_type, dataset_version_uuids
+        FROM open_lineage_run_io_state
+        WHERE run_uuid = :runUuid
+      ), resolved_io AS (
+        SELECT
+          state.io_type,
+          occurrence.ordinality AS occurrence_order,
+          dv.uuid,
+          dv.created_at,
+          dv.dataset_uuid,
+          dv.version,
+          dv.dataset_schema_version_uuid,
+          dv.lifecycle_state,
+          dv.run_uuid,
+          dv.namespace_name,
+          dv.dataset_name
+        FROM authoritative_state state
+        CROSS JOIN LATERAL unnest(state.dataset_version_uuids)
+          WITH ORDINALITY occurrence(dataset_version_uuid, ordinality)
+        INNER JOIN dataset_versions dv ON dv.uuid = occurrence.dataset_version_uuid
+        UNION ALL
+        SELECT
+          'INPUT' AS io_type,
+          NULL::bigint AS occurrence_order,
+          dv.uuid,
+          dv.created_at,
+          dv.dataset_uuid,
+          dv.version,
+          dv.dataset_schema_version_uuid,
+          dv.lifecycle_state,
+          dv.run_uuid,
+          dv.namespace_name,
+          dv.dataset_name
+        FROM runs_input_mapping rim
+        INNER JOIN dataset_versions dv ON dv.uuid = rim.dataset_version_uuid
+        WHERE rim.run_uuid = :runUuid
+          AND NOT EXISTS (
+            SELECT 1 FROM authoritative_state state WHERE state.io_type = 'INPUT')
+        UNION ALL
+        SELECT
+          'OUTPUT' AS io_type,
+          NULL::bigint AS occurrence_order,
+          dv.uuid,
+          dv.created_at,
+          dv.dataset_uuid,
+          dv.version,
+          dv.dataset_schema_version_uuid,
+          dv.lifecycle_state,
+          dv.run_uuid,
+          dv.namespace_name,
+          dv.dataset_name
+        FROM dataset_versions dv
+        WHERE dv.run_uuid = :runUuid
+          AND NOT EXISTS (
+            SELECT 1 FROM authoritative_state state WHERE state.io_type = 'OUTPUT')
+      )
       SELECT
-        'INPUT' AS io_type,
-        dv.uuid,
-        dv.created_at,
-        dv.dataset_uuid,
-        dv.version,
-        dv.dataset_schema_version_uuid,
-        dv.lifecycle_state,
-        dv.run_uuid,
-        dv.namespace_name,
-        dv.dataset_name
-      FROM runs_input_mapping rim
-      INNER JOIN dataset_versions dv ON dv.uuid = rim.dataset_version_uuid
-      WHERE rim.run_uuid = :runUuid
-      UNION ALL
-      SELECT
-        'OUTPUT' AS io_type,
-        dv.uuid,
-        dv.created_at,
-        dv.dataset_uuid,
-        dv.version,
-        dv.dataset_schema_version_uuid,
-        dv.lifecycle_state,
-        dv.run_uuid,
-        dv.namespace_name,
-        dv.dataset_name
-      FROM dataset_versions dv
-      WHERE dv.run_uuid = :runUuid
-      ORDER BY io_type, namespace_name, dataset_name, uuid
+        io_type, uuid, created_at, dataset_uuid, version, dataset_schema_version_uuid,
+        lifecycle_state, run_uuid, namespace_name, dataset_name
+      FROM resolved_io
+      ORDER BY io_type, occurrence_order NULLS LAST, namespace_name, dataset_name, uuid
       """)
   List<RunIoRow> findRunIoRows(UUID runUuid);
 
-  /** Returns one immutable, cumulative input/output snapshot for the given run. */
+  /** Uses authoritative sides when present and cumulative legacy facts for missing sides. */
   default RunIoSnapshot findRunIoSnapshot(UUID runUuid) {
     return RunIoSnapshot.from(findRunIoRows(runUuid));
   }
@@ -626,6 +631,16 @@ public interface JobVersionDao extends BaseDao {
   /** Returns the {@link JobVersionRow} object for a given the unique run ID . */
   @SqlQuery("SELECT * FROM job_versions WHERE latest_run_uuid = :runUuid")
   Optional<ExtendedJobVersionRow> findJobVersionFor(UUID runUuid);
+
+  /** Returns the immutable job version currently referenced by the given run. */
+  @SqlQuery(
+      """
+      SELECT jv.*
+      FROM runs AS r
+      INNER JOIN job_versions AS jv ON jv.uuid = r.job_version_uuid
+      WHERE r.uuid = :runUuid
+      """)
+  Optional<ExtendedJobVersionRow> findJobVersionLinkedToRun(UUID runUuid);
 
   /** Returns the total row count for the {@code job_versions} table; used for testing only. */
   @VisibleForTesting
@@ -804,18 +819,7 @@ public interface JobVersionDao extends BaseDao {
         d.getDatasetRow().getName());
   }
 
-  /**
-   * Used to upsert an immutable {@link JobVersionRow} object when a {@link Run} has transitioned. A
-   * {@link Version} is generated using {@link Utils#newJobVersionFor} based on the jobs inputs and
-   * inputs, source code location, and context. A version for a given job is created <i>only</i>
-   * when a {@link Run} transitions into a {@code COMPLETED}, {@code ABORTED}, or {@code FAILED}
-   * state.
-   *
-   * @param jobRowRunDetails The job row with run details.
-   * @param runState The current run state.
-   * @param transitionedAt The timestamp of the run state transition.
-   * @return A {@link BagOfJobVersionInfo} object.
-   */
+  /** Creates or refreshes the immutable job version for a transitioned run. */
   @Transaction
   default BagOfJobVersionInfo upsertJobVersionOnRunTransition(
       @NonNull JobRowRunDetails jobRowRunDetails,
@@ -827,7 +831,7 @@ public interface JobVersionDao extends BaseDao {
   }
 
   /** Transaction-assuming core for a run transition that creates or refreshes a job version. */
-  default BagOfJobVersionInfo upsertJobVersionOnRunTransitionInTransaction(
+  default @Nullable BagOfJobVersionInfo upsertJobVersionOnRunTransitionInTransaction(
       @NonNull JobRowRunDetails jobRowRunDetails,
       @NonNull RunState runState,
       @NonNull Instant transitionedAt,
@@ -837,7 +841,7 @@ public interface JobVersionDao extends BaseDao {
   }
 
   /** Ordered queue variant; run-local writes stay FIFO and shared pointers use LWW. */
-  default BagOfJobVersionInfo upsertJobVersionOnRunTransitionInTransaction(
+  default @Nullable BagOfJobVersionInfo upsertJobVersionOnRunTransitionInTransaction(
       @NonNull JobRowRunDetails jobRowRunDetails,
       @NonNull RunState runState,
       @NonNull Instant transitionedAt,
@@ -845,98 +849,104 @@ public interface JobVersionDao extends BaseDao {
       @Nullable ProjectionOrder order) {
     boolean projectCurrentIo =
         order == null
-            || createJobDao().canProjectCurrentIo(jobRowRunDetails.jobRow.getUuid(), order);
+            || createJobDao().canProjectCurrentIo(jobRowRunDetails.jobRow().getUuid(), order);
     return upsertJobVersionOnRunTransitionInTransaction(
         jobRowRunDetails, runState, transitionedAt, linkJobToJobVersion, order, projectCurrentIo);
   }
 
   /** Ordered core accepting the event-level winner already used for missing-side invalidation. */
-  default BagOfJobVersionInfo upsertJobVersionOnRunTransitionInTransaction(
+  default @Nullable BagOfJobVersionInfo upsertJobVersionOnRunTransitionInTransaction(
       @NonNull JobRowRunDetails jobRowRunDetails,
       @NonNull RunState runState,
       @NonNull Instant transitionedAt,
       boolean linkJobToJobVersion,
       @Nullable ProjectionOrder order,
       boolean projectCurrentIo) {
-    // Get the job.
-    final JobDao jobDao = createJobDao();
-    JobRow jobRow = jobRowRunDetails.jobRow;
+    JobDao jobDao = createJobDao();
+    JobVersionDao jobVersionDao = createJobVersionDao();
+    RunDao runDao = createRunDao();
+    JobRow jobRow = jobRowRunDetails.jobRow();
+    UUID runUuid = jobRowRunDetails.runUuid();
+    boolean ordered = order != null;
     UUID canonicalJobUuid =
         jobRow.getSymlinkTargetId() == null ? jobRow.getUuid() : jobRow.getSymlinkTargetId();
     // OpenLineage projection already holds this canonical job before locking its run. Take the same
     // gate before touching a job version or run so a direct transition cannot hold either first.
     jobDao.lockJobBeforeRunMutation(canonicalJobUuid);
 
-    // Add the job version.
-    final JobVersionDao jobVersionDao = createJobVersionDao();
+    if (ordered && !runDao.claimOpenLineageJobVersionProjection(runUuid, order)) {
+      return null;
+    }
 
-    final JobVersionRow jobVersionRow =
-        order == null
-            ? jobVersionDao.upsertJobVersion(
-                UUID.randomUUID(),
-                transitionedAt,
-                jobRowRunDetails.jobRow.getUuid(),
-                jobRowRunDetails.jobLocation,
-                jobRowRunDetails.jobVersion.getValue(),
-                jobRowRunDetails.jobRow.getName(),
-                jobRowRunDetails.namespaceRow.getUuid(),
-                jobRowRunDetails.jobRow.getNamespaceName())
-            : jobVersionDao.upsertOpenLineageJobVersion(
+    JobVersionRow jobVersionRow =
+        ordered
+            ? jobVersionDao.upsertOpenLineageJobVersion(
                 UUID.randomUUID(),
                 order.getEventTime(),
-                jobRowRunDetails.jobRow.getUuid(),
-                jobRowRunDetails.jobLocation,
-                jobRowRunDetails.jobVersion.getValue(),
-                jobRowRunDetails.jobRow.getName(),
-                jobRowRunDetails.namespaceRow.getUuid(),
-                jobRowRunDetails.jobRow.getNamespaceName());
+                jobRow.getUuid(),
+                jobRowRunDetails.jobLocation(),
+                jobRowRunDetails.jobVersion().getValue(),
+                jobRow.getName(),
+                jobRowRunDetails.namespaceRow().getUuid(),
+                jobRow.getNamespaceName())
+            : jobVersionDao.upsertJobVersion(
+                UUID.randomUUID(),
+                transitionedAt,
+                jobRow.getUuid(),
+                jobRowRunDetails.jobLocation(),
+                jobRowRunDetails.jobVersion().getValue(),
+                jobRow.getName(),
+                jobRowRunDetails.namespaceRow().getUuid(),
+                jobRow.getNamespaceName());
 
     CurrentJobVersionIoWrite ioWrite =
         CurrentJobVersionIoWrite.of(
             jobVersionRow.getUuid(),
             jobVersionRow.getJobUuid(),
-            jobRowRunDetails.jobRow.getSymlinkTargetId(),
-            jobRowRunDetails.jobVersionInputs.stream()
+            jobRow.getSymlinkTargetId(),
+            jobRowRunDetails.jobVersionInputs().stream()
                 .map(ExtendedDatasetVersionRow::getDatasetUuid)
-                .collect(Collectors.toList()),
-            jobRowRunDetails.jobVersionOutputs.stream()
+                .toList(),
+            jobRowRunDetails.jobVersionOutputs().stream()
                 .map(ExtendedDatasetVersionRow::getDatasetUuid)
-                .collect(Collectors.toList()));
+                .toList());
 
-    if (order == null) {
+    if (!ordered) {
       jobVersionDao.flushCurrentJobVersionIoInCurrentTransaction(ioWrite);
     }
 
     // Link the job version to the run.
-    createRunDao().updateJobVersion(jobRowRunDetails.runUuid, jobVersionRow.getUuid());
+    if (!ordered) {
+      runDao.updateJobVersion(runUuid, jobVersionRow.getUuid());
+    } else if (!runDao.updateJobVersionForOpenLineageClaim(
+        runUuid, jobVersionRow.getUuid(), order)) {
+      throw new IllegalStateException("OpenLineage run job-version claim was lost for " + runUuid);
+    }
 
     // Link the run to the job version; multiple run instances may be linked to a job version.
-    if (order == null) {
-      jobVersionDao.updateLatestRunFor(
-          jobVersionRow.getUuid(), transitionedAt, jobRowRunDetails.runUuid);
+    if (ordered) {
+      jobVersionDao.updateLatestRunFor(jobVersionRow.getUuid(), runUuid, order);
     } else {
-      jobVersionDao.updateLatestRunFor(jobVersionRow.getUuid(), jobRowRunDetails.runUuid, order);
+      jobVersionDao.updateLatestRunFor(jobVersionRow.getUuid(), transitionedAt, runUuid);
     }
 
     // Link the job facets to this job version
-    jobVersionDao.linkJobFacetsToJobVersion(jobRowRunDetails.runUuid, jobVersionRow.getUuid());
+    jobVersionDao.linkJobFacetsToJobVersion(runUuid, jobVersionRow.getUuid());
 
     if (linkJobToJobVersion) {
-      if (order == null) {
-        jobDao.updateVersionFor(
-            jobRowRunDetails.jobRow.getUuid(), transitionedAt, jobVersionRow.getUuid());
+      if (!ordered) {
+        jobDao.updateVersionFor(jobRow.getUuid(), transitionedAt, jobVersionRow.getUuid());
       } else if (projectCurrentIo
-          && jobDao.updateVersionFor(
-              jobRowRunDetails.jobRow.getUuid(), jobVersionRow.getUuid(), order)) {
+          && jobDao.updateVersionFor(jobRow.getUuid(), jobVersionRow.getUuid(), order)) {
         jobVersionDao.replaceOpenLineageCurrentJobVersionIoInCurrentTransaction(ioWrite);
       }
     }
 
     return new BagOfJobVersionInfo(
-        jobRowRunDetails.jobRow,
+        jobRow,
         jobVersionRow,
-        jobRowRunDetails.jobVersionInputs,
-        jobRowRunDetails.jobVersionOutputs);
+        jobRowRunDetails.jobVersionInputs(),
+        jobRowRunDetails.jobVersionOutputs());
   }
 
   /** Returns the specified {@link ExtendedDatasetVersionRow}s as {@link DatasetId}s. */
@@ -1043,6 +1053,13 @@ public interface JobVersionDao extends BaseDao {
       @Nullable UUID symlinkTargetJobUuid,
       ImmutableSortedSet<UUID> inputDatasetUuids,
       ImmutableSortedSet<UUID> outputDatasetUuids) {
+    public CurrentJobVersionIoWrite {
+      Objects.requireNonNull(jobVersionUuid, "jobVersionUuid");
+      Objects.requireNonNull(jobUuid, "jobUuid");
+      inputDatasetUuids = postgresUuidSet(inputDatasetUuids);
+      outputDatasetUuids = postgresUuidSet(outputDatasetUuids);
+    }
+
     public static CurrentJobVersionIoWrite of(
         UUID jobVersionUuid,
         UUID jobUuid,
@@ -1050,13 +1067,26 @@ public interface JobVersionDao extends BaseDao {
         Iterable<UUID> inputDatasetUuids,
         Iterable<UUID> outputDatasetUuids) {
       return new CurrentJobVersionIoWrite(
-          Objects.requireNonNull(jobVersionUuid, "jobVersionUuid"),
-          Objects.requireNonNull(jobUuid, "jobUuid"),
+          jobVersionUuid,
+          jobUuid,
           symlinkTargetJobUuid,
-          ImmutableSortedSet.copyOf(Objects.requireNonNull(inputDatasetUuids, "inputDatasetUuids")),
-          ImmutableSortedSet.copyOf(
-              Objects.requireNonNull(outputDatasetUuids, "outputDatasetUuids")));
+          postgresUuidSet(Objects.requireNonNull(inputDatasetUuids, "inputDatasetUuids")),
+          postgresUuidSet(Objects.requireNonNull(outputDatasetUuids, "outputDatasetUuids")));
     }
+  }
+
+  private static ImmutableSortedSet<UUID> postgresUuidSet(Iterable<UUID> values) {
+    return ImmutableSortedSet.<UUID>orderedBy(JobVersionDao::comparePostgresqlUuids)
+        .addAll(values)
+        .build();
+  }
+
+  private static int comparePostgresqlUuids(UUID left, UUID right) {
+    int compared =
+        Long.compareUnsigned(left.getMostSignificantBits(), right.getMostSignificantBits());
+    return compared != 0
+        ? compared
+        : Long.compareUnsigned(left.getLeastSignificantBits(), right.getLeastSignificantBits());
   }
 
   record JobRowRunDetails(

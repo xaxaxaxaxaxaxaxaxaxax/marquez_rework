@@ -6,7 +6,6 @@
 package marquez.db;
 
 import java.net.URI;
-import java.sql.SQLException;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.temporal.ChronoUnit;
@@ -22,8 +21,16 @@ import java.util.stream.Stream;
 import javax.validation.Valid;
 import lombok.Value;
 import marquez.common.Utils;
+import marquez.db.OpenLineageProjector.DatasetProjection;
+import marquez.db.OpenLineageProjector.DatasetProjectionResult;
+import marquez.db.OpenLineageProjector.JobProjectionResult;
+import marquez.db.OpenLineageProjector.JobVersionProjection;
+import marquez.db.OpenLineageProjector.ProjectionRequest;
+import marquez.db.OpenLineageProjector.ProjectionResult;
+import marquez.db.OpenLineageProjector.RunProjectionResult;
 import marquez.db.models.UpdateLineageRow;
 import marquez.db.models.UpdateLineageRow.DatasetRecord;
+import marquez.service.models.BaseEvent;
 import marquez.service.models.DatasetEvent;
 import marquez.service.models.JobEvent;
 import marquez.service.models.LineageEvent;
@@ -38,7 +45,6 @@ import marquez.service.models.LineageEvent.Run;
 import marquez.service.models.LineageEvent.RunFacet;
 import marquez.service.models.LineageEvent.SchemaDatasetFacet;
 import marquez.service.models.LineageEvent.SchemaField;
-import org.postgresql.util.PGobject;
 import org.testcontainers.shaded.com.google.common.collect.ImmutableMap;
 
 public class LineageTestUtils {
@@ -176,22 +182,17 @@ public class LineageTestUtils {
         .put(
             "_schemaURL",
             "https://openlineage.io/spec/1-0-1/OpenLineage.json#/definitions/RunEvent");
-    UpdateLineageRow updateLineageRow = dao.updateMarquezModel(event, Utils.getMapper());
-    PGobject jsonObject = new PGobject();
-    jsonObject.setType("json");
-    try {
-      jsonObject.setValue(Utils.toJson(event));
-    } catch (SQLException e) {
-      throw new RuntimeException(e);
-    }
-    dao.createLineageEvent(
-        event.getEventType() == null ? "" : event.getEventType(),
-        event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
-        runId,
-        event.getJob().getName(),
-        event.getJob().getNamespace(),
-        jsonObject,
-        event.getProducer());
+    String exactEventJson = Utils.toJson(event);
+    UpdateLineageRow updateLineageRow = projectAsLegacyRow(dao, event, exactEventJson);
+    dao.createOpenLineageEventDao()
+        .createLineageEvent(
+            event.getEventType() == null ? "" : event.getEventType(),
+            event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
+            runId,
+            event.getJob().getName(),
+            event.getJob().getNamespace(),
+            exactEventJson,
+            event.getProducer());
 
     return updateLineageRow;
   }
@@ -217,18 +218,13 @@ public class LineageTestUtils {
         .put(
             "_schemaURL",
             "https://openlineage.io/spec/1-0-1/OpenLineage.json#/definitions/RunEvent");
-    UpdateLineageRow updateLineageRow = dao.updateMarquezModel(event, Utils.getMapper());
-    PGobject jsonObject = new PGobject();
-    jsonObject.setType("json");
-    try {
-      jsonObject.setValue(Utils.toJson(event));
-    } catch (SQLException e) {
-      throw new RuntimeException(e);
-    }
-    dao.createDatasetEvent(
-        event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
-        jsonObject,
-        event.getProducer());
+    String exactEventJson = Utils.toJson(event);
+    UpdateLineageRow updateLineageRow = projectAsLegacyRow(dao, event, exactEventJson);
+    dao.createOpenLineageEventDao()
+        .createDatasetEvent(
+            event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
+            exactEventJson,
+            event.getProducer());
 
     return updateLineageRow;
   }
@@ -257,22 +253,90 @@ public class LineageTestUtils {
         .put(
             "_schemaURL",
             "https://openlineage.io/spec/1-0-1/OpenLineage.json#/definitions/RunEvent");
-    UpdateLineageRow updateLineageRow = dao.updateMarquezModel(event, Utils.getMapper());
-    PGobject jsonObject = new PGobject();
-    jsonObject.setType("json");
-    try {
-      jsonObject.setValue(Utils.toJson(event));
-    } catch (SQLException e) {
-      throw new RuntimeException(e);
-    }
-    dao.createJobEvent(
-        event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
-        event.getJob().getName(),
-        event.getJob().getNamespace(),
-        jsonObject,
-        event.getProducer());
+    String exactEventJson = Utils.toJson(event);
+    UpdateLineageRow updateLineageRow = projectAsLegacyRow(dao, event, exactEventJson);
+    dao.createOpenLineageEventDao()
+        .createJobEvent(
+            event.getEventTime().withZoneSameInstant(ZoneId.of("UTC")).toInstant(),
+            event.getJob().getName(),
+            event.getJob().getNamespace(),
+            exactEventJson,
+            event.getProducer());
 
     return updateLineageRow;
+  }
+
+  /**
+   * Keeps broad legacy test fixtures source-compatible while exercising the immutable projector.
+   */
+  static UpdateLineageRow projectAsLegacyRow(
+      OpenLineageDao dao, BaseEvent event, String exactEventJson) {
+    return toLegacyRow(project(dao, event, exactEventJson, true));
+  }
+
+  static ProjectionResult project(
+      OpenLineageDao dao,
+      BaseEvent event,
+      String exactEventJson,
+      boolean listenerSnapshotRequired) {
+    ProjectionRequest request =
+        new ProjectionRequest(event, exactEventJson, listenerSnapshotRequired);
+    return dao.inTransaction(
+        transactional ->
+            OpenLineageProjector.getInstance()
+                .projectInTransaction(transactional, Utils.getMapper(), request));
+  }
+
+  static UpdateLineageRow toLegacyRow(ProjectionResult result) {
+    UpdateLineageRow row = new UpdateLineageRow();
+    if (result instanceof RunProjectionResult run) {
+      row.setNamespace(run.namespace());
+      row.setJob(run.job());
+      row.setRunArgs(run.runArgs());
+      row.setRun(run.run());
+      row.setRunState(run.runState());
+      row.setInputs(toLegacyIo(run.inputs()));
+      row.setOutputs(toLegacyIo(run.outputs()));
+      row.setRunIoSnapshot(run.runIoSnapshot());
+      row.setJobVersionBag(toLegacyJobVersion(run.jobVersion()));
+    } else if (result instanceof JobProjectionResult job) {
+      row.setNamespace(job.namespace());
+      row.setJob(job.job());
+      row.setInputs(toLegacyIo(job.inputs()));
+      row.setOutputs(toLegacyIo(job.outputs()));
+      row.setJobVersionBag(toLegacyJobVersion(job.jobVersion()));
+    } else if (result instanceof DatasetProjectionResult dataset) {
+      row.setNamespace(dataset.namespace());
+      row.setOutputs(Optional.of(toLegacyIo(dataset.outputs())));
+    } else {
+      throw new IllegalArgumentException("Unsupported projection result " + result.getClass());
+    }
+    return row;
+  }
+
+  private static JobVersionDao.BagOfJobVersionInfo toLegacyJobVersion(
+      JobVersionProjection projection) {
+    return projection == null
+        ? null
+        : new JobVersionDao.BagOfJobVersionInfo(
+            projection.job(), projection.jobVersion(), projection.inputs(), projection.outputs());
+  }
+
+  private static Optional<List<DatasetRecord>> toLegacyIo(
+      Optional<List<DatasetProjection>> projections) {
+    return projections.map(LineageTestUtils::toLegacyIo);
+  }
+
+  private static List<DatasetRecord> toLegacyIo(List<DatasetProjection> projections) {
+    return projections.stream()
+        .map(
+            projection ->
+                new DatasetRecord(
+                    projection.dataset(),
+                    projection.version(),
+                    projection.namespace(),
+                    projection.columnLineage()))
+        .toList();
   }
 
   public static DatasetFacets newDatasetFacet(SchemaField... fields) {

@@ -51,6 +51,7 @@ import lombok.Builder;
 import lombok.Getter;
 import lombok.NonNull;
 import marquez.common.models.DatasetId;
+import marquez.common.models.DatasetName;
 import marquez.common.models.Field;
 import marquez.common.models.FlexibleDateTimeDeserializer;
 import marquez.common.models.JobName;
@@ -183,15 +184,26 @@ public final class Utils {
     }
   }
 
+  /** Validates the namespace and name of every OpenLineage dataset in the supplied list. */
+  public static void validateOpenLineageDatasetIds(@Nullable List<LineageEvent.Dataset> datasets) {
+    if (datasets == null) {
+      return;
+    }
+    for (LineageEvent.Dataset dataset : datasets) {
+      new DatasetId(NamespaceName.of(dataset.getNamespace()), DatasetName.of(dataset.getName()));
+    }
+  }
+
   /**
    * Resolves a parent run using the normal OpenLineage run identity, while retaining the old
    * Airflow adapter's namespaced derivation only for its identifiable fully-qualified-task shape.
    */
   public static UUID openLineageParentRunUuid(
       @NonNull ParentRunFacet parent, @NonNull String childJobName) {
+    var parentJob = parent.getJob();
     String parentNamespace =
-        requireOpenLineageIdentity(parent.getJob().getNamespace(), "parent namespace");
-    String parentJobName = requireOpenLineageIdentity(parent.getJob().getName(), "parent job name");
+        requireOpenLineageIdentity(parentJob.getNamespace(), "parent namespace");
+    String parentJobName = requireOpenLineageIdentity(parentJob.getName(), "parent job name");
     String parentRunId = requireOpenLineageIdentity(parent.getRun().getRunId(), "parent runId");
     if (parentJobName.equals(childJobName) && parentJobName.contains(".")) {
       return findParentRunUuid(

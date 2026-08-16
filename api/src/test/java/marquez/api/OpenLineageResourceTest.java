@@ -35,7 +35,7 @@ import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
 import marquez.api.exceptions.JdbiExceptionExceptionMapper;
 import marquez.common.Utils;
-import marquez.db.OpenLineageDao;
+import marquez.db.OpenLineageEventDao;
 import marquez.db.OpenLineageQueueDao;
 import marquez.db.OpenLineageQueueDao.PreparedAdmission;
 import marquez.db.OpenLineageQueueDao.PreparedEvent;
@@ -59,7 +59,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 @ExtendWith(DropwizardExtensionsSupport.class)
 class OpenLineageResourceTest {
   private static final String INVALID_NAMESPACE = "namespace-\uD83D\uDE02";
-  private static final OpenLineageDao OPEN_LINEAGE_DAO = mock(OpenLineageDao.class);
+  private static final OpenLineageEventDao OPEN_LINEAGE_EVENT_DAO = mock(OpenLineageEventDao.class);
   private static final OpenLineageIntake OPEN_LINEAGE_INTAKE = mock(OpenLineageIntake.class);
   private static final OpenLineageResource RESOURCE;
   private static final ResourceExtension UNDER_TEST;
@@ -88,7 +88,7 @@ class OpenLineageResourceTest {
                 OpenLineageService.class,
                 openLineageService));
 
-    RESOURCE = new OpenLineageResource(serviceFactory, OPEN_LINEAGE_DAO, OPEN_LINEAGE_INTAKE);
+    RESOURCE = new OpenLineageResource(serviceFactory, OPEN_LINEAGE_EVENT_DAO, OPEN_LINEAGE_INTAKE);
     UNDER_TEST =
         ResourceExtension.builder()
             .setMapper(Utils.newObjectMapper())
@@ -100,7 +100,7 @@ class OpenLineageResourceTest {
 
   @BeforeEach
   void setUpOpenLineageIntake() {
-    reset(OPEN_LINEAGE_DAO, OPEN_LINEAGE_INTAKE);
+    reset(OPEN_LINEAGE_EVENT_DAO, OPEN_LINEAGE_INTAKE);
     when(OPEN_LINEAGE_INTAKE.enqueue(any(PreparedEvent.class))).thenReturn(1L);
     when(OPEN_LINEAGE_INTAKE.enqueueAll(any(PreparedAdmission.class)))
         .thenAnswer(invocation -> ((PreparedAdmission) invocation.getArgument(0)).size());

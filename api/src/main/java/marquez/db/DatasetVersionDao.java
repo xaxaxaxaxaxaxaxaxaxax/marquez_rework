@@ -150,7 +150,6 @@ public interface DatasetVersionDao extends BaseDao {
     if (fields == null) {
       return null;
     }
-    OpenLineageDao openLineageDao = createOpenLineageDao();
     return fields.stream()
         .map(
             f ->

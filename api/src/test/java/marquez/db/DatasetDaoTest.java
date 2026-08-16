@@ -148,7 +148,7 @@ class DatasetDaoTest {
                 UUID.randomUUID(),
                 createdAt,
                 "dataset-version-update-test",
-                OpenLineageDao.DEFAULT_NAMESPACE_OWNER);
+                OpenLineageDefaults.DEFAULT_NAMESPACE_OWNER);
     SourceRow source =
         jdbi.onDemand(SourceDao.class)
             .upsertOrDefault(
@@ -233,7 +233,7 @@ class DatasetDaoTest {
                 UUID.randomUUID(),
                 createdAt,
                 "dataset-bulk-original-namespace",
-                OpenLineageDao.DEFAULT_NAMESPACE_OWNER);
+                OpenLineageDefaults.DEFAULT_NAMESPACE_OWNER);
     SourceRow originalSource =
         jdbi.onDemand(SourceDao.class)
             .upsertOrDefault(
@@ -244,7 +244,7 @@ class DatasetDaoTest {
                 UUID.randomUUID(),
                 createdAt,
                 "dataset-bulk-replacement-namespace",
-                OpenLineageDao.DEFAULT_NAMESPACE_OWNER);
+                OpenLineageDefaults.DEFAULT_NAMESPACE_OWNER);
     SourceRow replacementSource =
         jdbi.onDemand(SourceDao.class)
             .upsertOrDefault(
@@ -320,7 +320,7 @@ class DatasetDaoTest {
                 UUID.randomUUID(),
                 now,
                 "dataset-bulk-duplicate-namespace",
-                OpenLineageDao.DEFAULT_NAMESPACE_OWNER);
+                OpenLineageDefaults.DEFAULT_NAMESPACE_OWNER);
     SourceRow source =
         jdbi.onDemand(SourceDao.class)
             .upsertOrDefault(
@@ -394,7 +394,7 @@ class DatasetDaoTest {
                 UUID.randomUUID(),
                 t0,
                 "legacy-watermark-ns",
-                OpenLineageDao.DEFAULT_NAMESPACE_OWNER);
+                OpenLineageDefaults.DEFAULT_NAMESPACE_OWNER);
     SourceRow source =
         jdbi.onDemand(SourceDao.class)
             .upsertOrDefault(UUID.randomUUID(), "POSTGRES", t0, "legacy-watermark-source", "");
